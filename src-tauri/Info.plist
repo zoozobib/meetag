@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 麦克风权限 -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Need microphone access to record your voice.</string>
+
+  <!-- macOS 14.4+ 系统音频捕获权限（仅系统录音 / AudioCapture） -->
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Need system audio recording access to capture call audio.</string>
+</dict>
+</plist>

@@ -1,0 +1,8 @@
+<script type="module">
+    import { invoke } from "@tauri-apps/api/core";
+
+    console.log("invoke start_demo_recording");
+    invoke("start_demo_recording", { seconds: 10 })
+        .then((res) => console.log("done:", res))
+        .catch((e) => console.error("err:", e));
+</script>
