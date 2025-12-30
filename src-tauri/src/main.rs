@@ -142,6 +142,183 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
 }
 
 // =====================
+// Minimal WAV PCM16 Reader
+// =====================
+#[derive(Debug, Clone)]
+struct Pcm16Wav {
+    sample_rate: u32,
+    channels: u16,
+    samples: Vec<i16>, // interleaved
+}
+
+/// 只支持 PCM16 little-endian WAV
+fn read_pcm16_wav(path: &std::path::Path) -> Result<Pcm16Wav> {
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+
+    // very small / invalid
+    if buf.len() < 44 {
+        anyhow::bail!("wav too small: {:?}", path);
+    }
+
+    // RIFF header
+    if &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
+        anyhow::bail!("not a RIFF/WAVE file: {:?}", path);
+    }
+
+    // find "fmt " and "data" chunks (robust scanning)
+    let mut pos = 12;
+    let mut fmt_found = None;
+    let mut data_found = None;
+
+    while pos + 8 <= buf.len() {
+        let chunk_id = &buf[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let chunk_data_start = pos + 8;
+        let chunk_data_end = chunk_data_start + chunk_size;
+
+        if chunk_data_end > buf.len() {
+            break;
+        }
+
+        if chunk_id == b"fmt " {
+            fmt_found = Some((chunk_data_start, chunk_size));
+        } else if chunk_id == b"data" {
+            data_found = Some((chunk_data_start, chunk_size));
+            break; // 通常 data 在后面，找到就可以结束
+        }
+
+        // chunks are word-aligned
+        pos = chunk_data_end + (chunk_size % 2);
+    }
+
+    let (fmt_start, fmt_size) = fmt_found.context("fmt chunk not found")?;
+    let (data_start, data_size) = data_found.context("data chunk not found")?;
+
+    if fmt_size < 16 {
+        anyhow::bail!("fmt chunk too small");
+    }
+
+    let audio_format = u16::from_le_bytes(buf[fmt_start..fmt_start + 2].try_into().unwrap());
+    let channels = u16::from_le_bytes(buf[fmt_start + 2..fmt_start + 4].try_into().unwrap());
+    let sample_rate = u32::from_le_bytes(buf[fmt_start + 4..fmt_start + 8].try_into().unwrap());
+    let bits_per_sample =
+        u16::from_le_bytes(buf[fmt_start + 14..fmt_start + 16].try_into().unwrap());
+
+    if audio_format != 1 {
+        anyhow::bail!("only PCM supported (format=1). got {}", audio_format);
+    }
+    if bits_per_sample != 16 {
+        anyhow::bail!("only 16-bit PCM supported. got {} bits", bits_per_sample);
+    }
+
+    let data = &buf[data_start..data_start + data_size];
+
+    if data.len() % 2 != 0 {
+        anyhow::bail!("data chunk not aligned");
+    }
+
+    let mut samples = Vec::with_capacity(data.len() / 2);
+    for i in (0..data.len()).step_by(2) {
+        samples.push(i16::from_le_bytes([data[i], data[i + 1]]));
+    }
+
+    Ok(Pcm16Wav {
+        sample_rate,
+        channels,
+        samples,
+    })
+}
+
+/// 把 stereo/mono 统一转换成 mono（简单平均）
+/// 返回 mono samples
+fn to_mono(w: &Pcm16Wav) -> Vec<i16> {
+    if w.channels == 1 {
+        return w.samples.clone();
+    }
+    if w.channels == 2 {
+        let mut mono = Vec::with_capacity(w.samples.len() / 2);
+        let mut i = 0;
+        while i + 1 < w.samples.len() {
+            let l = w.samples[i] as i32;
+            let r = w.samples[i + 1] as i32;
+            mono.push(((l + r) / 2) as i16);
+            i += 2;
+        }
+        return mono;
+    }
+    // 超过 2 声道就取第一个声道
+    let ch = w.channels as usize;
+    let frames = w.samples.len() / ch;
+    let mut mono = Vec::with_capacity(frames);
+    for f in 0..frames {
+        mono.push(w.samples[f * ch]);
+    }
+    mono
+}
+
+/// 混音：mix = mic * mic_gain + sys * sys_gain
+/// 输出 mono PCM16 WAV（sample_rate 同 input）
+fn mix_pcm16_wav(
+    mic_path: &std::path::Path,
+    sys_path: &std::path::Path,
+    out_path: &std::path::Path,
+    mic_gain: f32,
+    sys_gain: f32,
+) -> Result<()> {
+    let mic = read_pcm16_wav(mic_path)?;
+    let sys = read_pcm16_wav(sys_path)?;
+
+    // 检查采样率一致（最小版本先不做 resample）
+    if mic.sample_rate != sys.sample_rate {
+        anyhow::bail!(
+            "sample rate mismatch: mic={} sys={}",
+            mic.sample_rate,
+            sys.sample_rate
+        );
+    }
+
+    let mic_mono = to_mono(&mic);
+    let sys_mono = to_mono(&sys);
+
+    let max_len = mic_mono.len().max(sys_mono.len());
+    let mut mixed: Vec<i16> = Vec::with_capacity(max_len);
+
+    for i in 0..max_len {
+        let m = if i < mic_mono.len() {
+            mic_mono[i] as f32
+        } else {
+            0.0
+        };
+        let s = if i < sys_mono.len() {
+            sys_mono[i] as f32
+        } else {
+            0.0
+        };
+
+        let y = m * mic_gain + s * sys_gain;
+        // 防止爆音
+        let y = y.clamp(i16::MIN as f32, i16::MAX as f32);
+        mixed.push(y as i16);
+    }
+
+    // 写出 WAV（复用你的 WavWriter）
+    let mut w = WavWriter::create(out_path)?;
+    w.init_pcm16(mic.sample_rate, 1)?;
+    let mut bytes = Vec::with_capacity(mixed.len() * 2);
+    for v in mixed {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    w.write_data(&bytes);
+    w.finalize()?;
+
+    Ok(())
+}
+
+// =====================
 // Tauri command: record N seconds -> (system.wav, mic.wav)
 // NOTE: sync function to avoid Send future issues
 // =====================
@@ -233,6 +410,15 @@ fn start_demo_recording(app: tauri::AppHandle, seconds: u64) -> Result<(String, 
                 .unwrap()
                 .finalize()
                 .map_err(|e| e.to_string())?;
+
+            let mix_path = base.join("mix.wav");
+
+            // 经验值：mic 通常会偏小，所以 mic_gain 可以调大
+            // 你可以先用 mic_gain=3.0, sys_gain=1.0
+            mix_pcm16_wav(&mic_path, &system_path, &mix_path, 3.0, 1.0)
+                .map_err(|e| format!("mix failed: {e:?}"))?;
+
+            println!("✅ mix.wav: {}", mix_path.display());
 
             Ok((
                 system_path.display().to_string(),
