@@ -137,7 +137,7 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
                 &stream_config,
                 move |data: &[f32], _| {
                     // 你要更响可以把 gain 调大，比如 4.0/6.0
-                    let gain: f32 = 1.0;
+                    let gain: f32 = 50.0;
 
                     let mut bytes = Vec::with_capacity(data.len() * 2);
                     for &x in data {
@@ -361,26 +361,27 @@ fn mix_pcm16_wav(
     let mic_rms = rms_i16(&mic_mono);
     let sys_rms = rms_i16(&sys_mono);
 
+    let target_mic_rms = 0.25;
     // 防止 mic 静音导致除 0
-    let mut auto_mic_gain = if mic_rms > 0.00001 {
-        sys_rms / mic_rms
+    let mut mic_gain = if mic_rms > 0.0001 {
+        target_mic_rms / mic_rms
     } else {
         1.0
     };
 
     // 夹紧避免离谱（耳机 mic 很小会算出很大）
-    auto_mic_gain = auto_mic_gain.clamp(2.5, 12.0);
+    mic_gain = mic_gain.clamp(1.0, 150.0);
 
     // 主观补偿：让 mic 稍微更突出一点（你也可以调 1.0~1.5）
-    let mic_gain = auto_mic_gain * 1.4;
+    let mic_gain = mic_gain * 1.4;
 
     // system 略降一点（你也可以改成 1.0）
     let sys_gain = 0.75;
 
     // 打印调试信息（方便你确认自动 gain 是否合理）
     println!(
-        "🔊 RMS: mic={:.4}, sys={:.4}, auto_mic_gain={:.2}, mic_gain={:.2}, sys_gain={:.2}",
-        mic_rms, sys_rms, auto_mic_gain, mic_gain, sys_gain
+        "🔊 RMS: mic={:.4}, sys={:.4}, mic_gain={:.2}, sys_gain={:.2}",
+        mic_rms, sys_rms, mic_gain, sys_gain
     );
 
     let max_len = mic_mono.len().max(sys_mono.len());
