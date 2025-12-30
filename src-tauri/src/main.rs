@@ -276,17 +276,77 @@ fn to_mono(w: &Pcm16Wav) -> Vec<i16> {
 
 /// 混音：mix = mic * mic_gain + sys * sys_gain
 /// 输出 mono PCM16 WAV（sample_rate 同 input）
+/// 计算 RMS（归一化到 0..1 的浮点）
+fn rms_i16(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0f64;
+    for &v in samples {
+        let x = v as f64 / i16::MAX as f64;
+        sum += x * x;
+    }
+    ((sum / samples.len() as f64) as f32).sqrt()
+}
+
+/// 计算峰值（0..1）
+fn peak_i16(samples: &[i16]) -> f32 {
+    let mut peak = 0.0f32;
+    for &v in samples {
+        let x = (v as f32).abs() / i16::MAX as f32;
+        if x > peak {
+            peak = x;
+        }
+    }
+    peak
+}
+
+/// 软限幅 limiter：
+/// threshold: 0..1（建议 0.95）
+/// knee: 0..1（建议 0.2）
+///
+/// 输入输出都是 -1..1
+fn soft_limiter(x: f32, threshold: f32, knee: f32) -> f32 {
+    let ax = x.abs();
+    if ax <= threshold {
+        return x;
+    }
+
+    // knee 区间：从 threshold 到 threshold + knee 渐进压缩
+    let t = threshold;
+    let k = knee.max(1e-6);
+    let upper = (t + k).min(1.0);
+
+    if ax >= upper {
+        // 超过上限：硬夹紧
+        return x.signum() * upper;
+    }
+
+    // 在 knee 内：smoothstep
+    let u = (ax - t) / (upper - t); // 0..1
+    let s = u * u * (3.0 - 2.0 * u); // smoothstep
+    let y = t + (upper - t) * s;
+    x.signum() * y
+}
+
+/// 自动 RMS 对齐混音：
+/// - 读取 mic/system wav
+/// - 转 mono
+/// - 自动算 mic_gain，使 mic_rms ≈ sys_rms
+/// - 加一点主观补偿，让 mic 稍微更突出
+/// - system 可稍微降一点，避免压过人声
+/// - 软限幅防爆音
+///
+/// 输出 mono PCM16 wav
 fn mix_pcm16_wav(
     mic_path: &std::path::Path,
     sys_path: &std::path::Path,
     out_path: &std::path::Path,
-    mic_gain: f32,
-    sys_gain: f32,
 ) -> Result<()> {
     let mic = read_pcm16_wav(mic_path)?;
     let sys = read_pcm16_wav(sys_path)?;
 
-    // 检查采样率一致（最小版本先不做 resample）
+    // 最小版本：采样率必须一致
     if mic.sample_rate != sys.sample_rate {
         anyhow::bail!(
             "sample rate mismatch: mic={} sys={}",
@@ -298,39 +358,135 @@ fn mix_pcm16_wav(
     let mic_mono = to_mono(&mic);
     let sys_mono = to_mono(&sys);
 
+    let mic_rms = rms_i16(&mic_mono);
+    let sys_rms = rms_i16(&sys_mono);
+
+    // 防止 mic 静音导致除 0
+    let mut auto_mic_gain = if mic_rms > 0.00001 {
+        sys_rms / mic_rms
+    } else {
+        1.0
+    };
+
+    // 夹紧避免离谱（耳机 mic 很小会算出很大）
+    auto_mic_gain = auto_mic_gain.clamp(2.5, 12.0);
+
+    // 主观补偿：让 mic 稍微更突出一点（你也可以调 1.0~1.5）
+    let mic_gain = auto_mic_gain * 1.4;
+
+    // system 略降一点（你也可以改成 1.0）
+    let sys_gain = 0.75;
+
+    // 打印调试信息（方便你确认自动 gain 是否合理）
+    println!(
+        "🔊 RMS: mic={:.4}, sys={:.4}, auto_mic_gain={:.2}, mic_gain={:.2}, sys_gain={:.2}",
+        mic_rms, sys_rms, auto_mic_gain, mic_gain, sys_gain
+    );
+
     let max_len = mic_mono.len().max(sys_mono.len());
     let mut mixed: Vec<i16> = Vec::with_capacity(max_len);
 
+    // limiter 参数
+    let threshold = 0.95;
+    let knee = 0.20;
+
     for i in 0..max_len {
         let m = if i < mic_mono.len() {
-            mic_mono[i] as f32
+            mic_mono[i] as f32 / i16::MAX as f32
         } else {
             0.0
         };
         let s = if i < sys_mono.len() {
-            sys_mono[i] as f32
+            sys_mono[i] as f32 / i16::MAX as f32
         } else {
             0.0
         };
 
-        let y = m * mic_gain + s * sys_gain;
-        // 防止爆音
-        let y = y.clamp(i16::MIN as f32, i16::MAX as f32);
-        mixed.push(y as i16);
+        // 混音（浮点域 -1..1）
+        let mut y = m * mic_gain + s * sys_gain;
+
+        // 防爆音：软限幅
+        y = soft_limiter(y, threshold, knee);
+
+        // 转回 i16
+        let out = (y * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        mixed.push(out);
     }
+
+    // 输出前再打印 peak 信息
+    let out_peak = peak_i16(&mixed);
+    println!("🔊 mix peak = {:.3}", out_peak);
 
     // 写出 WAV（复用你的 WavWriter）
     let mut w = WavWriter::create(out_path)?;
     w.init_pcm16(mic.sample_rate, 1)?;
+
     let mut bytes = Vec::with_capacity(mixed.len() * 2);
     for v in mixed {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
+
     w.write_data(&bytes);
     w.finalize()?;
 
     Ok(())
 }
+
+// fn mix_pcm16_wav(
+//     mic_path: &std::path::Path,
+//     sys_path: &std::path::Path,
+//     out_path: &std::path::Path,
+//     mic_gain: f32,
+//     sys_gain: f32,
+// ) -> Result<()> {
+//     let mic = read_pcm16_wav(mic_path)?;
+//     let sys = read_pcm16_wav(sys_path)?;
+
+//     // 检查采样率一致（最小版本先不做 resample）
+//     if mic.sample_rate != sys.sample_rate {
+//         anyhow::bail!(
+//             "sample rate mismatch: mic={} sys={}",
+//             mic.sample_rate,
+//             sys.sample_rate
+//         );
+//     }
+
+//     let mic_mono = to_mono(&mic);
+//     let sys_mono = to_mono(&sys);
+
+//     let max_len = mic_mono.len().max(sys_mono.len());
+//     let mut mixed: Vec<i16> = Vec::with_capacity(max_len);
+
+//     for i in 0..max_len {
+//         let m = if i < mic_mono.len() {
+//             mic_mono[i] as f32
+//         } else {
+//             0.0
+//         };
+//         let s = if i < sys_mono.len() {
+//             sys_mono[i] as f32
+//         } else {
+//             0.0
+//         };
+
+//         let y = m * mic_gain + s * sys_gain;
+//         // 防止爆音
+//         let y = y.clamp(i16::MIN as f32, i16::MAX as f32);
+//         mixed.push(y as i16);
+//     }
+
+//     // 写出 WAV（复用你的 WavWriter）
+//     let mut w = WavWriter::create(out_path)?;
+//     w.init_pcm16(mic.sample_rate, 1)?;
+//     let mut bytes = Vec::with_capacity(mixed.len() * 2);
+//     for v in mixed {
+//         bytes.extend_from_slice(&v.to_le_bytes());
+//     }
+//     w.write_data(&bytes);
+//     w.finalize()?;
+
+//     Ok(())
+// }
 
 // =====================
 // Tauri command: record N seconds -> (system.wav, mic.wav)
@@ -475,7 +631,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         let _ = mic_writer.lock().unwrap().finalize();
 
         // 5) 生成 mix（mic_gain 可调）
-        if let Err(e) = mix_pcm16_wav(&mic_path_t, &system_path_t, &mix_path_t, 3.0, 1.0) {
+        if let Err(e) = mix_pcm16_wav(&mic_path_t, &system_path_t, &mix_path_t) {
             eprintln!("❌ mix failed: {e:?}");
         } else {
             println!("✅ mix.wav: {}", mix_path_t.display());
@@ -546,114 +702,114 @@ async fn stop_recording() -> Result<(String, String, String), String> {
     })
 }
 
-fn start_demo_recording(app: tauri::AppHandle, seconds: u64) -> Result<(String, String), String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+// fn start_demo_recording(app: tauri::AppHandle, seconds: u64) -> Result<(String, String), String> {
+//     let (tx, rx) = std::sync::mpsc::channel();
 
-    std::thread::spawn(move || {
-        let res: Result<(String, String), String> = (|| {
-            let base: PathBuf = app.path().app_data_dir().map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+//     std::thread::spawn(move || {
+//         let res: Result<(String, String), String> = (|| {
+//             let base: PathBuf = app.path().app_data_dir().map_err(|e| e.to_string())?;
+//             std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
 
-            let system_path = base.join("system.wav");
-            let mic_path = base.join("mic.wav");
+//             let system_path = base.join("system.wav");
+//             let mic_path = base.join("mic.wav");
 
-            let system_writer = Arc::new(Mutex::new(
-                WavWriter::create(&system_path).map_err(|e| e.to_string())?,
-            ));
-            let mic_writer = Arc::new(Mutex::new(
-                WavWriter::create(&mic_path).map_err(|e| e.to_string())?,
-            ));
+//             let system_writer = Arc::new(Mutex::new(
+//                 WavWriter::create(&system_path).map_err(|e| e.to_string())?,
+//             ));
+//             let mic_writer = Arc::new(Mutex::new(
+//                 WavWriter::create(&mic_path).map_err(|e| e.to_string())?,
+//             ));
 
-            // 1) MIC stream (CPAL)
-            let mic_stream = start_mic_stream(mic_writer.clone()).map_err(|e| e.to_string())?;
-            mic_stream.play().map_err(|e| e.to_string())?;
+//             // 1) MIC stream (CPAL)
+//             let mic_stream = start_mic_stream(mic_writer.clone()).map_err(|e| e.to_string())?;
+//             mic_stream.play().map_err(|e| e.to_string())?;
 
-            // 2) System audio stream (CoreAudio Tap)
-            let mut system_stream = audio::capture::core_audio::CoreAudioCapture::new()
-                .map_err(|e| format!("CoreAudioCapture::new failed: {e:?}"))?
-                .stream()
-                .map_err(|e| format!("CoreAudioCapture::stream failed: {e:?}"))?;
+//             // 2) System audio stream (CoreAudio Tap)
+//             let mut system_stream = audio::capture::core_audio::CoreAudioCapture::new()
+//                 .map_err(|e| format!("CoreAudioCapture::new failed: {e:?}"))?
+//                 .stream()
+//                 .map_err(|e| format!("CoreAudioCapture::stream failed: {e:?}"))?;
 
-            let sr = system_stream.sample_rate();
-            system_writer
-                .lock()
-                .unwrap()
-                .init_pcm16(sr, 1)
-                .map_err(|e| e.to_string())?;
+//             let sr = system_stream.sample_rate();
+//             system_writer
+//                 .lock()
+//                 .unwrap()
+//                 .init_pcm16(sr, 1)
+//                 .map_err(|e| e.to_string())?;
 
-            // 3) Run async loop on a local tokio runtime (current-thread)
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .map_err(|e| e.to_string())?;
+//             // 3) Run async loop on a local tokio runtime (current-thread)
+//             let rt = tokio::runtime::Builder::new_current_thread()
+//                 .enable_time()
+//                 .build()
+//                 .map_err(|e| e.to_string())?;
 
-            let system_writer2 = system_writer.clone();
+//             let system_writer2 = system_writer.clone();
 
-            rt.block_on(async move {
-                use tokio::time::{Duration, Instant};
+//             rt.block_on(async move {
+//                 use tokio::time::{Duration, Instant};
 
-                let deadline = Instant::now() + Duration::from_secs(seconds);
-                let mut buf: Vec<i16> = Vec::with_capacity(48000);
+//                 let deadline = Instant::now() + Duration::from_secs(seconds);
+//                 let mut buf: Vec<i16> = Vec::with_capacity(48000);
 
-                while Instant::now() < deadline {
-                    if let Some(s) = system_stream.next().await {
-                        // 强制类型，避免推断失败
-                        let s: f32 = s;
+//                 while Instant::now() < deadline {
+//                     if let Some(s) = system_stream.next().await {
+//                         // 强制类型，避免推断失败
+//                         let s: f32 = s;
 
-                        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        buf.push(v);
+//                         let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+//                         buf.push(v);
 
-                        if buf.len() >= 48000 {
-                            flush_i16(system_writer2.clone(), &mut buf);
-                        }
-                    } else {
-                        break;
-                    }
-                }
+//                         if buf.len() >= 48000 {
+//                             flush_i16(system_writer2.clone(), &mut buf);
+//                         }
+//                     } else {
+//                         break;
+//                     }
+//                 }
 
-                if !buf.is_empty() {
-                    flush_i16(system_writer2.clone(), &mut buf);
-                }
+//                 if !buf.is_empty() {
+//                     flush_i16(system_writer2.clone(), &mut buf);
+//                 }
 
-                // 小睡一下让 CPAL 回调把最后一小段写进去（可选）
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            });
+//                 // 小睡一下让 CPAL 回调把最后一小段写进去（可选）
+//                 tokio::time::sleep(Duration::from_millis(50)).await;
+//             });
 
-            // 4) stop mic
-            drop(mic_stream);
+//             // 4) stop mic
+//             drop(mic_stream);
 
-            // 5) finalize wav
-            system_writer
-                .lock()
-                .unwrap()
-                .finalize()
-                .map_err(|e| e.to_string())?;
-            mic_writer
-                .lock()
-                .unwrap()
-                .finalize()
-                .map_err(|e| e.to_string())?;
+//             // 5) finalize wav
+//             system_writer
+//                 .lock()
+//                 .unwrap()
+//                 .finalize()
+//                 .map_err(|e| e.to_string())?;
+//             mic_writer
+//                 .lock()
+//                 .unwrap()
+//                 .finalize()
+//                 .map_err(|e| e.to_string())?;
 
-            let mix_path = base.join("mix.wav");
+//             let mix_path = base.join("mix.wav");
 
-            // 经验值：mic 通常会偏小，所以 mic_gain 可以调大
-            // 你可以先用 mic_gain=3.0, sys_gain=1.0
-            mix_pcm16_wav(&mic_path, &system_path, &mix_path, 3.0, 1.0)
-                .map_err(|e| format!("mix failed: {e:?}"))?;
+//             // 经验值：mic 通常会偏小，所以 mic_gain 可以调大
+//             // 你可以先用 mic_gain=3.0, sys_gain=1.0
+//             mix_pcm16_wav(&mic_path, &system_path, &mix_path, 3.0, 1.0)
+//                 .map_err(|e| format!("mix failed: {e:?}"))?;
 
-            println!("✅ mix.wav: {}", mix_path.display());
+//             println!("✅ mix.wav: {}", mix_path.display());
 
-            Ok((
-                system_path.display().to_string(),
-                mic_path.display().to_string(),
-            ))
-        })();
+//             Ok((
+//                 system_path.display().to_string(),
+//                 mic_path.display().to_string(),
+//             ))
+//         })();
 
-        let _ = tx.send(res);
-    });
+//         let _ = tx.send(res);
+//     });
 
-    rx.recv().map_err(|e| e.to_string())?
-}
+//     rx.recv().map_err(|e| e.to_string())?
+// }
 
 // =====================
 // App entry
