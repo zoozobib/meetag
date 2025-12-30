@@ -1,8 +1,46 @@
-<script type="module">
-    import { invoke } from "@tauri-apps/api/core";
+<!doctype html>
+<html>
 
-    console.log("invoke start_demo_recording");
-    invoke("start_demo_recording", { seconds: 10 })
-        .then((res) => console.log("done:", res))
-        .catch((e) => console.error("err:", e));
-</script>
+<body>
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <pre id="log"></pre>
+
+    <script>
+        const log = (s) => {
+            document.getElementById("log").textContent += s + "\n";
+            console.log(s);
+        };
+
+        async function invoke(cmd, args) {
+            // ✅ 纯静态页面必须用 window.__TAURI__
+            if (!window.__TAURI__ || !window.__TAURI__.core || !window.__TAURI__.core.invoke) {
+                log("❌ Tauri API not found. window.__TAURI__ is undefined");
+                return null;
+            }
+            return await window.__TAURI__.core.invoke(cmd, args);
+        }
+
+        document.getElementById("start").onclick = async () => {
+            log("▶ start_recording...");
+            try {
+                const res = await invoke("start_recording", {});
+                log("✅ started: " + JSON.stringify(res));
+            } catch (e) {
+                log("❌ start err: " + e);
+            }
+        };
+
+        document.getElementById("stop").onclick = async () => {
+            log("■ stop_recording...");
+            try {
+                const res = await invoke("stop_recording", {});
+                log("✅ stopped: " + JSON.stringify(res));
+            } catch (e) {
+                log("❌ stop err: " + e);
+            }
+        };
+    </script>
+</body>
+
+</html>

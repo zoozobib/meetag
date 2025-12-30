@@ -15,6 +15,20 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 mod audio;
 
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static RECORDER: Lazy<Mutex<Option<RecorderHandle>>> = Lazy::new(|| Mutex::new(None));
+
+struct RecorderHandle {
+    stop: Arc<AtomicBool>,
+    join: std::thread::JoinHandle<()>,
+    base_dir: PathBuf,
+    mic_path: PathBuf,
+    system_path: PathBuf,
+    mix_path: PathBuf,
+}
+
 // =====================
 // Minimal WAV writer (PCM16)
 // =====================
@@ -323,6 +337,215 @@ fn mix_pcm16_wav(
 // NOTE: sync function to avoid Send future issues
 // =====================
 #[tauri::command]
+fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
+    let mut guard = RECORDER.lock().unwrap();
+    if guard.is_some() {
+        return Err("recording already running".into());
+    }
+
+    // 输出目录：你现在是 app_data_dir；如果你想放桌面，改这里
+    let base: PathBuf = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+
+    let system_path = base.join("system.wav");
+    let mic_path = base.join("mic.wav");
+    let mix_path = base.join("mix.wav");
+
+    // 先创建 writer（写 wav header）
+    let system_writer = Arc::new(Mutex::new(
+        WavWriter::create(&system_path).map_err(|e| e.to_string())?,
+    ));
+    let mic_writer = Arc::new(Mutex::new(
+        WavWriter::create(&mic_path).map_err(|e| e.to_string())?,
+    ));
+
+    // stop flag
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+
+    let mic_path_t = mic_path.clone();
+    let system_path_t = system_path.clone();
+    let mix_path_t = mix_path.clone();
+
+    // 开线程跑录音
+    let join = std::thread::spawn(move || {
+        // 1) MIC stream
+        let mic_stream = match start_mic_stream(mic_writer.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ start_mic_stream failed: {e:?}");
+                return;
+            }
+        };
+        if let Err(e) = mic_stream.play() {
+            eprintln!("❌ mic_stream.play failed: {e:?}");
+            return;
+        }
+
+        // 2) System stream
+        let mut system_stream =
+            match audio::capture::core_audio::CoreAudioCapture::new().and_then(|c| c.stream()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("❌ CoreAudioCapture failed: {e:?}");
+                    return;
+                }
+            };
+
+        let sr = system_stream.sample_rate();
+        if let Err(e) = system_writer.lock().unwrap().init_pcm16(sr, 1) {
+            eprintln!("❌ init system wav failed: {e:?}");
+            return;
+        }
+
+        // 3) 在这个线程里跑一个 tokio current-thread runtime，不限时循环，直到 stop=true
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("❌ tokio runtime build failed: {e:?}");
+                return;
+            }
+        };
+
+        let system_writer2 = system_writer.clone();
+
+        rt.block_on(async move {
+            use futures_util::StreamExt;
+            use tokio::time::{Duration, Instant};
+
+            let mut buf: Vec<i16> = Vec::with_capacity(48000);
+            let mut last_flush = Instant::now();
+
+            // while !stop2.load(Ordering::Acquire) {
+            //     match system_stream.next().await {
+            //         Some(s) => {
+            //             let s: f32 = s;
+            //             let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            //             buf.push(v);
+
+            //             // 每 1 秒 flush 一次，避免内存一直涨
+            //             if buf.len() >= 48000 || last_flush.elapsed() >= Duration::from_secs(1) {
+            //                 flush_i16(system_writer2.clone(), &mut buf);
+            //                 last_flush = Instant::now();
+            //             }
+            //         }
+            //         None => break,
+            //     }
+            // }
+
+            use tokio::time::timeout;
+
+            while !stop2.load(Ordering::Acquire) {
+                // ✅ 最关键：不要无限等待 next()
+                match timeout(Duration::from_millis(200), system_stream.next()).await {
+                    Ok(Some(s)) => {
+                        let s: f32 = s;
+                        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        buf.push(v);
+
+                        if buf.len() >= 48000 || last_flush.elapsed() >= Duration::from_secs(1) {
+                            flush_i16(system_writer2.clone(), &mut buf);
+                            last_flush = Instant::now();
+                        }
+                    }
+                    Ok(None) => break, // stream ended
+                    Err(_) => {
+                        // timeout：没拿到数据，继续循环
+                        // 这样每 200ms 都能检查 stop flag
+                    }
+                }
+            }
+
+            if !buf.is_empty() {
+                flush_i16(system_writer2.clone(), &mut buf);
+            }
+
+            // 给 mic 回调一点时间写尾巴（可选）
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        // 4) drop streams => stop
+        drop(mic_stream);
+
+        // finalize wav（system/mic）
+        let _ = system_writer.lock().unwrap().finalize();
+        let _ = mic_writer.lock().unwrap().finalize();
+
+        // 5) 生成 mix（mic_gain 可调）
+        if let Err(e) = mix_pcm16_wav(&mic_path_t, &system_path_t, &mix_path_t, 3.0, 1.0) {
+            eprintln!("❌ mix failed: {e:?}");
+        } else {
+            println!("✅ mix.wav: {}", mix_path_t.display());
+        }
+    });
+
+    *guard = Some(RecorderHandle {
+        stop,
+        join,
+        base_dir: base.clone(),
+        mic_path: mic_path.clone(),
+        system_path: system_path.clone(),
+        mix_path: mix_path.clone(),
+    });
+
+    // 返回路径（让你知道文件位置）
+    Ok((
+        system_path.display().to_string(),
+        mic_path.display().to_string(),
+    ))
+}
+
+// #[tauri::command]
+// fn stop_recording() -> Result<(String, String, String), String> {
+//     let mut guard = RECORDER.lock().unwrap();
+//     let Some(handle) = guard.take() else {
+//         return Err("recording is not running".into());
+//     };
+
+//     handle.stop.store(true, Ordering::Release);
+
+//     // 等线程结束（录音 finalize + mix）
+//     let _ = handle.join.join();
+
+//     Ok((
+//         handle.system_path.display().to_string(),
+//         handle.mic_path.display().to_string(),
+//         handle.mix_path.display().to_string(),
+//     ))
+// }
+
+#[tauri::command]
+async fn stop_recording() -> Result<(String, String, String), String> {
+    let handle = {
+        let mut guard = RECORDER.lock().unwrap();
+        guard.take().ok_or("recording is not running")?
+    };
+
+    handle.stop.store(true, Ordering::Release);
+
+    // ✅ 不要阻塞 IPC/UI，放到 blocking 线程池里 join
+    let system_path = handle.system_path.clone();
+    let mic_path = handle.mic_path.clone();
+    let mix_path = handle.mix_path.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = handle.join.join();
+        (system_path, mic_path, mix_path)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .map(|(s, m, x)| {
+        (
+            s.display().to_string(),
+            m.display().to_string(),
+            x.display().to_string(),
+        )
+    })
+}
+
 fn start_demo_recording(app: tauri::AppHandle, seconds: u64) -> Result<(String, String), String> {
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -445,26 +668,24 @@ fn start_demo_recording(app: tauri::AppHandle, seconds: u64) -> Result<(String, 
 
 fn main() {
     tauri::Builder::default()
-        .setup(|app| {
-            // 一启动就开始录音：10 秒
-            let handle = app.handle().clone();
-
-            std::thread::spawn(move || {
-                // 这里直接调用我们写的 command 函数即可
-                match start_demo_recording(handle, 10) {
-                    Ok((system_path, mic_path)) => {
-                        println!("✅ system.wav: {}", system_path);
-                        println!("✅ mic.wav: {}", mic_path);
-                    }
-                    Err(e) => {
-                        eprintln!("❌ recording failed: {}", e);
-                    }
-                }
-            });
-
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![start_demo_recording])
+        // .setup(|app| {
+        //     // 一启动就开始录音：10 秒
+        //     let handle = app.handle().clone();
+        //     std::thread::spawn(move || {
+        //         // 这里直接调用我们写的 command 函数即可
+        //         match start_demo_recording(handle, 10) {
+        //             Ok((system_path, mic_path)) => {
+        //                 println!("✅ system.wav: {}", system_path);
+        //                 println!("✅ mic.wav: {}", mic_path);
+        //             }
+        //             Err(e) => {
+        //                 eprintln!("❌ recording failed: {}", e);
+        //             }
+        //         }
+        //     });
+        //     Ok(())
+        // })
+        .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
