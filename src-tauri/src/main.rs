@@ -127,6 +127,22 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
 
     writer.lock().unwrap().init_pcm16(sample_rate, channels)?;
 
+    // --- Mic AGC state (shared across callbacks) ---
+    // Store gain in Q8 fixed-point (gain * 256) so we can keep it in an atomic.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MIC_GAIN_Q8: AtomicU32 = AtomicU32::new((50.0_f32 * 256.0_f32) as u32);
+
+    // Tunables (safe defaults)
+    // Base gain keeps your original loudness in non-call scenarios.
+    // AGC will only BOOST above this when the system/WeChat suppresses the mic.
+    let base_gain: f32 = 50.0; // keep previous behavior when mic is normal
+    let target_rms: f32 = 0.08; // desired loudness (0..1) *when boosting*
+                                // Note: we do NOT attenuate below base_gain in this strategy.
+    let max_gain: f32 = 400.0; // cap to prevent runaway amplification
+    let smooth: f32 = 0.90; // 0.0..1.0, higher = smoother/slower gain changes
+    let limiter: f32 = 0.98; // soft limiter threshold
+    let rms_floor: f32 = 1.0e-5; // avoid divide-by-zero / silence spikes
+
     let stream_config: cpal::StreamConfig = cfg.clone().into();
     let err_fn = |err| eprintln!("mic stream error: {err}");
 
@@ -136,12 +152,88 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
             let stream = dev.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
-                    // 你要更响可以把 gain 调大，比如 4.0/6.0
-                    let gain: f32 = 50.0;
+                    if data.is_empty() {
+                        return;
+                    }
+
+                    // Compute RMS on the incoming buffer (interleaved channels).
+                    let mut sum = 0.0f32;
+                    for &x in data {
+                        sum += x * x;
+                    }
+                    let rms = (sum / (data.len() as f32)).sqrt();
+
+                    // Read current gain (Q8 -> f32)
+                    let mut gain = (MIC_GAIN_Q8.load(Ordering::Relaxed) as f32) / 256.0;
+                    if gain < base_gain {
+                        gain = base_gain;
+                    }
+
+                    // Update gain towards desired value (smoothed)
+                    if rms > rms_floor {
+                        let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
+                        gain =
+                            (gain * smooth + desired * (1.0 - smooth)).clamp(base_gain, max_gain);
+                        MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
+                    }
+
+                    // Convert to PCM16 with soft limiter.
+                    let mut bytes = Vec::with_capacity(data.len() * 2);
+                    for &x in data {
+                        let mut y = x * gain;
+                        if y > limiter {
+                            y = limiter;
+                        } else if y < -limiter {
+                            y = -limiter;
+                        }
+                        let v = (y * i16::MAX as f32) as i16;
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+
+                    w.lock().unwrap().write_data(&bytes);
+                },
+                err_fn,
+                None,
+            )?;
+            Ok(stream)
+        }
+        cpal::SampleFormat::I16 => {
+            let w = writer.clone();
+            let stream = dev.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| {
+                    if data.is_empty() {
+                        return;
+                    }
+
+                    // RMS in normalized float domain
+                    let mut sum = 0.0f32;
+                    for &x in data {
+                        let xf = x as f32 / i16::MAX as f32;
+                        sum += xf * xf;
+                    }
+                    let rms = (sum / (data.len() as f32)).sqrt();
+
+                    let mut gain = (MIC_GAIN_Q8.load(Ordering::Relaxed) as f32) / 256.0;
+                    if gain < base_gain {
+                        gain = base_gain;
+                    }
+                    if rms > rms_floor {
+                        let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
+                        gain =
+                            (gain * smooth + desired * (1.0 - smooth)).clamp(base_gain, max_gain);
+                        MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
+                    }
 
                     let mut bytes = Vec::with_capacity(data.len() * 2);
                     for &x in data {
-                        let v = ((x * gain).clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        let mut y = (x as f32 / i16::MAX as f32) * gain;
+                        if y > limiter {
+                            y = limiter;
+                        } else if y < -limiter {
+                            y = -limiter;
+                        }
+                        let v = (y * i16::MAX as f32) as i16;
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     w.lock().unwrap().write_data(&bytes);
@@ -151,7 +243,53 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
             )?;
             Ok(stream)
         }
-        other => anyhow::bail!("mic format {:?} not handled in demo", other),
+        cpal::SampleFormat::U16 => {
+            let w = writer.clone();
+            let stream = dev.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _| {
+                    if data.is_empty() {
+                        return;
+                    }
+
+                    // Map u16 [0, 65535] -> float [-1, 1]
+                    let mut sum = 0.0f32;
+                    for &x in data {
+                        let xf = (x as f32 / u16::MAX as f32) * 2.0 - 1.0;
+                        sum += xf * xf;
+                    }
+                    let rms = (sum / (data.len() as f32)).sqrt();
+
+                    let mut gain = (MIC_GAIN_Q8.load(Ordering::Relaxed) as f32) / 256.0;
+                    if gain < base_gain {
+                        gain = base_gain;
+                    }
+                    if rms > rms_floor {
+                        let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
+                        gain =
+                            (gain * smooth + desired * (1.0 - smooth)).clamp(base_gain, max_gain);
+                        MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
+                    }
+
+                    let mut bytes = Vec::with_capacity(data.len() * 2);
+                    for &x in data {
+                        let mut y = ((x as f32 / u16::MAX as f32) * 2.0 - 1.0) * gain;
+                        if y > limiter {
+                            y = limiter;
+                        } else if y < -limiter {
+                            y = -limiter;
+                        }
+                        let v = (y * i16::MAX as f32) as i16;
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    w.lock().unwrap().write_data(&bytes);
+                },
+                err_fn,
+                None,
+            )?;
+            Ok(stream)
+        }
+        other => anyhow::bail!("mic format {:?} not handled", other),
     }
 }
 
