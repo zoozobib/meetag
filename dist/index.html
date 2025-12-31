@@ -5,6 +5,8 @@
     <button id="start">Start</button>
     <button id="stop">Stop</button>
     <pre id="log"></pre>
+    <h3>Transcript</h3>
+    <pre id="tx"></pre>
 
     <script>
         const log = (s) => {
@@ -20,6 +22,21 @@
             }
             return await window.__TAURI__.core.invoke(cmd, args);
         }
+
+        // Listen to realtime ASR events
+        const listen = window.__TAURI__?.event?.listen;
+        async function setupListeners() {
+            if (!listen) { log("⚠️ tauri event.listen not available"); return; }
+            await listen('asr_final', (event) => {
+                const tx = document.getElementById('tx');
+                tx.textContent += event.payload + "\n";
+            });
+            await listen('asr_partial', (event) => {
+                // optional: show partial in last line
+            });
+            log('✅ ASR listeners ready');
+        }
+        setupListeners();
 
         document.getElementById("start").onclick = async () => {
             log("▶ start_recording...");
@@ -40,6 +57,18 @@
                 log("❌ stop err: " + e);
             }
         };
+
+        // Auto-start realtime ASR on page load
+        window.addEventListener("DOMContentLoaded", async () => {
+            try {
+                log("🚀 auto start realtime ASR...");
+                await invoke("start_realtime_asr", { serverUrl: "http://127.0.0.1:8178/transcribe" });
+                log("✅ realtime ASR started");
+            } catch (e) {
+                log("❌ start_realtime_asr failed: " + e);
+            }
+        });
+
     </script>
 </body>
 

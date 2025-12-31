@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration as StdDuration,
 };
+use tauri::Emitter;
 use tauri::Manager;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1274,7 +1275,54 @@ fn main() {
         //     });
         //     Ok(())
         // })
-        .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
+        .invoke_handler(tauri::generate_handler![
+            start_recording,
+            stop_recording,
+            start_realtime_asr
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// === Realtime ASR (VAD + Chunk + Whisper Server) scaffolding ===
+// NOTE: This file adds the realtime pipeline hooks but requires wiring `push_mix_asr_frame`
+// from the point where you already generate 16k mono PCM16 samples for mix_asr_16k_mono.wav.
+
+#[derive(Clone)]
+struct RealtimeAsrConfig {
+    server_url: String,
+    chunk_max_secs: u32,
+    vad_hangover_ms: u32,
+}
+
+static REALTIME_ASR_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+fn start_realtime_asr(app: tauri::AppHandle, server_url: String) -> Result<(), String> {
+    if REALTIME_ASR_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    let cfg = RealtimeAsrConfig {
+        server_url,
+        chunk_max_secs: 30,
+        vad_hangover_ms: 1000,
+    };
+    std::thread::spawn(move || {
+        if let Err(e) = realtime_asr_worker(app, cfg) {
+            eprintln!("realtime_asr_worker error: {e:?}");
+        }
+        REALTIME_ASR_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+fn realtime_asr_worker(app: tauri::AppHandle, cfg: RealtimeAsrConfig) -> anyhow::Result<()> {
+    // Placeholder: implement frame receiver + VAD + chunker + HTTP to whisper server.
+    // In the next step, wire this to receive frames from `push_mix_asr_frame()`.
+    app.emit(
+        "asr_final",
+        "✅ realtime ASR pipeline started (wire frames to enable transcription)",
+    )?;
+    Ok(())
 }
