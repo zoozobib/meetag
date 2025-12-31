@@ -112,7 +112,10 @@ fn flush_i16(writer: Arc<Mutex<WavWriter>>, buf: &mut Vec<i16>) {
 // =====================
 // MIC capture (CPAL) -> mic.wav
 // =====================
-fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
+fn start_mic_stream(
+    writer_raw: Arc<Mutex<WavWriter>>,
+    writer_asr: Arc<Mutex<WavWriter>>,
+) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let dev = host
         .default_input_device()
@@ -125,7 +128,12 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
     let sample_rate = cfg.sample_rate().0;
     let channels = cfg.channels() as u16;
 
-    writer.lock().unwrap().init_pcm16(sample_rate, channels)?;
+    writer_raw
+        .lock()
+        .unwrap()
+        .init_pcm16(sample_rate, channels)?;
+    // ASR-ready track: 16kHz mono PCM16
+    writer_asr.lock().unwrap().init_pcm16(16_000, 1)?;
 
     // --- Mic AGC state (shared across callbacks) ---
     // Store gain in Q8 fixed-point (gain * 256) so we can keep it in an atomic.
@@ -148,7 +156,17 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
 
     match cfg.sample_format() {
         cpal::SampleFormat::F32 => {
-            let w = writer.clone();
+            let w = writer_raw.clone();
+            let w_asr = writer_asr.clone();
+            let mut rs_phase: f32 = 0.0;
+            let ratio: f32 = sample_rate as f32 / 16_000.0;
+            let mut prev_mono: f32 = 0.0;
+            let mut rs_phase: f32 = 0.0;
+            let ratio: f32 = sample_rate as f32 / 16_000.0;
+            let mut prev_mono: f32 = 0.0;
+            let mut rs_phase: f32 = 0.0;
+            let ratio: f32 = sample_rate as f32 / 16_000.0;
+            let mut prev_mono: f32 = 0.0;
             let stream = dev.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
@@ -191,6 +209,44 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
                     }
 
                     w.lock().unwrap().write_data(&bytes);
+
+                    // --- ASR track: downmix to mono, resample to 16k, then PCM16 ---
+                    let ch = channels as usize;
+                    let mut asr_bytes = Vec::new();
+                    if ch == 0 {
+                        return;
+                    }
+                    // Iterate frames
+                    for frame_idx in 0..(data.len() / ch) {
+                        let mut mono = 0.0f32;
+                        for c in 0..ch {
+                            mono += data[frame_idx * ch + c] as f32;
+                        }
+                        mono /= ch as f32;
+                        mono *= gain;
+
+                        // soft limiter
+                        if mono > limiter {
+                            mono = limiter;
+                        } else if mono < -limiter {
+                            mono = -limiter;
+                        }
+
+                        // linear resample: emit when phase crosses 1.0
+                        // phase advances by 1/ratio per input sample (input_sr / 16000 = ratio)
+                        rs_phase += 1.0 / ratio;
+                        while rs_phase >= 1.0 {
+                            let t = 1.0 - (rs_phase - 1.0);
+                            let y = prev_mono + (mono - prev_mono) * t;
+                            let v = (y * i16::MAX as f32) as i16;
+                            asr_bytes.extend_from_slice(&v.to_le_bytes());
+                            rs_phase -= 1.0;
+                        }
+                        prev_mono = mono;
+                    }
+                    if !asr_bytes.is_empty() {
+                        w_asr.lock().unwrap().write_data(&asr_bytes);
+                    }
                 },
                 err_fn,
                 None,
@@ -198,7 +254,14 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
             Ok(stream)
         }
         cpal::SampleFormat::I16 => {
-            let w = writer.clone();
+            let w = writer_raw.clone();
+            let w_asr = writer_asr.clone();
+            let mut rs_phase: f32 = 0.0;
+            let ratio: f32 = sample_rate as f32 / 16_000.0;
+            let mut prev_mono: f32 = 0.0;
+            let mut rs_phase: f32 = 0.0;
+            let ratio: f32 = sample_rate as f32 / 16_000.0;
+            let mut prev_mono: f32 = 0.0;
             let stream = dev.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
@@ -237,6 +300,44 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     w.lock().unwrap().write_data(&bytes);
+
+                    // --- ASR track: downmix to mono, resample to 16k, then PCM16 ---
+                    let ch = channels as usize;
+                    let mut asr_bytes = Vec::new();
+                    if ch == 0 {
+                        return;
+                    }
+                    // Iterate frames
+                    for frame_idx in 0..(data.len() / ch) {
+                        let mut mono = 0.0f32;
+                        for c in 0..ch {
+                            mono += data[frame_idx * ch + c] as f32;
+                        }
+                        mono /= ch as f32;
+                        mono *= gain;
+
+                        // soft limiter
+                        if mono > limiter {
+                            mono = limiter;
+                        } else if mono < -limiter {
+                            mono = -limiter;
+                        }
+
+                        // linear resample: emit when phase crosses 1.0
+                        // phase advances by 1/ratio per input sample (input_sr / 16000 = ratio)
+                        rs_phase += 1.0 / ratio;
+                        while rs_phase >= 1.0 {
+                            let t = 1.0 - (rs_phase - 1.0);
+                            let y = prev_mono + (mono - prev_mono) * t;
+                            let v = (y * i16::MAX as f32) as i16;
+                            asr_bytes.extend_from_slice(&v.to_le_bytes());
+                            rs_phase -= 1.0;
+                        }
+                        prev_mono = mono;
+                    }
+                    if !asr_bytes.is_empty() {
+                        w_asr.lock().unwrap().write_data(&asr_bytes);
+                    }
                 },
                 err_fn,
                 None,
@@ -244,7 +345,11 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
             Ok(stream)
         }
         cpal::SampleFormat::U16 => {
-            let w = writer.clone();
+            let w = writer_raw.clone();
+            let w_asr = writer_asr.clone();
+            let mut rs_phase: f32 = 0.0;
+            let ratio: f32 = sample_rate as f32 / 16_000.0;
+            let mut prev_mono: f32 = 0.0;
             let stream = dev.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _| {
@@ -283,6 +388,44 @@ fn start_mic_stream(writer: Arc<Mutex<WavWriter>>) -> Result<cpal::Stream> {
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     w.lock().unwrap().write_data(&bytes);
+
+                    // --- ASR track: downmix to mono, resample to 16k, then PCM16 ---
+                    let ch = channels as usize;
+                    let mut asr_bytes = Vec::new();
+                    if ch == 0 {
+                        return;
+                    }
+                    // Iterate frames
+                    for frame_idx in 0..(data.len() / ch) {
+                        let mut mono = 0.0f32;
+                        for c in 0..ch {
+                            mono += data[frame_idx * ch + c] as f32;
+                        }
+                        mono /= ch as f32;
+                        mono *= gain;
+
+                        // soft limiter
+                        if mono > limiter {
+                            mono = limiter;
+                        } else if mono < -limiter {
+                            mono = -limiter;
+                        }
+
+                        // linear resample: emit when phase crosses 1.0
+                        // phase advances by 1/ratio per input sample (input_sr / 16000 = ratio)
+                        rs_phase += 1.0 / ratio;
+                        while rs_phase >= 1.0 {
+                            let t = 1.0 - (rs_phase - 1.0);
+                            let y = prev_mono + (mono - prev_mono) * t;
+                            let v = (y * i16::MAX as f32) as i16;
+                            asr_bytes.extend_from_slice(&v.to_le_bytes());
+                            rs_phase -= 1.0;
+                        }
+                        prev_mono = mono;
+                    }
+                    if !asr_bytes.is_empty() {
+                        w_asr.lock().unwrap().write_data(&asr_bytes);
+                    }
                 },
                 err_fn,
                 None,
@@ -644,6 +787,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
     let system_path = base.join("system.wav");
     let mic_path = base.join("mic.wav");
+    let mic_asr_path = base.join("mic_asr_16k_mono.wav");
     let mix_path = base.join("mix.wav");
 
     // 先创建 writer（写 wav header）
@@ -652,6 +796,9 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     ));
     let mic_writer = Arc::new(Mutex::new(
         WavWriter::create(&mic_path).map_err(|e| e.to_string())?,
+    ));
+    let mic_asr_writer = Arc::new(Mutex::new(
+        WavWriter::create(&mic_asr_path).map_err(|e| e.to_string())?,
     ));
 
     // stop flag
@@ -665,7 +812,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     // 开线程跑录音
     let join = std::thread::spawn(move || {
         // 1) MIC stream
-        let mic_stream = match start_mic_stream(mic_writer.clone()) {
+        let mic_stream = match start_mic_stream(mic_writer.clone(), mic_asr_writer.clone()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("❌ start_mic_stream failed: {e:?}");
@@ -768,6 +915,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         // finalize wav（system/mic）
         let _ = system_writer.lock().unwrap().finalize();
         let _ = mic_writer.lock().unwrap().finalize();
+        let _ = mic_asr_writer.lock().unwrap().finalize();
 
         // 5) 生成 mix（mic_gain 可调）
         if let Err(e) = mix_pcm16_wav(&mic_path_t, &system_path_t, &mix_path_t) {
