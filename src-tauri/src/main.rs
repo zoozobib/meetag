@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration as StdDuration,
 };
@@ -27,6 +27,7 @@ struct RecorderHandle {
     mic_path: PathBuf,
     system_path: PathBuf,
     mix_path: PathBuf,
+    mix_asr_path: PathBuf,
 }
 
 // =====================
@@ -789,6 +790,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     let mic_path = base.join("mic.wav");
     let mic_asr_path = base.join("mic_asr_16k_mono.wav");
     let mix_path = base.join("mix.wav");
+    let mix_asr_path = base.join("mix_asr_16k_mono.wav");
 
     // 先创建 writer（写 wav header）
     let system_writer = Arc::new(Mutex::new(
@@ -808,6 +810,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     let mic_path_t = mic_path.clone();
     let system_path_t = system_path.clone();
     let mix_path_t = mix_path.clone();
+    let mix_asr_path_t = mix_asr_path.clone();
 
     // 开线程跑录音
     let join = std::thread::spawn(move || {
@@ -922,6 +925,12 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             eprintln!("❌ mix failed: {e:?}");
         } else {
             println!("✅ mix.wav: {}", mix_path_t.display());
+
+            // Convert mix.wav -> mix_asr_16k_mono.wav (Whisper.cpp-ready)
+            match convert_wav_to_16k_mono_pcm16(&mix_path_t, &mix_asr_path_t) {
+                Ok(()) => println!("✅ mix_asr_16k_mono.wav: {}", mix_asr_path_t.display()),
+                Err(e) => eprintln!("❌ convert mix_asr failed: {e:?}"),
+            }
         }
     });
 
@@ -932,6 +941,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         mic_path: mic_path.clone(),
         system_path: system_path.clone(),
         mix_path: mix_path.clone(),
+        mix_asr_path: mix_asr_path.clone(),
     });
 
     // 返回路径（让你知道文件位置）
@@ -1108,6 +1118,142 @@ async fn stop_recording() -> Result<(String, String, String), String> {
 //         .run(tauri::generate_context!())
 //         .expect("error while running tauri application");
 // }
+
+/// Convert a PCM16 WAV (any sample rate, mono/stereo) into 16kHz mono PCM16 WAV.
+/// This is intended for Whisper.cpp input (stable: 16k/mono/s16le).
+/// - Reads input as PCM16 (fmt audio_format=1, bits_per_sample=16)
+/// - Downmixes to mono by averaging channels
+/// - Linear resamples to 16kHz
+
+/// Parse a minimal WAV header and return (fmt_start, fmt_size, data_start, data_size).
+/// Supports standard RIFF/WAVE with 'fmt ' and 'data' chunks.
+/// Returns offsets within the provided buffer.
+fn parse_wav_header(buf: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    if buf.len() < 44 {
+        anyhow::bail!("wav too small");
+    }
+    if &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
+        anyhow::bail!("not a RIFF/WAVE file");
+    }
+    let mut pos = 12usize;
+    let mut fmt_found: Option<(usize, usize)> = None;
+    let mut data_found: Option<(usize, usize)> = None;
+
+    while pos + 8 <= buf.len() {
+        let chunk_id = &buf[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let chunk_data_start = pos + 8;
+        let chunk_data_end = chunk_data_start.saturating_add(chunk_size);
+
+        if chunk_data_end > buf.len() {
+            break;
+        }
+
+        if chunk_id == b"fmt " {
+            fmt_found = Some((chunk_data_start, chunk_size));
+        } else if chunk_id == b"data" {
+            data_found = Some((chunk_data_start, chunk_size));
+            break;
+        }
+
+        // chunks are word-aligned (pad to even)
+        pos = chunk_data_end + (chunk_size % 2);
+    }
+
+    let (fmt_start, fmt_size) = fmt_found.ok_or_else(|| anyhow::anyhow!("missing fmt chunk"))?;
+    let (data_start, data_size) =
+        data_found.ok_or_else(|| anyhow::anyhow!("missing data chunk"))?;
+    Ok((fmt_start, fmt_size, data_start, data_size))
+}
+
+fn convert_wav_to_16k_mono_pcm16(input_path: &Path, output_path: &Path) -> Result<()> {
+    let bytes = std::fs::read(input_path).with_context(|| format!("read {:?}", input_path))?;
+    let (fmt_start, fmt_size, data_start, data_size) =
+        parse_wav_header(&bytes).context("parse wav header")?;
+
+    // Parse fmt chunk (PCM)
+    if fmt_size < 16 {
+        anyhow::bail!("fmt chunk too small");
+    }
+    let audio_format = u16::from_le_bytes(bytes[fmt_start..fmt_start + 2].try_into().unwrap());
+    if audio_format != 1 {
+        anyhow::bail!(
+            "unsupported wav audio_format {}, only PCM(1) supported",
+            audio_format
+        );
+    }
+    let channels =
+        u16::from_le_bytes(bytes[fmt_start + 2..fmt_start + 4].try_into().unwrap()) as usize;
+    let sample_rate = u32::from_le_bytes(bytes[fmt_start + 4..fmt_start + 8].try_into().unwrap());
+    let bits_per_sample =
+        u16::from_le_bytes(bytes[fmt_start + 14..fmt_start + 16].try_into().unwrap());
+    if bits_per_sample != 16 {
+        anyhow::bail!(
+            "unsupported bits_per_sample {}, only 16 supported",
+            bits_per_sample
+        );
+    }
+    if channels == 0 {
+        anyhow::bail!("invalid channels=0");
+    }
+
+    // Prepare writer
+    let mut w = WavWriter::create(output_path)?;
+    w.init_pcm16(16_000, 1)?;
+
+    // Linear resample
+    let ratio = sample_rate as f32 / 16_000.0;
+    if ratio <= 0.0 {
+        anyhow::bail!("invalid sample_rate {}", sample_rate);
+    }
+
+    let mut phase: f32 = 0.0;
+    let mut prev: f32 = 0.0;
+    let mut first = true;
+
+    let mut out_bytes: Vec<u8> = Vec::with_capacity((data_size as usize / 2) * 2);
+    let samples = &bytes[data_start..data_start + data_size];
+
+    let frame_count = (samples.len() / 2) / channels;
+    for i in 0..frame_count {
+        // downmix
+        let mut mono = 0.0f32;
+        for c in 0..channels {
+            let off = (i * channels + c) * 2;
+            let s = i16::from_le_bytes(samples[off..off + 2].try_into().unwrap());
+            mono += s as f32 / i16::MAX as f32;
+        }
+        mono /= channels as f32;
+
+        if first {
+            prev = mono;
+            first = false;
+        }
+
+        phase += 1.0 / ratio;
+        while phase >= 1.0 {
+            let t = 1.0 - (phase - 1.0);
+            let y = prev + (mono - prev) * t;
+            let v = (y.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            out_bytes.extend_from_slice(&v.to_le_bytes());
+            phase -= 1.0;
+        }
+
+        prev = mono;
+
+        // Flush periodically to keep memory bounded
+        if out_bytes.len() >= 64 * 1024 {
+            w.write_data(&out_bytes);
+            out_bytes.clear();
+        }
+    }
+
+    if !out_bytes.is_empty() {
+        w.write_data(&out_bytes);
+    }
+    w.finalize()?;
+    Ok(())
+}
 
 fn main() {
     tauri::Builder::default()
