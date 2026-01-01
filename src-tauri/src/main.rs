@@ -10,6 +10,15 @@ use std::{
     time::Duration as StdDuration,
 };
 use tauri::Emitter;
+
+static LAST_RECORD_BASE: once_cell::sync::OnceCell<std::sync::Mutex<Option<std::path::PathBuf>>> =
+    once_cell::sync::OnceCell::new();
+
+static MIC_PCM_TX: Lazy<std::sync::Mutex<Option<std::sync::mpsc::Sender<i16>>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+static SYS_PCM_TX: Lazy<std::sync::Mutex<Option<std::sync::mpsc::Sender<i16>>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
 use tauri::Manager;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -211,6 +220,7 @@ fn start_mic_stream(
                     }
 
                     w.lock().unwrap().write_data(&bytes);
+                    w.lock().unwrap().write_data(&bytes);
 
                     // --- ASR track: downmix to mono, resample to 16k, then PCM16 ---
                     let ch = channels as usize;
@@ -248,6 +258,14 @@ fn start_mic_stream(
                     }
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
+
+                        // Send 16k mono ASR samples to mixer
+                        if let Some(tx) = MIC_PCM_TX.lock().unwrap().as_ref() {
+                            for ch in asr_bytes.chunks_exact(2) {
+                                let v = i16::from_le_bytes([ch[0], ch[1]]);
+                                let _ = tx.send(v);
+                            }
+                        }
                     }
                 },
                 err_fn,
@@ -339,6 +357,14 @@ fn start_mic_stream(
                     }
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
+
+                        // Send 16k mono ASR samples to mixer
+                        if let Some(tx) = MIC_PCM_TX.lock().unwrap().as_ref() {
+                            for ch in asr_bytes.chunks_exact(2) {
+                                let v = i16::from_le_bytes([ch[0], ch[1]]);
+                                let _ = tx.send(v);
+                            }
+                        }
                     }
                 },
                 err_fn,
@@ -427,6 +453,14 @@ fn start_mic_stream(
                     }
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
+
+                        // Send 16k mono ASR samples to mixer
+                        if let Some(tx) = MIC_PCM_TX.lock().unwrap().as_ref() {
+                            for ch in asr_bytes.chunks_exact(2) {
+                                let v = i16::from_le_bytes([ch[0], ch[1]]);
+                                let _ = tx.send(v);
+                            }
+                        }
                     }
                 },
                 err_fn,
@@ -806,6 +840,47 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
     // stop flag
     let stop = Arc::new(AtomicBool::new(false));
+    // realtime pcm channels
+    let (mic_pcm_tx, mic_pcm_rx) = std::sync::mpsc::channel::<i16>();
+    let (sys_pcm_tx, sys_pcm_rx) = std::sync::mpsc::channel::<i16>();
+    let (mix_pcm_tx, mix_pcm_rx) = std::sync::mpsc::channel::<i16>();
+    *MIC_PCM_TX.lock().unwrap() = Some(mic_pcm_tx.clone());
+    *SYS_PCM_TX.lock().unwrap() = Some(sys_pcm_tx.clone());
+
+    // mixer thread
+    let stop_mix = stop.clone();
+    std::thread::spawn(move || {
+        let mut s_last: i16 = 0;
+        // Synchronize on Mic stream (16kHz clock)
+        while let Ok(mic_sample) = mic_pcm_rx.recv() {
+            if stop_mix.load(Ordering::Acquire) {
+                break;
+            }
+            if let Ok(v) = sys_pcm_rx.try_recv() {
+                s_last = v;
+            } else {
+                // If system stream is slower/empty, reuse last sample or zero?
+                // reusing last sample is better than silence for tiny jitters,
+                // but for ASR, silence (0) might be safer to avoid buzzing artifacts.
+                // Let's degrade to 0 if queue is effectively empty to avoid stuck-tone.
+                if s_last != 0 {
+                    s_last = 0;
+                }
+            }
+
+            // Saturation mix
+            let sum = mic_sample as i32 + s_last as i32;
+            let mixed = sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let _ = mix_pcm_tx.send(mixed);
+        }
+    });
+
+    // asr worker thread (chunks -> /inference)
+    let asr_app = app.clone();
+    let stop_asr = stop.clone();
+    std::thread::spawn(move || {
+        let _ = realtime_inference_worker(asr_app, stop_asr, mix_pcm_rx);
+    });
     let stop2 = stop.clone();
 
     let mic_path_t = mic_path.clone();
@@ -871,6 +946,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             //             let s: f32 = s;
             //             let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             //             buf.push(v);
+            // if let Some(tx)=SYS_PCM_TX.lock().unwrap().as_ref(){ let _=tx.send(v); }
 
             //             // 每 1 秒 flush 一次，避免内存一直涨
             //             if buf.len() >= 48000 || last_flush.elapsed() >= Duration::from_secs(1) {
@@ -884,6 +960,14 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
             use tokio::time::timeout;
 
+            // System Resample State
+            let mut rs_phase: f32 = 0.0;
+            // Assuming system audio is 48kHz (typical) or whatever `system_stream.sample_rate()` returned.
+            // But here we need to know the INPUT sample rate to calc ratio.
+            // `sr` variable holds it from line 887.
+            let ratio = sr as f32 / 16_000.0;
+            let mut prev_sample: f32 = 0.0;
+
             while !stop2.load(Ordering::Acquire) {
                 // ✅ 最关键：不要无限等待 next()
                 match timeout(Duration::from_millis(200), system_stream.next()).await {
@@ -891,6 +975,22 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                         let s: f32 = s;
                         let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         buf.push(v);
+
+                        // --- Resample to 16kHz for ASR Mixer ---
+                        // Linear interpolation
+                        rs_phase += 1.0 / ratio;
+                        while rs_phase >= 1.0 {
+                            let t = 1.0 - (rs_phase - 1.0);
+                            let y = prev_sample + (s - prev_sample) * t;
+                            let v_asr = (y.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+
+                            if let Some(tx) = SYS_PCM_TX.lock().unwrap().as_ref() {
+                                let _ = tx.send(v_asr);
+                            }
+                            rs_phase -= 1.0;
+                        }
+                        prev_sample = s;
+                        // ---------------------------------------
 
                         if buf.len() >= 48000 || last_flush.elapsed() >= Duration::from_secs(1) {
                             flush_i16(system_writer2.clone(), &mut buf);
@@ -928,7 +1028,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             println!("✅ mix.wav: {}", mix_path_t.display());
 
             // Convert mix.wav -> mix_asr_16k_mono.wav (Whisper.cpp-ready)
-            match convert_wav_to_16k_mono_pcm16(&mix_path_t, &mix_asr_path_t) {
+            match crate::convert_wav_to_16k_mono_pcm16(&mix_path_t, &mix_asr_path_t) {
                 Ok(()) => println!("✅ mix_asr_16k_mono.wav: {}", mix_asr_path_t.display()),
                 Err(e) => eprintln!("❌ convert mix_asr failed: {e:?}"),
             }
@@ -952,7 +1052,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     ))
 }
 
-// #[tauri::command]
+// #[tauri..:command]
 // fn stop_recording() -> Result<(String, String, String), String> {
 //     let mut guard = RECORDER.lock().unwrap();
 //     let Some(handle) = guard.take() else {
@@ -1112,217 +1212,193 @@ async fn stop_recording() -> Result<(String, String, String), String> {
 // =====================
 // App entry
 // =====================
-// fn main() {
-//     tauri::Builder::default()
-//         // 如果你想“0 UI 自动开始录音”，可以在 setup 里直接调用 start_demo_recording
-//         .invoke_handler(tauri::generate_handler![start_demo_recording])
-//         .run(tauri::generate_context!())
-//         .expect("error while running tauri application");
-// }
-
-/// Convert a PCM16 WAV (any sample rate, mono/stereo) into 16kHz mono PCM16 WAV.
-/// This is intended for Whisper.cpp input (stable: 16k/mono/s16le).
-/// - Reads input as PCM16 (fmt audio_format=1, bits_per_sample=16)
-/// - Downmixes to mono by averaging channels
-/// - Linear resamples to 16kHz
-
-/// Parse a minimal WAV header and return (fmt_start, fmt_size, data_start, data_size).
-/// Supports standard RIFF/WAVE with 'fmt ' and 'data' chunks.
-/// Returns offsets within the provided buffer.
-fn parse_wav_header(buf: &[u8]) -> Result<(usize, usize, usize, usize)> {
-    if buf.len() < 44 {
-        anyhow::bail!("wav too small");
-    }
-    if &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
-        anyhow::bail!("not a RIFF/WAVE file");
-    }
-    let mut pos = 12usize;
-    let mut fmt_found: Option<(usize, usize)> = None;
-    let mut data_found: Option<(usize, usize)> = None;
-
-    while pos + 8 <= buf.len() {
-        let chunk_id = &buf[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let chunk_data_start = pos + 8;
-        let chunk_data_end = chunk_data_start.saturating_add(chunk_size);
-
-        if chunk_data_end > buf.len() {
-            break;
-        }
-
-        if chunk_id == b"fmt " {
-            fmt_found = Some((chunk_data_start, chunk_size));
-        } else if chunk_id == b"data" {
-            data_found = Some((chunk_data_start, chunk_size));
-            break;
-        }
-
-        // chunks are word-aligned (pad to even)
-        pos = chunk_data_end + (chunk_size % 2);
-    }
-
-    let (fmt_start, fmt_size) = fmt_found.ok_or_else(|| anyhow::anyhow!("missing fmt chunk"))?;
-    let (data_start, data_size) =
-        data_found.ok_or_else(|| anyhow::anyhow!("missing data chunk"))?;
-    Ok((fmt_start, fmt_size, data_start, data_size))
+//
+fn set_last_record_base(p: std::path::PathBuf) {
+    let m = LAST_RECORD_BASE.get_or_init(|| Mutex::new(None));
+    *m.lock().unwrap() = Some(p);
 }
-
-fn convert_wav_to_16k_mono_pcm16(input_path: &Path, output_path: &Path) -> Result<()> {
-    let bytes = std::fs::read(input_path).with_context(|| format!("read {:?}", input_path))?;
-    let (fmt_start, fmt_size, data_start, data_size) =
-        parse_wav_header(&bytes).context("parse wav header")?;
-
-    // Parse fmt chunk (PCM)
-    if fmt_size < 16 {
-        anyhow::bail!("fmt chunk too small");
-    }
-    let audio_format = u16::from_le_bytes(bytes[fmt_start..fmt_start + 2].try_into().unwrap());
-    if audio_format != 1 {
-        anyhow::bail!(
-            "unsupported wav audio_format {}, only PCM(1) supported",
-            audio_format
-        );
-    }
-    let channels =
-        u16::from_le_bytes(bytes[fmt_start + 2..fmt_start + 4].try_into().unwrap()) as usize;
-    let sample_rate = u32::from_le_bytes(bytes[fmt_start + 4..fmt_start + 8].try_into().unwrap());
-    let bits_per_sample =
-        u16::from_le_bytes(bytes[fmt_start + 14..fmt_start + 16].try_into().unwrap());
-    if bits_per_sample != 16 {
-        anyhow::bail!(
-            "unsupported bits_per_sample {}, only 16 supported",
-            bits_per_sample
-        );
-    }
-    if channels == 0 {
-        anyhow::bail!("invalid channels=0");
-    }
-
-    // Prepare writer
-    let mut w = WavWriter::create(output_path)?;
-    w.init_pcm16(16_000, 1)?;
-
-    // Linear resample
-    let ratio = sample_rate as f32 / 16_000.0;
-    if ratio <= 0.0 {
-        anyhow::bail!("invalid sample_rate {}", sample_rate);
-    }
-
-    let mut phase: f32 = 0.0;
-    let mut prev: f32 = 0.0;
-    let mut first = true;
-
-    let mut out_bytes: Vec<u8> = Vec::with_capacity((data_size as usize / 2) * 2);
-    let samples = &bytes[data_start..data_start + data_size];
-
-    let frame_count = (samples.len() / 2) / channels;
-    for i in 0..frame_count {
-        // downmix
-        let mut mono = 0.0f32;
-        for c in 0..channels {
-            let off = (i * channels + c) * 2;
-            let s = i16::from_le_bytes(samples[off..off + 2].try_into().unwrap());
-            mono += s as f32 / i16::MAX as f32;
-        }
-        mono /= channels as f32;
-
-        if first {
-            prev = mono;
-            first = false;
-        }
-
-        phase += 1.0 / ratio;
-        while phase >= 1.0 {
-            let t = 1.0 - (phase - 1.0);
-            let y = prev + (mono - prev) * t;
-            let v = (y.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            out_bytes.extend_from_slice(&v.to_le_bytes());
-            phase -= 1.0;
-        }
-
-        prev = mono;
-
-        // Flush periodically to keep memory bounded
-        if out_bytes.len() >= 64 * 1024 {
-            w.write_data(&out_bytes);
-            out_bytes.clear();
-        }
-    }
-
-    if !out_bytes.is_empty() {
-        w.write_data(&out_bytes);
-    }
-    w.finalize()?;
-    Ok(())
+fn get_last_record_base() -> Option<std::path::PathBuf> {
+    let m = LAST_RECORD_BASE.get_or_init(|| Mutex::new(None));
+    m.lock().unwrap().clone()
 }
 
 fn main() {
     tauri::Builder::default()
-        // .setup(|app| {
-        //     // 一启动就开始录音：10 秒
-        //     let handle = app.handle().clone();
-        //     std::thread::spawn(move || {
-        //         // 这里直接调用我们写的 command 函数即可
-        //         match start_demo_recording(handle, 10) {
-        //             Ok((system_path, mic_path)) => {
-        //                 println!("✅ system.wav: {}", system_path);
-        //                 println!("✅ mic.wav: {}", mic_path);
-        //             }
-        //             Err(e) => {
-        //                 eprintln!("❌ recording failed: {}", e);
-        //             }
-        //         }
-        //     });
-        //     Ok(())
-        // })
-        .invoke_handler(tauri::generate_handler![
-            start_recording,
-            stop_recording,
-            start_realtime_asr
-        ])
+        .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
-// === Realtime ASR (VAD + Chunk + Whisper Server) scaffolding ===
-// NOTE: This file adds the realtime pipeline hooks but requires wiring `push_mix_asr_frame`
-// from the point where you already generate 16k mono PCM16 samples for mix_asr_16k_mono.wav.
-
-#[derive(Clone)]
-struct RealtimeAsrConfig {
-    server_url: String,
-    chunk_max_secs: u32,
-    vad_hangover_ms: u32,
+fn resample_f32_to_16k(input: &[f32], in_rate: usize) -> Vec<f32> {
+    if in_rate == 16_000 {
+        return input.to_vec();
+    }
+    let ratio = in_rate as f64 / 16_000.0;
+    let out_len = (input.len() as f64 / ratio).ceil() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let a = *input.get(idx).unwrap_or(&0.0);
+        let b = *input.get(idx + 1).unwrap_or(&a);
+        out.push(a + (b - a) * frac);
+    }
+    out
 }
 
-static REALTIME_ASR_RUNNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[tauri::command]
-fn start_realtime_asr(app: tauri::AppHandle, server_url: String) -> Result<(), String> {
-    if REALTIME_ASR_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Ok(());
+fn write_pcm16_wav_16k_mono(path: &std::path::Path, samples: &[i16]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    let data_bytes = (samples.len() * 2) as u32;
+    // RIFF header
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_bytes).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    // fmt chunk
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // PCM
+    f.write_all(&1u16.to_le_bytes())?; // audio format PCM
+    f.write_all(&1u16.to_le_bytes())?; // channels
+    f.write_all(&16000u32.to_le_bytes())?; // sample rate
+    f.write_all(&(16000u32 * 2).to_le_bytes())?; // byte rate
+    f.write_all(&2u16.to_le_bytes())?; // block align
+    f.write_all(&16u16.to_le_bytes())?; // bits
+                                        // data chunk
+    f.write_all(b"data")?;
+    f.write_all(&data_bytes.to_le_bytes())?;
+    for &s in samples {
+        f.write_all(&s.to_le_bytes())?;
     }
-    let cfg = RealtimeAsrConfig {
-        server_url,
-        chunk_max_secs: 30,
-        vad_hangover_ms: 1000,
-    };
-    std::thread::spawn(move || {
-        if let Err(e) = realtime_asr_worker(app, cfg) {
-            eprintln!("realtime_asr_worker error: {e:?}");
-        }
-        REALTIME_ASR_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-    });
     Ok(())
 }
 
-fn realtime_asr_worker(app: tauri::AppHandle, cfg: RealtimeAsrConfig) -> anyhow::Result<()> {
-    // Placeholder: implement frame receiver + VAD + chunker + HTTP to whisper server.
-    // In the next step, wire this to receive frames from `push_mix_asr_frame()`.
-    app.emit(
-        "asr_final",
-        "✅ realtime ASR pipeline started (wire frames to enable transcription)",
-    )?;
+fn convert_wav_to_16k_mono_pcm16(
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
+    // Read WAV PCM16/32float and resample/downmix to 16k mono PCM16.
+    let data = std::fs::read(input_path).map_err(|e| e.to_string())?;
+    if data.len() < 44 {
+        return Err("wav too small".into());
+    }
+    // very small wav parser (PCM/IEEE float)
+    let mut pos = 12;
+    let mut audio_fmt = 1u16;
+    let mut channels = 1u16;
+    let mut sample_rate = 16000u32;
+    let mut bits_per_sample = 16u16;
+    let mut data_chunk: &[u8] = &[];
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let sz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        if pos + sz > data.len() {
+            break;
+        }
+        if id == b"fmt " && sz >= 16 {
+            audio_fmt = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+            channels = u16::from_le_bytes(data[pos + 2..pos + 4].try_into().unwrap());
+            sample_rate = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+            bits_per_sample = u16::from_le_bytes(data[pos + 14..pos + 16].try_into().unwrap());
+        } else if id == b"data" {
+            data_chunk = &data[pos..pos + sz];
+        }
+        pos += sz + (sz % 2);
+    }
+    if data_chunk.is_empty() {
+        return Err("no data chunk".into());
+    }
+    // decode to f32 mono
+    let mut mono: Vec<f32> = Vec::new();
+    if audio_fmt == 1 && bits_per_sample == 16 {
+        let frame_bytes = (channels as usize) * 2;
+        for frame in data_chunk.chunks_exact(frame_bytes) {
+            let mut acc = 0f32;
+            for c in 0..channels as usize {
+                let s = i16::from_le_bytes(frame[c * 2..c * 2 + 2].try_into().unwrap()) as f32
+                    / 32768.0;
+                acc += s;
+            }
+            mono.push(acc / channels as f32);
+        }
+    } else if audio_fmt == 3 && bits_per_sample == 32 {
+        let frame_bytes = (channels as usize) * 4;
+        for frame in data_chunk.chunks_exact(frame_bytes) {
+            let mut acc = 0f32;
+            for c in 0..channels as usize {
+                let s = f32::from_le_bytes(frame[c * 4..c * 4 + 4].try_into().unwrap());
+                acc += s;
+            }
+            mono.push(acc / channels as f32);
+        }
+    } else {
+        return Err(format!(
+            "unsupported wav fmt={} bps={}",
+            audio_fmt, bits_per_sample
+        ));
+    }
+    // resample to 16k
+    let out = resample_f32_to_16k(&mono, sample_rate as usize);
+    // convert to i16
+    let mut pcm: Vec<i16> = Vec::with_capacity(out.len());
+    for &x in &out {
+        let y = (x.max(-1.0).min(1.0) * 32767.0) as i16;
+        pcm.push(y);
+    }
+    write_pcm16_wav_16k_mono(output_path, &pcm).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn realtime_inference_worker(
+    app: tauri::AppHandle,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut rx: std::sync::mpsc::Receiver<i16>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let client = reqwest::blocking::Client::new();
+    let server_url = "http://127.0.0.1:8178/inference";
+    let mut buf: Vec<i16> = Vec::new();
+    let mut last_send = Instant::now();
+    let chunk_secs: f32 = 3.0;
+    let chunk_samples: usize = (16000.0 * chunk_secs) as usize;
+    while !stop.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(s) => {
+                buf.push(s);
+                if buf.len() >= chunk_samples
+                    || last_send.elapsed() >= Duration::from_secs_f32(chunk_secs)
+                {
+                    if buf.len() >= 8000 {
+                        // write temp wav
+                        let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+                        write_pcm16_wav_16k_mono(tmp.path(), &buf).map_err(|e| e.to_string())?;
+                        let form = reqwest::blocking::multipart::Form::new()
+                            .text("response_format", "json")
+                            .text("language", "zh")
+                            .part(
+                                "file",
+                                reqwest::blocking::multipart::Part::file(tmp.path())
+                                    .map_err(|e| e.to_string())?,
+                            );
+                        if let Ok(resp) = client.post(server_url).multipart(form).send() {
+                            if let Ok(txt) = resp.text() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                    if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                                        let _ = app.emit("asr_final", t.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    buf.clear();
+                    last_send = Instant::now();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
     Ok(())
 }
