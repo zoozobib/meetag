@@ -1359,18 +1359,28 @@ fn realtime_inference_worker(
     let client = reqwest::blocking::Client::new();
     let server_url = "http://127.0.0.1:8178/inference";
 
-    let mut buf: Vec<i16> = Vec::with_capacity(16000 * 15);
-
-    // VAD Parameters
+    // Strict Dynamic VAD Parameters
     let frame_size = 480; // 30ms @ 16kHz
-    let vad_threshold = 0.005; // RMS threshold
-    let max_silence_frames = 17; // ~0.5s (17 * 30ms = 510ms)
-    let max_len_samples = 16000 * 15; // 15 seconds
-    let max_silence_buffer_samples = 16000 * 5; // 5 seconds of pure silence to drop
+    let vad_threshold = 0.01; // Increased from 0.005 to 0.01 (block background noise)
+
+    // Debounce: require consecutive speech frames to trigger
+    let min_speech_frames = 3; // 3 * 30ms = 90ms (ignore clicks)
+
+    // Short vs Long pause thresholds (Faster now)
+    let frames_short_pause = 4; // ~120ms (was 180ms)
+    let frames_long_pause = 15; // ~450ms
+
+    // Duration needed to switch to "responsive" mode
+    let samples_long_utterance = 16000 * 2; // 2 seconds (switch to fast cut sooner)
+
+    let max_len_samples = 16000 * 5; // 5 seconds max (force update sooner)
+    let max_silence_buffer_samples = 16000 * 5;
 
     // State
+    let mut buf: Vec<i16> = Vec::with_capacity(max_len_samples);
     let mut is_speaking = false;
     let mut silence_frames = 0;
+    let mut speech_run_count = 0; // for debounce
     let mut frame_accum: Vec<i16> = Vec::with_capacity(frame_size);
 
     while !stop.load(Ordering::Relaxed) {
@@ -1391,51 +1401,66 @@ fn realtime_inference_worker(
                     frame_accum.clear();
 
                     if rms > vad_threshold {
+                        speech_run_count += 1;
+                    } else {
+                        speech_run_count = 0;
+                    }
+
+                    // Trigger "speaking" state only after stability
+                    if speech_run_count >= min_speech_frames {
                         is_speaking = true;
                         silence_frames = 0;
                     } else {
-                        silence_frames += 1;
+                        // If we are already speaking, this counts as silence frame
+                        if is_speaking {
+                            silence_frames += 1;
+                        }
                     }
 
-                    // 1. End of Sentence (Speaking -> Pause > 0.5s)
-                    if is_speaking && silence_frames >= max_silence_frames {
-                        // SEND
-                        if buf.len() > 2000 {
-                            // Avoid super short glitches
+                    // --- Dynamic Segmentation Logic ---
+                    let current_threshold = if buf.len() > samples_long_utterance {
+                        frames_short_pause
+                    } else {
+                        frames_long_pause
+                    };
+
+                    // 1. End of Sentence (Speaking -> Pause > limit)
+                    if is_speaking && silence_frames >= current_threshold {
+                        if buf.len() > 1000 {
+                            // 1000 samples ~ 60ms
                             send_audio_to_asr(&app, &client, server_url, &buf);
                         }
                         buf.clear();
                         is_speaking = false;
                         silence_frames = 0;
+                        speech_run_count = 0;
                     }
                 }
 
-                // 2. Max Length (Force send at 15s)
+                // 2. Max Length (Force send at 5s)
                 if buf.len() >= max_len_samples {
-                    if is_speaking && buf.len() > 16000 {
+                    if is_speaking {
                         send_audio_to_asr(&app, &client, server_url, &buf);
                     }
                     buf.clear();
                     is_speaking = false;
                     silence_frames = 0;
+                    speech_run_count = 0;
                 }
 
-                // 3. Garbage Collection (Long silence at start, e.g. 5s)
+                // 3. Garbage Collection
                 if !is_speaking && buf.len() >= max_silence_buffer_samples {
-                    // Drop buffer (it's just 5s of background noise)
                     buf.clear();
                     silence_frames = 0;
+                    speech_run_count = 0;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Determine if we should flush on timeout/stop?
-                // Mostly just continue checking stop flag.
-            }
-            Err(_) => break, // Disconnected
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
         }
     }
 
-    // Final flush if speaking
+    // Final flush
     if !buf.is_empty() && is_speaking {
         send_audio_to_asr(&app, &client, server_url, &buf);
     }
