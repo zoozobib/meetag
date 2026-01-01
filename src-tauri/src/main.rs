@@ -220,7 +220,6 @@ fn start_mic_stream(
                     }
 
                     w.lock().unwrap().write_data(&bytes);
-                    w.lock().unwrap().write_data(&bytes);
 
                     // --- ASR track: downmix to mono, resample to 16k, then PCM16 ---
                     let ch = channels as usize;
