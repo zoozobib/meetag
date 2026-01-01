@@ -1,74 +1,79 @@
 <!doctype html>
 <html>
 
+<head>
+    <meta charset="utf-8" />
+    <title>Realtime ASR Test</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system;
+            padding: 16px;
+        }
+
+        button {
+            padding: 10px 14px;
+            margin-right: 8px;
+        }
+
+        #log {
+            white-space: pre-wrap;
+            border: 1px solid #ddd;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 12px;
+            height: 320px;
+            overflow: auto;
+        }
+    </style>
+</head>
+
 <body>
-    <button id="start">Start</button>
-    <button id="stop">Stop</button>
-    <pre id="log"></pre>
+    <h2>Realtime ASR Test</h2>
+    <button id="btnStart">Start</button>
+    <button id="btnStop">Stop</button>
+    <div id="status"></div>
     <h3>Transcript</h3>
-    <pre id="tx"></pre>
+    <div id="log"></div>
 
     <script>
-        const log = (s) => {
-            document.getElementById("log").textContent += s + "\n";
-            console.log(s);
-        };
+        const { invoke } = window.__TAURI__.core;
+        const { listen } = window.__TAURI__.event;
 
-        async function invoke(cmd, args) {
-            // ✅ 纯静态页面必须用 window.__TAURI__
-            if (!window.__TAURI__ || !window.__TAURI__.core || !window.__TAURI__.core.invoke) {
-                log("❌ Tauri API not found. window.__TAURI__ is undefined");
-                return null;
-            }
-            return await window.__TAURI__.core.invoke(cmd, args);
+        const logEl = document.getElementById("log");
+        const statusEl = document.getElementById("status");
+
+        function appendLine(s) {
+            logEl.textContent += s + "\n";
+            logEl.scrollTop = logEl.scrollHeight;
         }
 
-        // Listen to realtime ASR events
-        const listen = window.__TAURI__?.event?.listen;
         async function setupListeners() {
-            if (!listen) { log("⚠️ tauri event.listen not available"); return; }
-            await listen('asr_final', (event) => {
-                const tx = document.getElementById('tx');
-                tx.textContent += event.payload + "\n";
-            });
-            await listen('asr_partial', (event) => {
-                // optional: show partial in last line
-            });
-            log('✅ ASR listeners ready');
+            await listen("asr_partial", (e) => { statusEl.textContent = e.payload; });
+            await listen("asr_final", (e) => { appendLine(e.payload); });
+            appendLine("✅ ASR listeners ready");
         }
-        setupListeners();
 
-        document.getElementById("start").onclick = async () => {
-            log("▶ start_recording...");
+        document.getElementById("btnStart").addEventListener("click", async () => {
+            appendLine("▶ start_recording...");
             try {
-                const res = await invoke("start_recording", {});
-                log("✅ started: " + JSON.stringify(res));
-            } catch (e) {
-                log("❌ start err: " + e);
-            }
-        };
-
-        document.getElementById("stop").onclick = async () => {
-            log("■ stop_recording...");
-            try {
-                const res = await invoke("stop_recording", {});
-                log("✅ stopped: " + JSON.stringify(res));
-            } catch (e) {
-                log("❌ stop err: " + e);
-            }
-        };
-
-        // Auto-start realtime ASR on page load
-        window.addEventListener("DOMContentLoaded", async () => {
-            try {
-                log("🚀 auto start realtime ASR...");
-                await invoke("start_realtime_asr", { serverUrl: "http://127.0.0.1:8178/transcribe" });
-                log("✅ realtime ASR started");
-            } catch (e) {
-                log("❌ start_realtime_asr failed: " + e);
+                const out = await invoke("start_recording");
+                appendLine("✅ started: " + JSON.stringify(out));
+            } catch (err) {
+                appendLine("❌ start_recording failed: " + err);
             }
         });
 
+        document.getElementById("btnStop").addEventListener("click", async () => {
+            appendLine("■ stop_recording...");
+            try {
+                const out = await invoke("stop_recording");
+                appendLine("✅ stopped: " + JSON.stringify(out));
+            } catch (err) {
+                appendLine("❌ stop_recording failed: " + err);
+            }
+        });
+
+        setupListeners();
     </script>
 </body>
 

@@ -1355,49 +1355,122 @@ fn realtime_inference_worker(
     mut rx: std::sync::mpsc::Receiver<i16>,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let client = reqwest::blocking::Client::new();
     let server_url = "http://127.0.0.1:8178/inference";
-    let mut buf: Vec<i16> = Vec::new();
-    let mut last_send = Instant::now();
-    let chunk_secs: f32 = 3.0;
-    let chunk_samples: usize = (16000.0 * chunk_secs) as usize;
+
+    let mut buf: Vec<i16> = Vec::with_capacity(16000 * 15);
+
+    // VAD Parameters
+    let frame_size = 480; // 30ms @ 16kHz
+    let vad_threshold = 0.005; // RMS threshold
+    let max_silence_frames = 17; // ~0.5s (17 * 30ms = 510ms)
+    let max_len_samples = 16000 * 15; // 15 seconds
+    let max_silence_buffer_samples = 16000 * 5; // 5 seconds of pure silence to drop
+
+    // State
+    let mut is_speaking = false;
+    let mut silence_frames = 0;
+    let mut frame_accum: Vec<i16> = Vec::with_capacity(frame_size);
+
     while !stop.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(s) => {
                 buf.push(s);
-                if buf.len() >= chunk_samples
-                    || last_send.elapsed() >= Duration::from_secs_f32(chunk_secs)
-                {
-                    if buf.len() >= 8000 {
-                        // write temp wav
-                        let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-                        write_pcm16_wav_16k_mono(tmp.path(), &buf).map_err(|e| e.to_string())?;
-                        let form = reqwest::blocking::multipart::Form::new()
-                            .text("response_format", "json")
-                            .text("language", "zh")
-                            .part(
-                                "file",
-                                reqwest::blocking::multipart::Part::file(tmp.path())
-                                    .map_err(|e| e.to_string())?,
-                            );
-                        if let Ok(resp) = client.post(server_url).multipart(form).send() {
-                            if let Ok(txt) = resp.text() {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                    if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                                        let _ = app.emit("asr_final", t.to_string());
-                                    }
-                                }
+                frame_accum.push(s);
+
+                // Process VAD every frame
+                if frame_accum.len() >= frame_size {
+                    // Calc RMS
+                    let mut sum_sq = 0.0f32;
+                    for &x in &frame_accum {
+                        let xf = x as f32 / i16::MAX as f32;
+                        sum_sq += xf * xf;
+                    }
+                    let rms = (sum_sq / frame_accum.len() as f32).sqrt();
+                    frame_accum.clear();
+
+                    if rms > vad_threshold {
+                        is_speaking = true;
+                        silence_frames = 0;
+                    } else {
+                        silence_frames += 1;
+                    }
+
+                    // 1. End of Sentence (Speaking -> Pause > 0.5s)
+                    if is_speaking && silence_frames >= max_silence_frames {
+                        // SEND
+                        if buf.len() > 2000 {
+                            // Avoid super short glitches
+                            send_audio_to_asr(&app, &client, server_url, &buf);
+                        }
+                        buf.clear();
+                        is_speaking = false;
+                        silence_frames = 0;
+                    }
+                }
+
+                // 2. Max Length (Force send at 15s)
+                if buf.len() >= max_len_samples {
+                    if is_speaking && buf.len() > 16000 {
+                        send_audio_to_asr(&app, &client, server_url, &buf);
+                    }
+                    buf.clear();
+                    is_speaking = false;
+                    silence_frames = 0;
+                }
+
+                // 3. Garbage Collection (Long silence at start, e.g. 5s)
+                if !is_speaking && buf.len() >= max_silence_buffer_samples {
+                    // Drop buffer (it's just 5s of background noise)
+                    buf.clear();
+                    silence_frames = 0;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Determine if we should flush on timeout/stop?
+                // Mostly just continue checking stop flag.
+            }
+            Err(_) => break, // Disconnected
+        }
+    }
+
+    // Final flush if speaking
+    if !buf.is_empty() && is_speaking {
+        send_audio_to_asr(&app, &client, server_url, &buf);
+    }
+
+    Ok(())
+}
+
+fn send_audio_to_asr(
+    app: &tauri::AppHandle,
+    client: &reqwest::blocking::Client,
+    url: &str,
+    samples: &[i16],
+) {
+    if let Ok(tmp) = tempfile::NamedTempFile::new() {
+        if let Ok(_) = write_pcm16_wav_16k_mono(tmp.path(), samples) {
+            let form = reqwest::blocking::multipart::Form::new()
+                .text("response_format", "json")
+                .text("language", "zh")
+                .part(
+                    "file",
+                    reqwest::blocking::multipart::Part::file(tmp.path()).unwrap(), // safe unwrap for temp file we just wrote
+                );
+
+            if let Ok(resp) = client.post(url).multipart(form).send() {
+                if let Ok(txt) = resp.text() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                let _ = app.emit("asr_final", t.to_string());
                             }
                         }
                     }
-                    buf.clear();
-                    last_send = Instant::now();
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => break,
         }
     }
-    Ok(())
 }
