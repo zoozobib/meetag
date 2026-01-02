@@ -155,7 +155,7 @@ fn start_mic_stream(
     // Base gain keeps your original loudness in non-call scenarios.
     // AGC will only BOOST above this when the system/WeChat suppresses the mic.
     let base_gain: f32 = 50.0; // keep previous behavior when mic is normal
-    let target_rms: f32 = 0.08; // desired loudness (0..1) *when boosting*
+    let target_rms: f32 = 0.15; // desired loudness (0..1) *when boosting* ~ -16dBFS
                                 // Note: we do NOT attenuate below base_gain in this strategy.
     let max_gain: f32 = 400.0; // cap to prevent runaway amplification
     let smooth: f32 = 0.90; // 0.0..1.0, higher = smoother/slower gain changes
@@ -1373,7 +1373,7 @@ fn realtime_inference_worker(
     // Duration needed to switch to "responsive" mode
     let samples_long_utterance = 16000 * 2; // 2 seconds (switch to fast cut sooner)
 
-    let max_len_samples = 16000 * 5; // 5 seconds max (force update sooner)
+    let max_len_samples = 16000 * 15; // 15 seconds max (avoid cutting sentences)
     let max_silence_buffer_samples = 16000 * 5;
 
     // State
@@ -1477,7 +1477,7 @@ fn send_audio_to_asr(
     if let Ok(tmp) = tempfile::NamedTempFile::new() {
         if let Ok(_) = write_pcm16_wav_16k_mono(tmp.path(), samples) {
             let form = reqwest::blocking::multipart::Form::new()
-                .text("response_format", "json")
+                .text("response_format", "verbose_json")
                 .text("language", "zh")
                 .part(
                     "file",
@@ -1486,11 +1486,35 @@ fn send_audio_to_asr(
 
             if let Ok(resp) = client.post(url).multipart(form).send() {
                 if let Ok(txt) = resp.text() {
+                    // Parse verbose_json response
+                    // Expected structure: { "text": "...", "segments": [ { "avg_logprob": -0.5, ... }, ... ] }
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                        if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                            let t = t.trim();
-                            if !t.is_empty() {
-                                let _ = app.emit("asr_final", t.to_string());
+                        // Check logprobs first
+                        let mut is_reliable = true;
+                        if let Some(segments) = v.get("segments").and_then(|arr| arr.as_array()) {
+                            for seg in segments {
+                                if let Some(lp) = seg.get("avg_logprob").and_then(|f| f.as_f64()) {
+                                    if lp < -1.0 {
+                                        eprintln!("⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}", lp, seg.get("text"));
+                                        is_reliable = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            // If no segments found, we can't verify logprob.
+                            // Depending on strategy, either trust or warn.
+                            // For now, let's warn but proceed if text exists,
+                            // OR assume it might be a simple json fallback (unlikely if we asked for verbose_json).
+                            eprintln!("⚠️ ASR response missing segments for logprob check");
+                        }
+
+                        if is_reliable {
+                            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                                let t = t.trim();
+                                if !t.is_empty() {
+                                    let _ = app.emit("asr_final", t.to_string());
+                                }
                             }
                         }
                     }
