@@ -154,11 +154,13 @@ fn start_mic_stream(
     // Tunables (safe defaults)
     // Base gain keeps your original loudness in non-call scenarios.
     // AGC will only BOOST above this when the system/WeChat suppresses the mic.
-    let base_gain: f32 = 50.0; // keep previous behavior when mic is normal
+    let base_gain: f32 = 15.0; // Reduced from 50.0 to prevent noise floor boosting
     let target_rms: f32 = 0.15; // desired loudness (0..1) *when boosting* ~ -16dBFS
                                 // Note: we do NOT attenuate below base_gain in this strategy.
-    let max_gain: f32 = 400.0; // cap to prevent runaway amplification
+    let max_gain: f32 = 50.0; // Reduced from 400.0. 50x is plenty (34dB).
     let smooth: f32 = 0.90; // 0.0..1.0, higher = smoother/slower gain changes
+    let decay: f32 = 0.99; // Slow release for gate
+    let noise_gate: f32 = 0.01; // Input RMS below this is considered noise: don't boost!
     let limiter: f32 = 0.98; // soft limiter threshold
     let rms_floor: f32 = 1.0e-5; // avoid divide-by-zero / silence spikes
 
@@ -198,13 +200,17 @@ fn start_mic_stream(
                         gain = base_gain;
                     }
 
-                    // Update gain towards desired value (smoothed)
-                    if rms > rms_floor {
+                    // Update gain
+                    if rms > noise_gate {
+                        // Signal is loud enough to be speech -> Target AGC
                         let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
                         gain =
                             (gain * smooth + desired * (1.0 - smooth)).clamp(base_gain, max_gain);
-                        MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
+                    } else {
+                        // Signal is silence/noise -> Decay gain to base_gain to avoid boosting noise
+                        gain = gain * decay + base_gain * (1.0 - decay);
                     }
+                    MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
 
                     // Convert to PCM16 with soft limiter.
                     let mut bytes = Vec::with_capacity(data.len() * 2);
@@ -300,12 +306,14 @@ fn start_mic_stream(
                     if gain < base_gain {
                         gain = base_gain;
                     }
-                    if rms > rms_floor {
+                    if rms > noise_gate {
                         let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
                         gain =
                             (gain * smooth + desired * (1.0 - smooth)).clamp(base_gain, max_gain);
-                        MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
+                    } else {
+                        gain = gain * decay + base_gain * (1.0 - decay);
                     }
+                    MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
 
                     let mut bytes = Vec::with_capacity(data.len() * 2);
                     for &x in data {
@@ -1361,17 +1369,21 @@ fn realtime_inference_worker(
 
     // Strict Dynamic VAD Parameters
     let frame_size = 480; // 30ms @ 16kHz
-    let vad_threshold = 0.01; // Increased from 0.005 to 0.01 (block background noise)
+    let vad_threshold = 0.03; // Increased to 0.03 (~ -30dB) to ignore floor noise
 
     // Debounce: require consecutive speech frames to trigger
     let min_speech_frames = 3; // 3 * 30ms = 90ms (ignore clicks)
 
-    // Short vs Long pause thresholds (Faster now)
-    let frames_short_pause = 4; // ~120ms (was 180ms)
-    let frames_long_pause = 15; // ~450ms
+    // Adaptive VAD Parameters
+    // We want to be conservative at first (wait for clear end),
+    // but become aggressive if the person keeps talking (to reduce latency).
+    let samples_stage_1 = 16000 * 4; // 0-4s: High quality mode
+    let samples_stage_2 = 16000 * 10; // 4-10s: Normal mode
+                                      // >10s: Low latency mode
 
-    // Duration needed to switch to "responsive" mode
-    let samples_long_utterance = 16000 * 2; // 2 seconds (switch to fast cut sooner)
+    let frames_stage_1 = 16; // ~480ms (Wait for clear sentence finish)
+    let frames_stage_2 = 10; // ~300ms (Standard pause)
+    let frames_stage_3 = 5; // ~150ms (Quick breath/break to release text)
 
     let max_len_samples = 16000 * 15; // 15 seconds max (avoid cutting sentences)
     let max_silence_buffer_samples = 16000 * 5;
@@ -1408,20 +1420,34 @@ fn realtime_inference_worker(
 
                     // Trigger "speaking" state only after stability
                     if speech_run_count >= min_speech_frames {
-                        is_speaking = true;
+                        if !is_speaking {
+                            is_speaking = true;
+                            println!("🎤 VAD: Speech START (rms={:.4})", rms);
+                        }
                         silence_frames = 0;
                     } else {
                         // If we are already speaking, this counts as silence frame
                         if is_speaking {
                             silence_frames += 1;
+                            // Debug log every 10 frames of silence (~300ms) to track why it's not cutting
+                            if silence_frames % 10 == 0 {
+                                println!(
+                                    "... VAD: Silence frame {} (rms={:.4} < {})",
+                                    silence_frames, rms, vad_threshold
+                                );
+                            }
                         }
                     }
 
-                    // --- Dynamic Segmentation Logic ---
-                    let current_threshold = if buf.len() > samples_long_utterance {
-                        frames_short_pause
+                    // --- Dynamic Segmentation Logic (Adaptive Urgency) ---
+                    // As the buffer grows, we tolerate shorter silences to "get the text out".
+                    let len = buf.len();
+                    let current_threshold = if len > samples_stage_2 {
+                        frames_stage_3 // >10s: Urgent, cut on 150ms
+                    } else if len > samples_stage_1 {
+                        frames_stage_2 // 4-10s: Normal, cut on 300ms
                     } else {
-                        frames_long_pause
+                        frames_stage_1 // <4s: Conservative, wait 480ms
                     };
 
                     // 1. End of Sentence (Speaking -> Pause > limit)
