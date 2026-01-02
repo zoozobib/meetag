@@ -1369,10 +1369,10 @@ fn realtime_inference_worker(
 
     // Strict Dynamic VAD Parameters
     let frame_size = 480; // 30ms @ 16kHz
-    let vad_threshold = 0.03; // Increased to 0.03 (~ -30dB) to ignore floor noise
+    let vad_threshold = 0.02; // Reduced to 0.02 to catch soft starts
 
     // Debounce: require consecutive speech frames to trigger
-    let min_speech_frames = 3; // 3 * 30ms = 90ms (ignore clicks)
+    let min_speech_frames = 2; // Reduced to 60ms to trigger faster
 
     // Adaptive VAD Parameters
     // We want to be conservative at first (wait for clear end),
@@ -1383,7 +1383,7 @@ fn realtime_inference_worker(
 
     let frames_stage_1 = 16; // ~480ms (Wait for clear sentence finish)
     let frames_stage_2 = 10; // ~300ms (Standard pause)
-    let frames_stage_3 = 5; // ~150ms (Quick breath/break to release text)
+    let frames_stage_3 = 8; // ~240ms (Was 150ms - relaxed to avoid cutting words)
 
     let max_len_samples = 16000 * 15; // 15 seconds max (avoid cutting sentences)
     let max_silence_buffer_samples = 16000 * 5;
@@ -1474,9 +1474,14 @@ fn realtime_inference_worker(
                     speech_run_count = 0;
                 }
 
-                // 3. Garbage Collection
+                // 3. Garbage Collection (Smart Pre-roll)
                 if !is_speaking && buf.len() >= max_silence_buffer_samples {
-                    buf.clear();
+                    // Don't clear everything! Keep last 0.5s as "pre-roll" for next sentence
+                    let keep_len = 8000; // 500ms
+                    if buf.len() > keep_len {
+                        let drain_end = buf.len() - keep_len;
+                        buf.drain(0..drain_end);
+                    }
                     silence_frames = 0;
                     speech_run_count = 0;
                 }
@@ -1500,8 +1505,13 @@ fn send_audio_to_asr(
     url: &str,
     samples: &[i16],
 ) {
+    // Add 300ms silence padding to end (Post-roll) to help ASR complete the last word
+    let mut padded = Vec::with_capacity(samples.len() + 4800);
+    padded.extend_from_slice(samples);
+    padded.resize(padded.len() + 4800, 0);
+
     if let Ok(tmp) = tempfile::NamedTempFile::new() {
-        if let Ok(_) = write_pcm16_wav_16k_mono(tmp.path(), samples) {
+        if let Ok(_) = write_pcm16_wav_16k_mono(tmp.path(), &padded) {
             let form = reqwest::blocking::multipart::Form::new()
                 .text("response_format", "verbose_json")
                 .text("language", "zh")
