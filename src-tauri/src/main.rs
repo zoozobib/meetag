@@ -307,6 +307,51 @@ fn get_last_record_base() -> Option<std::path::PathBuf> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri::Manager;
+                use tauri_plugin_shell::ShellExt;
+
+                let resource_path = handle
+                    .path()
+                    .resolve(
+                        "resources/ggml-small.bin",
+                        tauri::path::BaseDirectory::Resource,
+                    )
+                    .unwrap();
+
+                // Start whisper server sidecar
+                // Command name matches the externalBin configuration "bin/whisper-server"
+                // But generally "whisper-server" is the command/sidecar name (without "bin/" prefix in code).
+                // "bin/whisper-server" in tauri.conf.json -> code checks "whisper-server"
+                let sidecar_command = handle.shell().sidecar("whisper-server").unwrap().args([
+                    "-m",
+                    resource_path.to_str().unwrap(),
+                    "--port",
+                    "8178",
+                    "--host",
+                    "127.0.0.1",
+                ]);
+
+                let (mut rx, mut child) = sidecar_command
+                    .spawn()
+                    .expect("Failed to spawn whisper sidecar");
+                println!(
+                    "🚀 Whisper sidecar spawned with PID: {:?} on port 8178",
+                    child.pid()
+                );
+
+                // Read logs (optional, for debugging)
+                // while let Some(event) = rx.recv().await {
+                //    if let tauri_plugin_shell::process::CommandEvent::Stdout(line) = event {
+                //         println!("REQ: {:?}", String::from_utf8(line));
+                //    }
+                // }
+            });
+            Ok(())
+        })
         // NOTE: start_demo_recording removed or can be re-added if needed, but it was commented out in original file mostly?
         // User asked to clean up, so only keeping active commands.
         // Wait, start_demo_recording WAS there but commented out in the last view?
