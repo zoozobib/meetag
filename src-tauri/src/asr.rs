@@ -1,0 +1,206 @@
+use anyhow::Result;
+use tauri::Emitter;
+use webrtc_vad::{Vad, VadMode};
+
+use crate::wav::write_pcm16_wav_16k_mono;
+
+pub fn realtime_inference_worker(
+    app: tauri::AppHandle,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut rx: std::sync::mpsc::Receiver<i16>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let client = reqwest::blocking::Client::new();
+    let server_url = "http://127.0.0.1:8178/inference";
+
+    // Strict Dynamic VAD Parameters
+    // We use WebRTC VAD (very aggressive) instead of simple RMS
+    let mut vad =
+        Vad::new_with_rate_and_mode(webrtc_vad::SampleRate::Rate16kHz, VadMode::VeryAggressive);
+    let vad_frame_size = 320; // 20ms @ 16kHz
+    let mut vad_accum: Vec<i16> = Vec::with_capacity(vad_frame_size);
+
+    // Debounce: require consecutive speech frames to trigger
+    let min_speech_frames = 2; // ~40ms
+
+    // Adaptive VAD Parameters
+    // We want to be conservative at first (wait for clear end),
+    // but become aggressive if the person keeps talking (to reduce latency).\
+    let samples_stage_1 = 16000 * 4; // 0-4s: High quality mode
+    let samples_stage_2 = 16000 * 10; // 4-10s: Normal mode
+                                      // >10s: Low latency mode
+
+    let frames_stage_1 = 16; // ~320ms (Wait for clear sentence finish) (1 frame = 20ms)
+    let frames_stage_2 = 10; // ~200ms
+    let frames_stage_3 = 8; // ~160ms
+
+    let max_len_samples = 16000 * 15; // 15 seconds max (avoid cutting sentences)
+    let max_silence_buffer_samples = 16000 * 5;
+
+    // State
+    let mut buf: Vec<i16> = Vec::with_capacity(max_len_samples);
+    let mut is_speaking = false;
+    let mut silence_frames = 0;
+    let mut speech_run_count = 0; // for debounce
+                                  // frame_accum removed, using vad_accum
+
+    while !stop.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(s) => {
+                buf.push(s);
+                vad_accum.push(s);
+
+                // Process VAD every 20ms
+                if vad_accum.len() >= vad_frame_size {
+                    let is_voice = vad.is_voice_segment(&vad_accum).unwrap_or(false);
+                    vad_accum.clear();
+
+                    if is_voice {
+                        speech_run_count += 1;
+                    } else {
+                        speech_run_count = 0;
+                    }
+
+                    // Trigger "speaking" state only after stability
+                    if speech_run_count >= min_speech_frames {
+                        if !is_speaking {
+                            is_speaking = true;
+                            println!("🎤 VAD: Speech START");
+                        }
+                        silence_frames = 0;
+                    } else {
+                        // If we are already speaking, this counts as silence frame
+                        if is_speaking {
+                            silence_frames += 1;
+                            // Debug log every 10 frames of silence (~200ms) to track why it's not cutting
+                            if silence_frames % 10 == 0 {
+                                println!("... VAD: Silence frame {}", silence_frames);
+                            }
+                        }
+                    }
+
+                    // --- Dynamic Segmentation Logic (Adaptive Urgency) ---
+                    // As the buffer grows, we tolerate shorter silences to "get the text out".
+                    let len = buf.len();
+                    let current_threshold = if len > samples_stage_2 {
+                        frames_stage_3 // >10s: Urgent, cut on 160ms
+                    } else if len > samples_stage_1 {
+                        frames_stage_2 // 4-10s: Normal, cut on 200ms
+                    } else {
+                        frames_stage_1 // <4s: Conservative, wait 320ms
+                    };
+
+                    // 1. End of Sentence (Speaking -> Pause > limit)
+                    if is_speaking && silence_frames >= current_threshold {
+                        if buf.len() > 1000 {
+                            // 1000 samples ~ 60ms
+                            send_audio_to_asr(&app, &client, server_url, &buf);
+                        }
+                        buf.clear();
+                        is_speaking = false;
+                        silence_frames = 0;
+                        speech_run_count = 0;
+                    }
+                }
+
+                // 2. Max Length (Force send at 5s)
+                if buf.len() >= max_len_samples {
+                    if is_speaking {
+                        send_audio_to_asr(&app, &client, server_url, &buf);
+                    }
+                    buf.clear();
+                    is_speaking = false;
+                    silence_frames = 0;
+                    speech_run_count = 0;
+                }
+
+                // 3. Garbage Collection (Smart Pre-roll)
+                if !is_speaking && buf.len() >= max_silence_buffer_samples {
+                    // Don't clear everything! Keep last 0.5s as "pre-roll" for next sentence
+                    let keep_len = 8000; // 500ms
+                    if buf.len() > keep_len {
+                        let drain_end = buf.len() - keep_len;
+                        buf.drain(0..drain_end);
+                    }
+                    silence_frames = 0;
+                    speech_run_count = 0;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+
+    // Final flush
+    if !buf.is_empty() && is_speaking {
+        send_audio_to_asr(&app, &client, server_url, &buf);
+    }
+
+    Ok(())
+}
+
+fn send_audio_to_asr(
+    app: &tauri::AppHandle,
+    client: &reqwest::blocking::Client,
+    url: &str,
+    samples: &[i16],
+) {
+    // Add 300ms silence padding to end (Post-roll) to help ASR complete the last word
+    let mut padded = Vec::with_capacity(samples.len() + 4800);
+    padded.extend_from_slice(samples);
+    padded.resize(padded.len() + 4800, 0);
+
+    if let Ok(tmp) = tempfile::NamedTempFile::new() {
+        if let Ok(_) = write_pcm16_wav_16k_mono(tmp.path(), &padded) {
+            let form = reqwest::blocking::multipart::Form::new()
+                .text("response_format", "verbose_json")
+                .text("language", "zh")
+                .part(
+                    "file",
+                    reqwest::blocking::multipart::Part::file(tmp.path()).unwrap(), // safe unwrap for temp file we just wrote
+                );
+
+            if let Ok(resp) = client.post(url).multipart(form).send() {
+                if let Ok(txt) = resp.text() {
+                    // Parse verbose_json response
+                    // Expected structure: { "text": "...", "segments": [ { "avg_logprob": -0.5, ... }, ... ] }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        // Check logprobs first
+                        let mut is_reliable = true;
+                        if let Some(segments) = v.get("segments").and_then(|arr| arr.as_array()) {
+                            for seg in segments {
+                                if let Some(lp) = seg.get("avg_logprob").and_then(|f| f.as_f64()) {
+                                    if lp < -1.0 {
+                                        eprintln!(
+                                            "⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}",
+                                            lp,
+                                            seg.get("text")
+                                        );
+                                        is_reliable = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            // If no segments found, we can't verify logprob.
+                            // Depending on strategy, either trust or warn.
+                            // For now, let's warn but proceed if text exists,
+                            // OR assume it might be a simple json fallback (unlikely if we asked for verbose_json).
+                            eprintln!("⚠️ ASR response missing segments for logprob check");
+                        }
+
+                        if is_reliable {
+                            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                                let t = t.trim();
+                                if !t.is_empty() {
+                                    let _ = app.emit("asr_final", t.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
