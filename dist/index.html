@@ -49,7 +49,11 @@
 
         async function setupListeners() {
             await listen("asr_partial", (e) => { statusEl.textContent = e.payload; });
-            await listen("asr_final", (e) => { appendLine(e.payload); });
+            await listen("asr_final", (e) => {
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString('zh-CN', { hour12: false });
+                appendLine(`[${timeStr}] ${e.payload}`);
+            });
             appendLine("✅ ASR listeners ready");
         }
 
