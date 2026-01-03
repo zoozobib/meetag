@@ -27,6 +27,7 @@ mod audio;
 
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
+use webrtc_vad::{Vad, VadMode};
 
 static RECORDER: Lazy<Mutex<Option<RecorderHandle>>> = Lazy::new(|| Mutex::new(None));
 
@@ -39,6 +40,12 @@ struct RecorderHandle {
     mix_path: PathBuf,
     mix_asr_path: PathBuf,
 }
+
+// VAD wrapper to allow sending to audio thread
+// VAD wrapper to allow sending to audio thread
+pub struct SendVad(pub Vad);
+unsafe impl Send for SendVad {}
+unsafe impl Sync for SendVad {}
 
 // =====================
 // Minimal WAV writer (PCM16)
@@ -146,6 +153,13 @@ fn start_mic_stream(
     // ASR-ready track: 16kHz mono PCM16
     writer_asr.lock().unwrap().init_pcm16(16_000, 1)?;
 
+    let mut vad_wrapper = Arc::new(Mutex::new(SendVad(Vad::new_with_rate_and_mode(
+        webrtc_vad::SampleRate::Rate16kHz,
+        VadMode::VeryAggressive,
+    ))));
+    let mut vad_buf: Vec<i16> = Vec::with_capacity(320 * 10); // buffer for VAD
+    let mut speech_hold_frames = 0; // for short "hangover" after speech
+
     // --- Mic AGC state (shared across callbacks) ---
     // Store gain in Q8 fixed-point (gain * 256) so we can keep it in an atomic.
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -174,12 +188,6 @@ fn start_mic_stream(
             let mut rs_phase: f32 = 0.0;
             let ratio: f32 = sample_rate as f32 / 16_000.0;
             let mut prev_mono: f32 = 0.0;
-            let mut rs_phase: f32 = 0.0;
-            let ratio: f32 = sample_rate as f32 / 16_000.0;
-            let mut prev_mono: f32 = 0.0;
-            let mut rs_phase: f32 = 0.0;
-            let ratio: f32 = sample_rate as f32 / 16_000.0;
-            let mut prev_mono: f32 = 0.0;
             let stream = dev.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
@@ -201,16 +209,9 @@ fn start_mic_stream(
                     }
 
                     // Update gain
-                    if rms > noise_gate {
-                        // Signal is loud enough to be speech -> Target AGC
-                        let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
-                        gain =
-                            (gain * smooth + desired * (1.0 - smooth)).clamp(base_gain, max_gain);
-                    } else {
-                        // Signal is silence/noise -> Decay gain to base_gain to avoid boosting noise
-                        gain = gain * decay + base_gain * (1.0 - decay);
-                    }
-                    MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
+                    // Update gain logic moved to after VAD check
+                    // But we need 'current' gain to process audio first.
+                    // We will update MIC_GAIN_Q8 at the END of the loop for the NEXT buffer.
 
                     // Convert to PCM16 with soft limiter.
                     let mut bytes = Vec::with_capacity(data.len() * 2);
@@ -272,6 +273,49 @@ fn start_mic_stream(
                             }
                         }
                     }
+
+                    // --- VAD & AGC Update ---
+                    // 1. Append new 16kHz samples to vad_buf
+                    if !asr_bytes.is_empty() {
+                        for ch in asr_bytes.chunks_exact(2) {
+                            let v = i16::from_le_bytes([ch[0], ch[1]]);
+                            vad_buf.push(v);
+                        }
+                    }
+
+                    // 2. Process VAD frames (20ms = 320 samples)
+                    let mut is_speech_now = false;
+                    while vad_buf.len() >= 320 {
+                        let frame: Vec<i16> = vad_buf.drain(0..320).collect();
+                        if let Ok(true) = vad_wrapper.lock().unwrap().0.is_voice_segment(&frame) {
+                            is_speech_now = true;
+                            speech_hold_frames = 20; // Hold 'speech' state for ~400ms (20 * 20ms)
+                        } else {
+                            if speech_hold_frames > 0 {
+                                speech_hold_frames -= 1;
+                            }
+                        }
+                    }
+
+                    // 3. Update AGC Gain for NEXT callback
+                    // Use 'is_speech_now' OR 'speech_hold_frames > 0' as "Speech Active"
+                    let speech_active = is_speech_now || speech_hold_frames > 0;
+
+                    if speech_active {
+                        // Speech detected: Move gain towards target based on current RMS
+                        // desired gain = target_rms / rms
+                        // But rms is from the RAW input (full bandwidth).
+                        // If speech is active, we trust that RMS represents speech energy.
+                        if rms > rms_floor {
+                            let desired = (target_rms / rms).clamp(1.0, max_gain).max(base_gain);
+                            gain = (gain * smooth + desired * (1.0 - smooth))
+                                .clamp(base_gain, max_gain);
+                        }
+                    } else {
+                        // Silence: Decay gain
+                        gain = gain * decay + base_gain * (1.0 - decay);
+                    }
+                    MIC_GAIN_Q8.store((gain * 256.0) as u32, Ordering::Relaxed);
                 },
                 err_fn,
                 None,
@@ -1368,22 +1412,25 @@ fn realtime_inference_worker(
     let server_url = "http://127.0.0.1:8178/inference";
 
     // Strict Dynamic VAD Parameters
-    let frame_size = 480; // 30ms @ 16kHz
-    let vad_threshold = 0.02; // Reduced to 0.02 to catch soft starts
+    // We use WebRTC VAD (very aggressive) instead of simple RMS
+    let mut vad =
+        Vad::new_with_rate_and_mode(webrtc_vad::SampleRate::Rate16kHz, VadMode::VeryAggressive);
+    let vad_frame_size = 320; // 20ms @ 16kHz
+    let mut vad_accum: Vec<i16> = Vec::with_capacity(vad_frame_size);
 
     // Debounce: require consecutive speech frames to trigger
-    let min_speech_frames = 2; // Reduced to 60ms to trigger faster
+    let min_speech_frames = 2; // ~40ms
 
     // Adaptive VAD Parameters
     // We want to be conservative at first (wait for clear end),
-    // but become aggressive if the person keeps talking (to reduce latency).
+    // but become aggressive if the person keeps talking (to reduce latency).\
     let samples_stage_1 = 16000 * 4; // 0-4s: High quality mode
     let samples_stage_2 = 16000 * 10; // 4-10s: Normal mode
                                       // >10s: Low latency mode
 
-    let frames_stage_1 = 16; // ~480ms (Wait for clear sentence finish)
-    let frames_stage_2 = 10; // ~300ms (Standard pause)
-    let frames_stage_3 = 8; // ~240ms (Was 150ms - relaxed to avoid cutting words)
+    let frames_stage_1 = 16; // ~320ms (Wait for clear sentence finish) (1 frame = 20ms)
+    let frames_stage_2 = 10; // ~200ms
+    let frames_stage_3 = 8; // ~160ms
 
     let max_len_samples = 16000 * 15; // 15 seconds max (avoid cutting sentences)
     let max_silence_buffer_samples = 16000 * 5;
@@ -1393,26 +1440,20 @@ fn realtime_inference_worker(
     let mut is_speaking = false;
     let mut silence_frames = 0;
     let mut speech_run_count = 0; // for debounce
-    let mut frame_accum: Vec<i16> = Vec::with_capacity(frame_size);
+                                  // frame_accum removed, using vad_accum
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(s) => {
                 buf.push(s);
-                frame_accum.push(s);
+                vad_accum.push(s);
 
-                // Process VAD every frame
-                if frame_accum.len() >= frame_size {
-                    // Calc RMS
-                    let mut sum_sq = 0.0f32;
-                    for &x in &frame_accum {
-                        let xf = x as f32 / i16::MAX as f32;
-                        sum_sq += xf * xf;
-                    }
-                    let rms = (sum_sq / frame_accum.len() as f32).sqrt();
-                    frame_accum.clear();
+                // Process VAD every 20ms
+                if vad_accum.len() >= vad_frame_size {
+                    let is_voice = vad.is_voice_segment(&vad_accum).unwrap_or(false);
+                    vad_accum.clear();
 
-                    if rms > vad_threshold {
+                    if is_voice {
                         speech_run_count += 1;
                     } else {
                         speech_run_count = 0;
@@ -1422,19 +1463,16 @@ fn realtime_inference_worker(
                     if speech_run_count >= min_speech_frames {
                         if !is_speaking {
                             is_speaking = true;
-                            println!("🎤 VAD: Speech START (rms={:.4})", rms);
+                            println!("🎤 VAD: Speech START");
                         }
                         silence_frames = 0;
                     } else {
                         // If we are already speaking, this counts as silence frame
                         if is_speaking {
                             silence_frames += 1;
-                            // Debug log every 10 frames of silence (~300ms) to track why it's not cutting
+                            // Debug log every 10 frames of silence (~200ms) to track why it's not cutting
                             if silence_frames % 10 == 0 {
-                                println!(
-                                    "... VAD: Silence frame {} (rms={:.4} < {})",
-                                    silence_frames, rms, vad_threshold
-                                );
+                                println!("... VAD: Silence frame {}", silence_frames);
                             }
                         }
                     }
@@ -1443,11 +1481,11 @@ fn realtime_inference_worker(
                     // As the buffer grows, we tolerate shorter silences to "get the text out".
                     let len = buf.len();
                     let current_threshold = if len > samples_stage_2 {
-                        frames_stage_3 // >10s: Urgent, cut on 150ms
+                        frames_stage_3 // >10s: Urgent, cut on 160ms
                     } else if len > samples_stage_1 {
-                        frames_stage_2 // 4-10s: Normal, cut on 300ms
+                        frames_stage_2 // 4-10s: Normal, cut on 200ms
                     } else {
-                        frames_stage_1 // <4s: Conservative, wait 480ms
+                        frames_stage_1 // <4s: Conservative, wait 320ms
                     };
 
                     // 1. End of Sentence (Speaking -> Pause > limit)

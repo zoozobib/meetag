@@ -117,6 +117,7 @@ dependencies = [
  "tauri-plugin-log",
  "tempfile",
  "tokio",
+ "webrtc-vad",
 ]
 
 [[package]]
@@ -5063,6 +5064,15 @@ name = "webpki-roots"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
+
+[[package]]
+name = "webrtc-vad"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39a1e40fd6ca90be95459152a2537f2ba4286ee1b13073f7ebcaa74fc94e3008"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "webview2-com"
