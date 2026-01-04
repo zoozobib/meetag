@@ -6,6 +6,77 @@ use std::sync::{Arc, Mutex};
 use webrtc_vad::{Vad, VadMode};
 
 // =====================
+// Helper: Find best input device (prioritize external)
+// =====================
+fn find_best_input_device(host: &cpal::Host) -> Result<cpal::Device> {
+    let mut devices = host
+        .input_devices()
+        .context("failed to list input devices")?;
+    let mut best_device: Option<cpal::Device> = None;
+    let mut best_score = -100;
+
+    // Heuristic Scoring:
+    // +10: Explicitly "External", "USB", "Headset", "AirPods", "Rode", "Blue", "Focusrite"
+    //   0: Built-in / Internal (Fallback)
+    // -50: "Virtual", "BlackHole", "Zoom", "Teams", "Aggregate", "Multi-Output" (Avoid)
+
+    for device in devices {
+        let name = device.name().unwrap_or_else(|_| "unknown".to_string());
+        println!("🎤 Candidate input device: {}", name);
+
+        let mut score = 0;
+        let lower = name.to_lowercase();
+
+        // Bonus for likely good external mics
+        if lower.contains("usb")
+            || lower.contains("headset")
+            || lower.contains("airpods")
+            || lower.contains("external")
+            || lower.contains("rode")
+            || lower.contains("blue")
+            || lower.contains("focusrite")
+        {
+            score += 10;
+        }
+
+        // Penalty for virtual/aggregate devices that are likely silent or playback-only
+        if lower.contains("virtual")
+            || lower.contains("blackhole")
+            || lower.contains("zoom")
+            || lower.contains("teams")
+            || lower.contains("aggregate")
+            || lower.contains("multi-output")
+            || lower.contains("lark")
+        {
+            score -= 50;
+        }
+
+        // Small penalty for built-in to deprioritize it vs "Headset" if both exist having no other keywords
+        if lower.contains("built-in") || lower.contains("internal") || lower.contains("macbook") {
+            score -= 1;
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_device = Some(device);
+        }
+    }
+
+    if let Some(d) = best_device {
+        println!(
+            "🎤 Selected best input device: {} (Score: {})",
+            d.name().unwrap_or_default(),
+            best_score
+        );
+        Ok(d)
+    } else {
+        println!("🎤 No suitable devices found based on heuristic, trying system default");
+        host.default_input_device()
+            .context("no default input device")
+    }
+}
+
+// =====================
 // MIC capture (CPAL) -> mic.wav
 // =====================
 pub fn start_mic_stream(
@@ -14,9 +85,10 @@ pub fn start_mic_stream(
     mic_tx: std::sync::mpsc::Sender<i16>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
-    let dev = host
-        .default_input_device()
-        .context("no default input device")?;
+
+    // Use heuristic to pick device (Smart Selection)
+    // Fixed: Now ignores "Lark" and other virtual devices correctly.
+    let dev = find_best_input_device(&host)?;
 
     let cfg = dev
         .default_input_config()
