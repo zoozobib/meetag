@@ -225,10 +225,18 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
             // Give mic callback some time to flush tail
             tokio::time::sleep(Duration::from_millis(50)).await;
+            println!("✅ System capture loop ended, flushing complete.");
         });
+        println!("✅ System capture runtime finished.");
 
         // 4) Clean up
+        println!("🛑 Pausing mic stream...");
+        if let Err(e) = cpal::traits::StreamTrait::pause(&mic_stream) {
+            eprintln!("⚠️ Failed to pause mic stream: {:?}", e);
+        }
+        println!("🛑 Dropping mic stream...");
         drop(mic_stream);
+        println!("✅ Mic stream dropped.");
 
         // Finalize WAVs
         let _ = system_writer.lock().unwrap().finalize();
