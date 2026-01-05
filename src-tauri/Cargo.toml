@@ -33,7 +33,7 @@ features = [ "derive",]
 
 [dependencies.tauri]
 version = "2.6.2"
-features = []
+features = ["tray-icon"]
 
 [dependencies.tokio]
 version = "1.32.0"

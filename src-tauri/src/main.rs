@@ -13,12 +13,13 @@ use std::{
 mod asr;
 mod audio;
 mod capture;
+mod text_filter;
+mod tray;
 mod vad;
 mod wav;
-mod text_filter;
 
 use crate::wav::WavWriter;
-use tauri::Manager;
+use tauri::{Listener, Manager};
 
 static RECORDER: Lazy<Mutex<Option<RecorderHandle>>> = Lazy::new(|| Mutex::new(None));
 
@@ -317,8 +318,49 @@ fn get_last_record_base() -> Option<std::path::PathBuf> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                window.hide().unwrap();
+                api.prevent_close();
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Init Tray
+            tray::create_tray(&handle)?;
+
+            // Listen for Tray Events
+            let h1 = handle.clone();
+            handle.listen("tray-open-window", move |_| {
+                use tauri::Manager;
+                if let Some(window) = h1.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            });
+
+            let h2 = handle.clone();
+            handle.listen("tray-record-start", move |_| {
+                println!("▶ start_recording...");
+                match start_recording(h2.clone()) {
+                    Ok((sys, mic)) => println!("✅ started: [\"{}\",\"{}\"]", sys, mic),
+                    Err(e) => eprintln!("❌ Start failed: {}", e),
+                }
+            });
+
+            handle.listen("tray-record-stop", move |_| {
+                println!("▶ stop_recording...");
+                tauri::async_runtime::spawn(async move {
+                    match stop_recording().await {
+                        Ok((sys, mic, mix)) => {
+                            println!("stopped: [\"{}\",\"{}\",\"{}\"]", sys, mic, mix)
+                        }
+                        Err(e) => eprintln!("❌ Stop failed: {}", e),
+                    }
+                });
+            });
+
             tauri::async_runtime::spawn(async move {
                 use tauri::Manager;
                 use tauri_plugin_shell::ShellExt;
@@ -332,9 +374,6 @@ fn main() {
                     .unwrap();
 
                 // Start whisper server sidecar
-                // Command name matches the externalBin configuration "bin/whisper-server"
-                // But generally "whisper-server" is the command/sidecar name (without "bin/" prefix in code).
-                // "bin/whisper-server" in tauri.conf.json -> code checks "whisper-server"
                 let sidecar_command = handle.shell().sidecar("whisper-server").unwrap().args([
                     "-m",
                     resource_path.to_str().unwrap(),
@@ -351,22 +390,9 @@ fn main() {
                     "🚀 Whisper sidecar spawned with PID: {:?} on port 8178",
                     child.pid()
                 );
-
-                // Read logs (optional, for debugging)
-                // while let Some(event) = rx.recv().await {
-                //    if let tauri_plugin_shell::process::CommandEvent::Stdout(line) = event {
-                //         println!("REQ: {:?}", String::from_utf8(line));
-                //    }
-                // }
             });
             Ok(())
         })
-        // NOTE: start_demo_recording removed or can be re-added if needed, but it was commented out in original file mostly?
-        // User asked to clean up, so only keeping active commands.
-        // Wait, start_demo_recording WAS there but commented out in the last view?
-        // Let's checking View 256. Lines 1154-1261 are commented out?
-        // Lines 1154 starts `// fn start_demo_recording`.
-        // Yes, it was commented out. So I can remove it or keep it commented. Removing is cleaner.
         .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
