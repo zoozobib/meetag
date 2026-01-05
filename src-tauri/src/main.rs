@@ -15,6 +15,7 @@ mod audio;
 mod capture;
 mod vad;
 mod wav;
+mod text_filter;
 
 use crate::wav::WavWriter;
 use tauri::Manager;

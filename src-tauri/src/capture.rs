@@ -114,18 +114,20 @@ pub fn start_mic_stream(
     // --- Mic AGC state (shared across callbacks) ---
     // Store gain in Q8 fixed-point (gain * 256) so we can keep it in an atomic.
     use std::sync::atomic::{AtomicU32, Ordering};
-    static MIC_GAIN_Q8: AtomicU32 = AtomicU32::new((50.0_f32 * 256.0_f32) as u32);
+    // Initial gain: Start LOW (3.0) instead of HIGH (50.0) to avoid initial noise blast
+    static MIC_GAIN_Q8: AtomicU32 = AtomicU32::new((3.0_f32 * 256.0_f32) as u32);
 
     // Tunables (safe defaults)
     // Base gain keeps your original loudness in non-call scenarios.
     // AGC will only BOOST above this when the system/WeChat suppresses the mic.
-    let base_gain: f32 = 15.0; // Reduced from 50.0 to prevent noise floor boosting
+    // Reduced from 15.0 to 3.0 to prevent amplifying noise floor (which causes hallucinations)
+    let base_gain: f32 = 3.0;
     let target_rms: f32 = 0.15; // desired loudness (0..1) *when boosting* ~ -16dBFS
                                 // Note: we do NOT attenuate below base_gain in this strategy.
     let max_gain: f32 = 50.0; // Reduced from 400.0. 50x is plenty (34dB).
     let smooth: f32 = 0.90; // 0.0..1.0, higher = smoother/slower gain changes
     let decay: f32 = 0.99; // Slow release for gate
-    let noise_gate: f32 = 0.01; // Input RMS below this is considered noise: don't boost!
+    let noise_gate: f32 = 0.03; // Input RMS below this is considered noise: don't boost! (Raised from 0.01)
     let limiter: f32 = 0.98; // soft limiter threshold
     let rms_floor: f32 = 1.0e-5; // avoid divide-by-zero / silence spikes
 

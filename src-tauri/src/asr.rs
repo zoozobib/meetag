@@ -2,6 +2,7 @@ use anyhow::Result;
 use tauri::Emitter;
 use webrtc_vad::{Vad, VadMode};
 
+use crate::text_filter;
 use crate::wav::write_pcm16_wav_16k_mono;
 
 pub fn realtime_inference_worker(
@@ -22,7 +23,7 @@ pub fn realtime_inference_worker(
     let mut vad_accum: Vec<i16> = Vec::with_capacity(vad_frame_size);
 
     // Debounce: require consecutive speech frames to trigger
-    let min_speech_frames = 2; // ~40ms
+    let min_speech_frames = 5; // ~100ms
 
     // Adaptive VAD Parameters
     // We want to be conservative at first (wait for clear end),
@@ -43,7 +44,8 @@ pub fn realtime_inference_worker(
     let mut is_speaking = false;
     let mut silence_frames = 0;
     let mut speech_run_count = 0; // for debounce
-                                  // frame_accum removed, using vad_accum
+    let mut speech_frames_count = 0; // Total speech frames in current buffer
+                                     // frame_accum removed, using vad_accum
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -53,11 +55,33 @@ pub fn realtime_inference_worker(
 
                 // Process VAD every 20ms
                 if vad_accum.len() >= vad_frame_size {
-                    let is_voice = vad.is_voice_segment(&vad_accum).unwrap_or(false);
+                    // 0. RMS Gate (Simple Noise Gate)
+                    let sq_sum: f64 = vad_accum.iter().map(|&x| (x as f64).powi(2)).sum();
+                    let rms = (sq_sum / vad_accum.len() as f64).sqrt();
+
+                    // DEBUG: Print RMS to fine-tune threshold
+                    // if speech_run_count % 10 == 0 {
+                    //     println!("📊 VAD Input RMS: {:.1}", rms);
+                    // }
+
+                    let mut is_voice = vad.is_voice_segment(&vad_accum).unwrap_or(false);
+
+                    // Force silence if energy is too low (e.g. background hiss)
+                    // Bumped to 1000.0: Stronger noise filter.
+                    if rms < 1000.0 {
+                        is_voice = false;
+                    }
+
+                    if speech_run_count % 50 == 0 && is_voice {
+                        // Debug log occasionally to check RMS levels during speech
+                        println!("🔉 VAD: Speech frame RMS={:.1}", rms);
+                    }
+
                     vad_accum.clear();
 
                     if is_voice {
                         speech_run_count += 1;
+                        speech_frames_count += 1;
                     } else {
                         speech_run_count = 0;
                     }
@@ -68,14 +92,23 @@ pub fn realtime_inference_worker(
                             is_speaking = true;
                             println!("🎤 VAD: Speech START");
                         }
+                        if silence_frames > 0 {
+                            println!(
+                                "🔄 VAD: Silence RESET by speech run ({} frames)",
+                                speech_run_count
+                            );
+                        }
                         silence_frames = 0;
                     } else {
                         // If we are already speaking, this counts as silence frame
                         if is_speaking {
                             silence_frames += 1;
                             // Debug log every 10 frames of silence (~200ms) to track why it's not cutting
-                            if silence_frames % 10 == 0 {
-                                println!("... VAD: Silence frame {}", silence_frames);
+                            if silence_frames % 5 == 0 {
+                                println!(
+                                    "... VAD: Silence frame {} (Threshold: ...)",
+                                    silence_frames
+                                );
                             }
                         }
                     }
@@ -92,15 +125,48 @@ pub fn realtime_inference_worker(
                     };
 
                     // 1. End of Sentence (Speaking -> Pause > limit)
+                    if is_speaking {
+                        if silence_frames % 5 == 0 {
+                            println!(
+                                "📊 VAD Status: len={} samples, silence={} frames, limit={}",
+                                buf.len(),
+                                silence_frames,
+                                current_threshold
+                            );
+                        }
+                    }
                     if is_speaking && silence_frames >= current_threshold {
                         if buf.len() > 1000 {
-                            // 1000 samples ~ 60ms
-                            send_audio_to_asr(&app, &client, server_url, &buf);
+                            // Check speech density
+                            // One frame = 320 samples.
+                            // total_frames = buf.len() / 320
+                            // density = speech_frames_count / total_frames
+                            let total_frames = buf.len() / 320;
+                            let density = if total_frames > 0 {
+                                speech_frames_count as f32 / total_frames as f32
+                            } else {
+                                0.0
+                            };
+
+                            // Filter out low density (e.g. < 15% speech) if buffer is long enough (>2s)
+                            if buf.len() > 32000 && density < 0.15 {
+                                println!(
+                                    "⚠️ Low speech density: {:.1}% (len={}ms) - Sending anyway to preserve latency",
+                                    density * 100.0,
+                                    buf.len() / 16
+                                );
+                                send_audio_to_asr(&app, &client, server_url, &buf);
+                            } else {
+                                println!("🚀 Sending audio to ASR (Condition 1: Silence Cut), density={:.1}%", density * 100.0);
+                                // 1000 samples ~ 60ms
+                                send_audio_to_asr(&app, &client, server_url, &buf);
+                            }
                         }
                         buf.clear();
                         is_speaking = false;
                         silence_frames = 0;
                         speech_run_count = 0;
+                        speech_frames_count = 0;
                     }
                 }
 
@@ -113,6 +179,7 @@ pub fn realtime_inference_worker(
                     is_speaking = false;
                     silence_frames = 0;
                     speech_run_count = 0;
+                    speech_frames_count = 0;
                 }
 
                 // 3. Garbage Collection (Smart Pre-roll)
@@ -125,6 +192,7 @@ pub fn realtime_inference_worker(
                     }
                     silence_frames = 0;
                     speech_run_count = 0;
+                    speech_frames_count = 0; // Reset for new segment
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -156,6 +224,8 @@ fn send_audio_to_asr(
             let form = reqwest::blocking::multipart::Form::new()
                 .text("response_format", "verbose_json")
                 .text("language", "zh")
+                // REMOVED Anti-Hallucination Parameters to fix latency issue.
+                // We rely on Post-Processing (text_filter) and VAD LOGS for now.
                 .part(
                     "file",
                     reqwest::blocking::multipart::Part::file(tmp.path()).unwrap(), // safe unwrap for temp file we just wrote
@@ -194,7 +264,12 @@ fn send_audio_to_asr(
                             if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
                                 let t = t.trim();
                                 if !t.is_empty() {
-                                    let _ = app.emit("asr_final", t.to_string());
+                                    // 3. Text Post-processing (Blacklist/Repetition)
+                                    if text_filter::is_hallucination(t) {
+                                        println!("🗑️ Discarding hallucination: {:?}", t);
+                                    } else {
+                                        let _ = app.emit("asr_final", t.to_string());
+                                    }
                                 }
                             }
                         }
