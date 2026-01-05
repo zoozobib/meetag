@@ -224,6 +224,13 @@ fn send_audio_to_asr(
             let form = reqwest::blocking::multipart::Form::new()
                 .text("response_format", "verbose_json")
                 .text("language", "zh")
+                // Prompt strategy: Context + Style Guide
+                // 1. Context: "Meeting Record" -> Formal setting
+                // 2. Style: "Standard Written Language" -> Biases against slang (e.g. "浅整" -> "虔诚")
+                .text(
+                    "initial_prompt",
+                    "这是一段会议记录，请使用规范的书面语进行转写。",
+                )
                 // REMOVED Anti-Hallucination Parameters to fix latency issue.
                 // We rely on Post-Processing (text_filter) and VAD LOGS for now.
                 .part(
