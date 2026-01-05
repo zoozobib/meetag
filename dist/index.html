@@ -22,9 +22,10 @@
             --border-color: #E5E7EB;
             --status-badge-bg: #E5E7EB;
             --status-badge-text: #374151;
-            
+
             /* Spacing */
-            --sidebar-width: 260px;
+            --sidebar-width-expanded: 260px;
+            --sidebar-width-collapsed: 68px;
             --header-height: 50px;
         }
 
@@ -47,12 +48,19 @@
 
         /* --- Sidebar --- */
         .sidebar {
-            width: var(--sidebar-width);
+            width: var(--sidebar-width-collapsed);
+            /* Default collapsed */
             background-color: var(--bg-sidebar);
             display: flex;
             flex-direction: column;
             color: var(--text-sidebar);
             flex-shrink: 0;
+            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+        }
+
+        .sidebar.expanded {
+            width: var(--sidebar-width-expanded);
         }
 
         .sidebar-header {
@@ -60,13 +68,20 @@
             display: flex;
             align-items: center;
             gap: 12px;
-            margin-bottom: 20px;
+            height: 72px;
+            /* Fixed height for consistency */
+            overflow: hidden;
+            white-space: nowrap;
+        }
+
+        .sidebar-header .logo-icon {
+            min-width: 32px;
+            /* Prevent squishing */
         }
 
         .logo-icon {
             width: 32px;
             height: 32px;
-            /* Placeholder gradient for logo if no SVG provided, using SVG below */
         }
 
         .sidebar-title {
@@ -74,6 +89,14 @@
             font-size: 16px;
             color: white;
             letter-spacing: 0.5px;
+            opacity: 0;
+            transition: opacity 0.2s;
+            pointer-events: none;
+        }
+
+        .sidebar.expanded .sidebar-title {
+            opacity: 1;
+            pointer-events: auto;
         }
 
         .nav-item {
@@ -85,35 +108,39 @@
             color: var(--text-sidebar);
             gap: 12px;
             position: relative;
-            transition: background 0.2s;
+            transition: all 0.2s;
             margin: 0 12px;
             border-radius: 6px;
+            overflow: hidden;
+            white-space: nowrap;
+        }
+
+        /* Centering icons when collapsed */
+        .sidebar:not(.expanded) .nav-item {
+            padding: 12px 0;
+            justify-content: center;
+            margin: 0 10px;
         }
 
         .nav-item.active {
-            background-color: #4A5565; /* Lighter approx match */
-            background: linear-gradient(90deg, rgba(68,117,242,0.2) 0%, rgba(68,117,242,0.05) 100%);
-            color: var(--text-sidebar-active);
-            border-left: 3px solid var(--primary-blue);
-            border-radius: 4px; /* Slight adjust to match screenshot look of "box" vs "left border" */
-            /* Actually screenshot shows a full blue highlighting box style. Let's adjust */
-            background-color: #3b4250; /* A bit lighter than sidebar */
-            border-left: none; /* Screenshot looks like a full contained button */
-            background: #3B404C; 
-            border: 1px solid #4B5260;
-        }
-        
-        /* Specific fix for the "Active" look from screenshot: It has a blue icon box and text */
-        .nav-item.active {
             background-color: #3F4756;
-            color: #8EB0FF; /* Light blue text */
-            border: none;
+            color: #8EB0FF;
         }
-        
+
         .nav-icon {
-            width: 20px;
-            height: 20px;
+            width: 24px;
+            height: 24px;
+            min-width: 24px;
             opacity: 0.8;
+        }
+
+        .nav-text {
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .sidebar.expanded .nav-text {
+            opacity: 1;
         }
 
         .sidebar-footer {
@@ -121,6 +148,43 @@
             padding: 20px;
             font-size: 12px;
             color: #6B7280;
+            white-space: nowrap;
+            overflow: hidden;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .sidebar.expanded .sidebar-footer {
+            opacity: 1;
+        }
+
+        /* Toggle Button */
+        .sidebar-toggle {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            color: #9CA3AF;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        .sidebar-toggle:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+
+        .sidebar.expanded .sidebar-toggle {
+            left: auto;
+            right: 12px;
+            bottom: 12px;
+            transform: none;
         }
 
         /* --- Main Content --- */
@@ -196,9 +260,9 @@
         .btn-primary {
             background-color: var(--primary-blue);
             color: white;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
         }
-        
+
         .btn-primary:active {
             background-color: var(--primary-blue-hover);
         }
@@ -207,7 +271,7 @@
             background-color: var(--btn-secondary-bg);
             color: var(--text-primary);
             border: 1px solid var(--btn-secondary-border);
-            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
         }
 
         .btn-secondary:hover {
@@ -218,14 +282,15 @@
         .content-grid {
             display: flex;
             gap: 24px;
-            height: calc(100vh - 180px); /* Fill remaining vertical space */
+            height: calc(100vh - 180px);
+            /* Fill remaining vertical space */
             min-height: 400px;
         }
 
         .card {
             background-color: var(--bg-card);
             border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
             flex: 1;
             display: flex;
             flex-direction: column;
@@ -259,6 +324,13 @@
             line-height: 1.6;
         }
 
+        /* Enable text selection specifically in Log Area */
+        #log {
+            -webkit-user-select: text;
+            user-select: text;
+            cursor: text;
+        }
+
         /* Transcript Styling */
         .log-entry {
             margin-bottom: 4px;
@@ -266,12 +338,12 @@
             font-size: 13px;
             color: #374151;
         }
-        
+
         .log-timestamp {
             color: #9CA3AF;
             margin-right: 8px;
         }
-        
+
         .log-system {
             color: #6B7280;
             font-style: italic;
@@ -280,9 +352,18 @@
             gap: 6px;
         }
 
-        .log-success { color: #059669; }
-        .log-error { color: #DC2626; }
-        .log-icon { width: 14px; height: 14px; }
+        .log-success {
+            color: #059669;
+        }
+
+        .log-error {
+            color: #DC2626;
+        }
+
+        .log-icon {
+            width: 14px;
+            height: 14px;
+        }
 
         /* Notes Placeholder */
         .empty-state {
@@ -295,12 +376,13 @@
             color: #6B7280;
             gap: 16px;
         }
-        
+
         .empty-icon {
             width: 64px;
             height: 64px;
             opacity: 0.5;
-            background: #E5E7EB; /* Fallback */
+            background: #E5E7EB;
+            /* Fallback */
             border-radius: 50%;
         }
 
@@ -310,12 +392,14 @@
             margin-top: 10px;
             text-align: left;
         }
+
         .notes-list li {
             position: relative;
             padding-left: 16px;
             margin-bottom: 6px;
-            color: #6B7280; 
+            color: #6B7280;
         }
+
         .notes-list li::before {
             content: "•";
             position: absolute;
@@ -328,13 +412,16 @@
             width: 8px;
             height: 8px;
         }
+
         ::-webkit-scrollbar-track {
             background: transparent;
         }
+
         ::-webkit-scrollbar-thumb {
             background: #D1D5DB;
             border-radius: 4px;
         }
+
         ::-webkit-scrollbar-thumb:hover {
             background: #9CA3AF;
         }
@@ -343,8 +430,8 @@
 
 <body>
 
-    <!-- Sidebar -->
-    <div class="sidebar">
+    <!-- Sidebar (Init without .expanded for collapsed default) -->
+    <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <!-- Colorful Tiles Icon -->
             <svg class="logo-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -358,16 +445,26 @@
 
         <a href="#" class="nav-item active">
             <!-- Waveform Icon -->
-            <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 3-2 3 2zm0 0v-8"></path>
+            <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 3-2 3 2zm0 0v-8"></path>
                 <!-- Custom "Audio" wave look -->
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 10h3v4H4zM8 8h3v8H8zM12 6h3v12h-3zM16 8h3v8h-3zM20 10h3v4h-3z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M4 10h3v4H4zM8 8h3v8H8zM12 6h3v12h-3zM16 8h3v8h-3zM20 10h3v4h-3z"></path>
             </svg>
-            <span>Realtime ASR Test</span>
+            <span class="nav-text">Realtime ASR Test</span>
         </a>
 
         <div class="sidebar-footer">
             App v0.1
+        </div>
+
+        <!-- Toggle Button -->
+        <div class="sidebar-toggle" id="sidebarToggle">
+            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
         </div>
     </div>
 
@@ -384,23 +481,25 @@
             <div class="header-actions">
                 <!-- Three dots -->
                 <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z"/>
+                    <path
+                        d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
                 </svg>
             </div>
         </div>
-        
+
         <p class="page-description">Ready for realtime streaming and transcription.</p>
 
         <div class="controls-toolbar">
             <button id="btnStart" class="btn btn-primary">
                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
-                    <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                    <path
+                        d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
                 </svg>
                 Start Recording
             </button>
             <button id="btnStop" class="btn btn-secondary">
                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
-                    <path d="M4 4a2 2 0 012-2h8a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V4z"/>
+                    <path d="M4 4a2 2 0 012-2h8a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" />
                 </svg>
                 Stop
             </button>
@@ -411,7 +510,10 @@
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">Transcript</span>
-                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24"><path d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <path
+                            d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
+                    </svg>
                 </div>
                 <div class="card-body" id="log">
                     <!-- Logs will appear here -->
@@ -422,20 +524,25 @@
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">Meeting Notes</span>
-                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24"><path d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <path
+                            d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
+                    </svg>
                 </div>
                 <div class="card-body">
                     <div class="empty-state">
                         <!-- Simple Page Icon SVG -->
                         <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-                           <circle cx="32" cy="32" r="32" fill="#E5E7EB" fill-opacity="0.5"/>
-                           <path d="M22 18H36L42 24V46H22V18Z" fill="#CBD5E1"/>
-                           <path d="M26 26H38M26 32H38M26 38H34" stroke="white" stroke-width="2" stroke-linecap="round"/>
-                           <circle cx="28" cy="40" r="4" fill="#6B7280" opacity="0.6"/> <!-- Star badge simulacrum -->
+                            <circle cx="32" cy="32" r="32" fill="#E5E7EB" fill-opacity="0.5" />
+                            <path d="M22 18H36L42 24V46H22V18Z" fill="#CBD5E1" />
+                            <path d="M26 26H38M26 32H38M26 38H34" stroke="white" stroke-width="2"
+                                stroke-linecap="round" />
+                            <circle cx="28" cy="40" r="4" fill="#6B7280" opacity="0.6" /> <!-- Star badge simulacrum -->
                         </svg>
-                        
+
                         <div>
-                            <p style="color: #374151; font-weight: 500; margin-bottom: 4px;">Meeting notes will be generated</p>
+                            <p style="color: #374151; font-weight: 500; margin-bottom: 4px;">Meeting notes will be
+                                generated</p>
                             <p style="font-size: 13px;">here after recording starts.</p>
                             <ul class="notes-list" style="display: inline-block;">
                                 <li>Summary</li>
@@ -457,6 +564,14 @@
         const logEl = document.getElementById("log");
         const statusBadge = document.getElementById("statusBadge");
 
+        // Sidebar logic
+        const sidebar = document.getElementById("sidebar");
+        const toggleBtn = document.getElementById("sidebarToggle");
+
+        toggleBtn.addEventListener("click", () => {
+            sidebar.classList.toggle("expanded");
+        });
+
         function getTimeStr() {
             const now = new Date();
             return `[${now.toLocaleTimeString('zh-CN', { hour12: false })}]`;
@@ -475,10 +590,10 @@
         function appendSystemMessage(msg, type = 'info') {
             let iconColor = "#9CA3AF";
             let iconSvg = '';
-            
+
             if (type === 'success') {
                 iconColor = "#10B981"; // Green
-                 // check
+                // check
                 iconSvg = `<svg class="log-icon" style="color:${iconColor}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
             } else if (type === 'play') {
                 // play arrow
@@ -495,7 +610,7 @@
         }
 
         function appendTranscript(text) {
-             const html = `
+            const html = `
                 <span class="log-timestamp">${getTimeStr()}</span>
                 <span>${text}</span>
             `;
@@ -503,18 +618,18 @@
         }
 
         async function setupListeners() {
-            await listen("asr_partial", (e) => { 
+            await listen("asr_partial", (e) => {
                 statusBadge.textContent = "Listening...";
                 statusBadge.style.backgroundColor = "#DBEAFE";
                 statusBadge.style.color = "#1E40AF";
                 // Optionally show partials? The UI usually shows final only in log list.
                 // We could update a temporary line at bottom if needed.
             });
-            
+
             await listen("asr_final", (e) => {
                 appendTranscript(e.payload);
             });
-            
+
             // Initial ready message
             appendSystemMessage("ASR listeners ready", "success");
         }
