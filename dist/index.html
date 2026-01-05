@@ -5,75 +5,544 @@
     <meta charset="utf-8" />
     <title>Realtime ASR Test</title>
     <style>
-        body {
-            font-family: system-ui, -apple-system;
-            padding: 16px;
+        :root {
+            /* Colors */
+            --bg-sidebar: #2D313A;
+            --bg-main: #F3F4F6;
+            --bg-card: #FFFFFF;
+            --text-primary: #1F2937;
+            --text-secondary: #6B7280;
+            --text-sidebar: #D1D5DB;
+            --text-sidebar-active: #FFFFFF;
+            --primary-blue: #4475F2;
+            --primary-blue-hover: #365EC0;
+            --btn-secondary-bg: #FFFFFF;
+            --btn-secondary-border: #E5E7EB;
+            --btn-secondary-hover: #F9FAFB;
+            --border-color: #E5E7EB;
+            --status-badge-bg: #E5E7EB;
+            --status-badge-text: #374151;
+            
+            /* Spacing */
+            --sidebar-width: 260px;
+            --header-height: 50px;
         }
 
-        button {
-            padding: 10px 14px;
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-main);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        /* --- Sidebar --- */
+        .sidebar {
+            width: var(--sidebar-width);
+            background-color: var(--bg-sidebar);
+            display: flex;
+            flex-direction: column;
+            color: var(--text-sidebar);
+            flex-shrink: 0;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            /* Placeholder gradient for logo if no SVG provided, using SVG below */
+        }
+
+        .sidebar-title {
+            font-weight: 600;
+            font-size: 16px;
+            color: white;
+            letter-spacing: 0.5px;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            cursor: pointer;
+            text-decoration: none;
+            color: var(--text-sidebar);
+            gap: 12px;
+            position: relative;
+            transition: background 0.2s;
+            margin: 0 12px;
+            border-radius: 6px;
+        }
+
+        .nav-item.active {
+            background-color: #4A5565; /* Lighter approx match */
+            background: linear-gradient(90deg, rgba(68,117,242,0.2) 0%, rgba(68,117,242,0.05) 100%);
+            color: var(--text-sidebar-active);
+            border-left: 3px solid var(--primary-blue);
+            border-radius: 4px; /* Slight adjust to match screenshot look of "box" vs "left border" */
+            /* Actually screenshot shows a full blue highlighting box style. Let's adjust */
+            background-color: #3b4250; /* A bit lighter than sidebar */
+            border-left: none; /* Screenshot looks like a full contained button */
+            background: #3B404C; 
+            border: 1px solid #4B5260;
+        }
+        
+        /* Specific fix for the "Active" look from screenshot: It has a blue icon box and text */
+        .nav-item.active {
+            background-color: #3F4756;
+            color: #8EB0FF; /* Light blue text */
+            border: none;
+        }
+        
+        .nav-icon {
+            width: 20px;
+            height: 20px;
+            opacity: 0.8;
+        }
+
+        .sidebar-footer {
+            margin-top: auto;
+            padding: 20px;
+            font-size: 12px;
+            color: #6B7280;
+        }
+
+        /* --- Main Content --- */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 32px;
+            overflow-y: auto;
+        }
+
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+        }
+
+        .page-title-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .page-title {
+            font-size: 24px;
+            font-weight: 700;
+            color: #111827;
+        }
+
+        .badge-idle {
+            background-color: var(--status-badge-bg);
+            color: var(--status-badge-text);
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .page-description {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-bottom: 24px;
+        }
+
+        .header-actions {
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+
+        /* --- Controls --- */
+        .controls-toolbar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        .btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: none;
+            outline: none;
+        }
+
+        .btn-primary {
+            background-color: var(--primary-blue);
+            color: white;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        
+        .btn-primary:active {
+            background-color: var(--primary-blue-hover);
+        }
+
+        .btn-secondary {
+            background-color: var(--btn-secondary-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--btn-secondary-border);
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+
+        .btn-secondary:hover {
+            background-color: var(--btn-secondary-hover);
+        }
+
+        /* --- Grid Layout for Cards --- */
+        .content-grid {
+            display: flex;
+            gap: 24px;
+            height: calc(100vh - 180px); /* Fill remaining vertical space */
+            min-height: 400px;
+        }
+
+        .card {
+            background-color: var(--bg-card);
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #E5E7EB;
+        }
+
+        .card-header {
+            padding: 16px;
+            border-bottom: 1px solid #E5E7EB;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #111827;
+        }
+
+        .card-menu {
+            color: #9CA3AF;
+            cursor: pointer;
+        }
+
+        .card-body {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+
+        /* Transcript Styling */
+        .log-entry {
+            margin-bottom: 4px;
+            font-family: "SF Mono", "Monaco", "Menlo", monospace;
+            font-size: 13px;
+            color: #374151;
+        }
+        
+        .log-timestamp {
+            color: #9CA3AF;
             margin-right: 8px;
         }
+        
+        .log-system {
+            color: #6B7280;
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
 
-        #log {
-            white-space: pre-wrap;
-            border: 1px solid #ddd;
-            padding: 12px;
-            border-radius: 8px;
-            margin-top: 12px;
-            height: 320px;
-            overflow: auto;
+        .log-success { color: #059669; }
+        .log-error { color: #DC2626; }
+        .log-icon { width: 14px; height: 14px; }
+
+        /* Notes Placeholder */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+            color: #6B7280;
+            gap: 16px;
+        }
+        
+        .empty-icon {
+            width: 64px;
+            height: 64px;
+            opacity: 0.5;
+            background: #E5E7EB; /* Fallback */
+            border-radius: 50%;
+        }
+
+        .notes-list {
+            list-style: none;
+            padding: 0;
+            margin-top: 10px;
+            text-align: left;
+        }
+        .notes-list li {
+            position: relative;
+            padding-left: 16px;
+            margin-bottom: 6px;
+            color: #6B7280; 
+        }
+        .notes-list li::before {
+            content: "•";
+            position: absolute;
+            left: 0;
+            color: #9CA3AF;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #D1D5DB;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #9CA3AF;
         }
     </style>
 </head>
 
 <body>
-    <h2>Realtime ASR Test</h2>
-    <button id="btnStart">Start</button>
-    <button id="btnStop">Stop</button>
-    <div id="status"></div>
-    <h3>Transcript</h3>
-    <div id="log"></div>
 
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <!-- Colorful Tiles Icon -->
+            <svg class="logo-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect x="0" y="0" width="14" height="14" rx="4" fill="#F59E0B" />
+                <rect x="18" y="0" width="14" height="14" rx="4" fill="#10B981" />
+                <rect x="0" y="18" width="14" height="14" rx="4" fill="#3B82F6" />
+                <rect x="18" y="18" width="14" height="14" rx="4" fill="#EF4444" />
+            </svg>
+            <span class="sidebar-title">ASR Tools</span>
+        </div>
+
+        <a href="#" class="nav-item active">
+            <!-- Waveform Icon -->
+            <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 3-2 3 2zm0 0v-8"></path>
+                <!-- Custom "Audio" wave look -->
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 10h3v4H4zM8 8h3v8H8zM12 6h3v12h-3zM16 8h3v8h-3zM20 10h3v4h-3z"></path>
+            </svg>
+            <span>Realtime ASR Test</span>
+        </a>
+
+        <div class="sidebar-footer">
+            App v0.1
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="page-header">
+            <div>
+                <div class="page-title-row">
+                    <h1 class="page-title">Realtime ASR Test</h1>
+                    <span class="badge-idle" id="statusBadge">Idle</span>
+                </div>
+                <!-- Spacer -->
+            </div>
+            <div class="header-actions">
+                <!-- Three dots -->
+                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z"/>
+                </svg>
+            </div>
+        </div>
+        
+        <p class="page-description">Ready for realtime streaming and transcription.</p>
+
+        <div class="controls-toolbar">
+            <button id="btnStart" class="btn btn-primary">
+                <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                </svg>
+                Start Recording
+            </button>
+            <button id="btnStop" class="btn btn-secondary">
+                <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M4 4a2 2 0 012-2h8a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V4z"/>
+                </svg>
+                Stop
+            </button>
+        </div>
+
+        <div class="content-grid">
+            <!-- Transcript Card -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Transcript</span>
+                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24"><path d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+                </div>
+                <div class="card-body" id="log">
+                    <!-- Logs will appear here -->
+                </div>
+            </div>
+
+            <!-- Meeting Notes Card (Placeholder) -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Meeting Notes</span>
+                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24"><path d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+                </div>
+                <div class="card-body">
+                    <div class="empty-state">
+                        <!-- Simple Page Icon SVG -->
+                        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                           <circle cx="32" cy="32" r="32" fill="#E5E7EB" fill-opacity="0.5"/>
+                           <path d="M22 18H36L42 24V46H22V18Z" fill="#CBD5E1"/>
+                           <path d="M26 26H38M26 32H38M26 38H34" stroke="white" stroke-width="2" stroke-linecap="round"/>
+                           <circle cx="28" cy="40" r="4" fill="#6B7280" opacity="0.6"/> <!-- Star badge simulacrum -->
+                        </svg>
+                        
+                        <div>
+                            <p style="color: #374151; font-weight: 500; margin-bottom: 4px;">Meeting notes will be generated</p>
+                            <p style="font-size: 13px;">here after recording starts.</p>
+                            <ul class="notes-list" style="display: inline-block;">
+                                <li>Summary</li>
+                                <li>Action items</li>
+                                <li>Decisions</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
     <script>
         const { invoke } = window.__TAURI__.core;
         const { listen } = window.__TAURI__.event;
 
         const logEl = document.getElementById("log");
-        const statusEl = document.getElementById("status");
+        const statusBadge = document.getElementById("statusBadge");
 
-        function appendLine(s) {
-            logEl.textContent += s + "\n";
+        function getTimeStr() {
+            const now = new Date();
+            return `[${now.toLocaleTimeString('zh-CN', { hour12: false })}]`;
+        }
+
+        // Modified append logic to support HTML structures for icons
+        function appendHtml(html) {
+            const div = document.createElement("div");
+            div.className = "log-entry";
+            div.innerHTML = html;
+            logEl.appendChild(div);
+            // Auto scroll
             logEl.scrollTop = logEl.scrollHeight;
         }
 
+        function appendSystemMessage(msg, type = 'info') {
+            let iconColor = "#9CA3AF";
+            let iconSvg = '';
+            
+            if (type === 'success') {
+                iconColor = "#10B981"; // Green
+                 // check
+                iconSvg = `<svg class="log-icon" style="color:${iconColor}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
+            } else if (type === 'play') {
+                // play arrow
+                iconSvg = `<svg class="log-icon" style="color:#6B7280" fill="currentColor" viewBox="0 0 20 20"><path d="M6 4l10 6-10 6V4z"/></svg>`;
+            }
+
+            const html = `
+                <div class="log-system">
+                    ${iconSvg}
+                    <span>${msg}</span>
+                </div>
+            `;
+            appendHtml(html);
+        }
+
+        function appendTranscript(text) {
+             const html = `
+                <span class="log-timestamp">${getTimeStr()}</span>
+                <span>${text}</span>
+            `;
+            appendHtml(html);
+        }
+
         async function setupListeners() {
-            await listen("asr_partial", (e) => { statusEl.textContent = e.payload; });
-            await listen("asr_final", (e) => {
-                const now = new Date();
-                const timeStr = now.toLocaleTimeString('zh-CN', { hour12: false });
-                appendLine(`[${timeStr}] ${e.payload}`);
+            await listen("asr_partial", (e) => { 
+                statusBadge.textContent = "Listening...";
+                statusBadge.style.backgroundColor = "#DBEAFE";
+                statusBadge.style.color = "#1E40AF";
+                // Optionally show partials? The UI usually shows final only in log list.
+                // We could update a temporary line at bottom if needed.
             });
-            appendLine("✅ ASR listeners ready");
+            
+            await listen("asr_final", (e) => {
+                appendTranscript(e.payload);
+            });
+            
+            // Initial ready message
+            appendSystemMessage("ASR listeners ready", "success");
         }
 
         document.getElementById("btnStart").addEventListener("click", async () => {
-            appendLine("▶ start_recording...");
+            appendSystemMessage("start_recording...", "play");
             try {
                 const out = await invoke("start_recording");
-                appendLine("✅ started: " + JSON.stringify(out));
+                // The out is (sys_path, mic_path)
+                appendSystemMessage(`started: ${JSON.stringify(out)}`, "play");
+                statusBadge.textContent = "Recording";
+                statusBadge.style.backgroundColor = "#FEE2E2";
+                statusBadge.style.color = "#991B1B";
             } catch (err) {
-                appendLine("❌ start_recording failed: " + err);
+                appendSystemMessage("❌ start_recording failed: " + err);
             }
         });
 
         document.getElementById("btnStop").addEventListener("click", async () => {
-            appendLine("■ stop_recording...");
+            appendHtml(`<div class="log-system" style="margin-top:8px; margin-bottom:8px; border-top:1px dashed #E5E7EB;"></div>`); // Separator
             try {
                 const out = await invoke("stop_recording");
-                appendLine("✅ stopped: " + JSON.stringify(out));
+                appendSystemMessage(`stopped: ${JSON.stringify(out)}`, "play");
+                statusBadge.textContent = "Idle";
+                statusBadge.style.backgroundColor = "#E5E7EB";
+                statusBadge.style.color = "#374151";
             } catch (err) {
-                appendLine("❌ stop_recording failed: " + err);
+                appendSystemMessage("❌ stop_recording failed: " + err);
             }
         });
 
