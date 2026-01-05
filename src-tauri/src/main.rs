@@ -342,21 +342,41 @@ fn main() {
 
             let h2 = handle.clone();
             handle.listen("tray-record-start", move |_| {
+                use tauri::Emitter; // Ensure Emitter trait is available for emit
+                let _ = h2.emit("tray-log", "▶ start_recording...");
                 println!("▶ start_recording...");
                 match start_recording(h2.clone()) {
-                    Ok((sys, mic)) => println!("✅ started: [\"{}\",\"{}\"]", sys, mic),
-                    Err(e) => eprintln!("❌ Start failed: {}", e),
+                    Ok((sys, mic)) => {
+                        let msg = format!("started: [\"{}\",\"{}\"]", sys, mic);
+                        let _ = h2.emit("tray-log", &msg);
+                        println!("✅ {}", msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("❌ start_recording failed: {}", e);
+                        let _ = h2.emit("tray-log", &msg);
+                        eprintln!("{}", msg);
+                    }
                 }
             });
 
+            let h3 = handle.clone();
             handle.listen("tray-record-stop", move |_| {
+                use tauri::Emitter;
+                let _ = h3.emit("tray-log", "▶ stop_recording...");
                 println!("▶ stop_recording...");
+                let h_stop = h3.clone();
                 tauri::async_runtime::spawn(async move {
                     match stop_recording().await {
                         Ok((sys, mic, mix)) => {
-                            println!("stopped: [\"{}\",\"{}\",\"{}\"]", sys, mic, mix)
+                            let msg = format!("stopped: [\"{}\",\"{}\",\"{}\"]", sys, mic, mix);
+                            let _ = h_stop.emit("tray-log", &msg);
+                            println!("{}", msg);
                         }
-                        Err(e) => eprintln!("❌ Stop failed: {}", e),
+                        Err(e) => {
+                            let msg = format!("❌ stop_recording failed: {}", e);
+                            let _ = h_stop.emit("tray-log", &msg);
+                            eprintln!("{}", msg);
+                        }
                     }
                 });
             });

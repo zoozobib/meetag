@@ -630,6 +630,31 @@
                 appendTranscript(e.payload);
             });
 
+            // Listen for checks from System Tray
+            await listen("tray-log", (e) => {
+                const msg = e.payload;
+                if (msg.includes("start_recording")) {
+                    appendSystemMessage(msg, "play");
+                    // Sync badge state if possible
+                    statusBadge.textContent = "Recording";
+                    statusBadge.style.backgroundColor = "#FEE2E2";
+                    statusBadge.style.color = "#991B1B";
+                } else if (msg.includes("started:")) {
+                    appendSystemMessage(msg, "play");
+                } else if (msg.includes("stop_recording")) {
+                    appendHtml(`<div class="log-system" style="margin-top:8px; margin-bottom:8px; border-top:1px dashed #E5E7EB;"></div>`);
+                } else if (msg.includes("stopped:")) {
+                    appendSystemMessage(msg, "play");
+                    statusBadge.textContent = "Idle";
+                    statusBadge.style.backgroundColor = "#E5E7EB";
+                    statusBadge.style.color = "#374151";
+                } else if (msg.includes("failed") || msg.includes("❌")) {
+                    appendSystemMessage(msg, "error");
+                } else {
+                    appendSystemMessage(msg, "info");
+                }
+            });
+
             // Initial ready message
             appendSystemMessage("ASR listeners ready", "success");
         }
