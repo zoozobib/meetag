@@ -138,7 +138,11 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     // Use mic_pcm_tx.clone() to pass to valid stream
     let mic_tx_for_capture = mic_pcm_tx.clone();
 
+    // Shared Atomic Gate for AEC (Energy Interlock)
+    let system_speaking = Arc::new(AtomicBool::new(false));
+
     // Spawn recording thread
+    let sys_speaking_mic = system_speaking.clone();
     let join = std::thread::spawn(move || {
         // 1) MIC stream
         let mic_stream = match capture::start_mic_stream(
@@ -146,6 +150,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             mic_asr_writer.clone(),
             mic_tx_for_capture,
             asr_mic_tx, // Send to User ASR
+            sys_speaking_mic,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -187,6 +192,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         };
 
         let system_writer2 = system_writer.clone();
+        let sys_speaking_loop = system_speaking.clone();
 
         rt.block_on(async move {
             use futures_util::StreamExt;
@@ -195,10 +201,17 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             let mut buf: Vec<i16> = Vec::with_capacity(48000);
             let mut last_flush = Instant::now();
 
-            // System Resample State
             let mut rs_phase: f32 = 0.0;
             let ratio = sr as f32 / 16_000.0;
             let mut prev_sample: f32 = 0.0;
+
+            // AEC Gate State
+            let mut rms_window_sum = 0.0;
+            let mut rms_window_count = 0;
+            let rms_window_size = 480; // ~10ms at 48kHz (adjust based on SR)
+            let gate_threshold = 0.05; // Adjust this sensitivity!
+            let mut hang_timer = 0;
+            let hang_duration = 5; // Hold gate for ~5 windows (50ms) after loud sound
 
             while !stop2.load(Ordering::Acquire) {
                 // Don't block forever
@@ -207,6 +220,24 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                         let s: f32 = s;
                         let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         buf.push(v);
+
+                        // --- AEC Logic: Update Energy State ---
+                        rms_window_sum += s * s;
+                        rms_window_count += 1;
+                        if rms_window_count >= rms_window_size {
+                            let rms = (rms_window_sum / rms_window_count as f32).sqrt();
+                            if rms > gate_threshold {
+                                sys_speaking_loop.store(true, Ordering::Relaxed);
+                                hang_timer = hang_duration;
+                            } else if hang_timer > 0 {
+                                hang_timer -= 1;
+                            } else {
+                                sys_speaking_loop.store(false, Ordering::Relaxed);
+                            }
+                            rms_window_sum = 0.0;
+                            rms_window_count = 0;
+                        }
+                        // --------------------------------------
 
                         // --- Resample to 16kHz for ASR Mixer ---
                         rs_phase += 1.0 / ratio;

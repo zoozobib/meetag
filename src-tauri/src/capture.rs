@@ -2,6 +2,7 @@ use crate::vad::SendVad;
 use crate::wav::WavWriter;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use webrtc_vad::{Vad, VadMode};
 
@@ -84,6 +85,7 @@ pub fn start_mic_stream(
     writer_asr: Arc<Mutex<WavWriter>>,
     mixer_tx: std::sync::mpsc::Sender<i16>,
     asr_tx: std::sync::mpsc::Sender<i16>,
+    system_speaking: Arc<AtomicBool>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
 
@@ -145,12 +147,17 @@ pub fn start_mic_stream(
             let tx_mix = mixer_tx.clone();
             let tx_asr = asr_tx.clone();
 
+            let sys_speak_f32 = system_speaking.clone();
+
             let stream = dev.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
                     if data.is_empty() {
                         return;
                     }
+
+                    let is_echo_active = sys_speak_f32.load(Ordering::Relaxed);
+                    // ... (gain logic remains)
 
                     // Compute RMS on the incoming buffer (interleaved channels).
                     let mut sum = 0.0f32;
@@ -224,7 +231,13 @@ pub fn start_mic_stream(
                         for ch in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch[0], ch[1]]);
                             let _ = tx_mix.send(v);
-                            let _ = tx_asr.send(v);
+
+                            // AEC Gate
+                            if is_echo_active {
+                                let _ = tx_asr.send(0);
+                            } else {
+                                let _ = tx_asr.send(v);
+                            }
                         }
                     }
 
