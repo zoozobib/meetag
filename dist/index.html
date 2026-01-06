@@ -468,6 +468,53 @@
         ::-webkit-scrollbar-thumb:hover {
             background: #9CA3AF;
         }
+
+        /* --- History View Styles --- */
+        .view-section {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            height: 100%;
+            /* Important for inner scrolling */
+        }
+
+        .history-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            overflow-y: auto;
+            padding-bottom: 20px;
+        }
+
+        .history-item {
+            background: var(--bg-card);
+            padding: 16px 20px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .history-item:hover {
+            border-color: var(--primary-blue);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            transform: translateY(-1px);
+        }
+
+        .history-date {
+            font-weight: 600;
+            color: var(--text-primary);
+            font-size: 15px;
+            margin-bottom: 4px;
+        }
+
+        .history-meta {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
     </style>
 </head>
 
@@ -486,7 +533,7 @@
             <span class="sidebar-title">ASR Tools</span>
         </div>
 
-        <a href="#" class="nav-item active">
+        <a href="#" class="nav-item active" id="navHome">
             <!-- Waveform Icon -->
             <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"
                 xmlns="http://www.w3.org/2000/svg">
@@ -497,6 +544,16 @@
                     d="M4 10h3v4H4zM8 8h3v8H8zM12 6h3v12h-3zM16 8h3v8h-3zM20 10h3v4h-3z"></path>
             </svg>
             <span class="nav-text">Realtime ASR Test</span>
+        </a>
+
+        <a href="#" class="nav-item" id="navHistory">
+            <!-- History Icon -->
+            <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+            </svg>
+            <span class="nav-text">History</span>
         </a>
 
         <div class="sidebar-footer">
@@ -513,90 +570,132 @@
 
     <!-- Main Content -->
     <div class="main-content">
-        <div class="page-header">
-            <div>
-                <div class="page-title-row">
-                    <h1 class="page-title">Realtime ASR Test</h1>
-                    <span class="badge-idle" id="statusBadge">Idle</span>
+
+        <!-- VIEW: HOME -->
+        <div id="view-home" class="view-section">
+            <div class="page-header">
+                <div>
+                    <div class="page-title-row">
+                        <h1 class="page-title">Realtime ASR Test</h1>
+                        <span class="badge-idle" id="statusBadge">Idle</span>
+                    </div>
+                    <!-- Spacer -->
                 </div>
-                <!-- Spacer -->
-            </div>
-            <div class="header-actions">
-                <!-- Three dots -->
-                <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
-                    <path
-                        d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
-                </svg>
-            </div>
-        </div>
-
-        <p class="page-description">Ready for realtime streaming and transcription.</p>
-
-        <div class="controls-toolbar">
-            <button id="btnStart" class="btn btn-primary">
-                <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
-                    <path
-                        d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
-                </svg>
-                Start Recording
-            </button>
-            <button id="btnStop" class="btn btn-secondary">
-                <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
-                    <path d="M4 4a2 2 0 012-2h8a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" />
-                </svg>
-                Stop
-            </button>
-        </div>
-
-        <div class="content-grid">
-            <!-- Transcript Card -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Transcript</span>
-                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                <div class="header-actions">
+                    <!-- Three dots -->
+                    <svg width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
                         <path
                             d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
                     </svg>
                 </div>
-                <div class="card-body" id="log">
-                    <!-- Logs will appear here -->
-                </div>
             </div>
 
-            <!-- Meeting Notes Card (Placeholder) -->
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Meeting Notes</span>
-                    <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+            <p class="page-description">Ready for realtime streaming and transcription.</p>
+
+            <div class="controls-toolbar">
+                <button id="btnStart" class="btn btn-primary">
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
                         <path
-                            d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
+                            d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
                     </svg>
-                </div>
-                <div class="card-body">
-                    <div class="empty-state">
-                        <!-- Simple Page Icon SVG -->
-                        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <circle cx="32" cy="32" r="32" fill="#E5E7EB" fill-opacity="0.5" />
-                            <path d="M22 18H36L42 24V46H22V18Z" fill="#CBD5E1" />
-                            <path d="M26 26H38M26 32H38M26 38H34" stroke="white" stroke-width="2"
-                                stroke-linecap="round" />
-                            <circle cx="28" cy="40" r="4" fill="#6B7280" opacity="0.6" /> <!-- Star badge simulacrum -->
+                    Start Recording
+                </button>
+                <button id="btnStop" class="btn btn-secondary">
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M4 4a2 2 0 012-2h8a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" />
+                    </svg>
+                    Stop
+                </button>
+            </div>
+
+            <div class="content-grid">
+                <!-- Transcript Card -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Transcript</span>
+                        <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                            <path
+                                d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
                         </svg>
+                    </div>
+                    <div class="card-body" id="log">
+                        <!-- Logs will appear here -->
+                    </div>
+                </div>
 
-                        <div>
-                            <p style="color: #374151; font-weight: 500; margin-bottom: 4px;">Meeting notes will be
-                                generated</p>
-                            <p style="font-size: 13px;">here after recording starts.</p>
-                            <ul class="notes-list" style="display: inline-block;">
-                                <li>Summary</li>
-                                <li>Action items</li>
-                                <li>Decisions</li>
-                            </ul>
+                <!-- Meeting Notes Card (Placeholder) -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Meeting Notes</span>
+                        <svg class="card-menu" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                            <path
+                                d="M6 12a2 2 0 11-4 0 2 2 0 014 0zM14 12a2 2 0 11-4 0 2 2 0 014 0zM22 12a2 2 0 11-4 0 2 2 0 014 0z" />
+                        </svg>
+                    </div>
+                    <div class="card-body">
+                        <div class="empty-state">
+                            <!-- Simple Page Icon SVG -->
+                            <svg width="64" height="64" viewBox="0 0 64 64" fill="none"
+                                xmlns="http://www.w3.org/2000/svg">
+                                <circle cx="32" cy="32" r="32" fill="#E5E7EB" fill-opacity="0.5" />
+                                <path d="M22 18H36L42 24V46H22V18Z" fill="#CBD5E1" />
+                                <path d="M26 26H38M26 32H38M26 38H34" stroke="white" stroke-width="2"
+                                    stroke-linecap="round" />
+                                <circle cx="28" cy="40" r="4" fill="#6B7280" opacity="0.6" />
+                                <!-- Star badge simulacrum -->
+                            </svg>
+
+                            <div>
+                                <p style="color: #374151; font-weight: 500; margin-bottom: 4px;">Meeting notes will be
+                                    generated</p>
+                                <p style="font-size: 13px;">here after recording starts.</p>
+                                <ul class="notes-list" style="display: inline-block;">
+                                    <li>Summary</li>
+                                    <li>Action items</li>
+                                    <li>Decisions</li>
+                                </ul>
+                            </div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
+
+        <!-- VIEW: HISTORY -->
+        <div id="view-history" class="view-section" style="display: none;">
+            <div class="page-header">
+                <h1 class="page-title">Session History</h1>
+            </div>
+            <div id="history-list" class="history-list">
+                <!-- Items go here -->
+            </div>
+        </div>
+
+        <!-- VIEW: DETAIL -->
+        <div id="view-detail" class="view-section" style="display: none;">
+            <div class="page-header">
+                <div class="page-title-row">
+                    <button class="btn btn-secondary" id="btnBackToHistory"
+                        style="margin-right: 12px; padding: 6px 12px;">
+                        <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                            style="margin-right: 4px;">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M10 19l-7-7m0 0l7-7m-7 7h18"></path>
+                        </svg>
+                        Back
+                    </button>
+                    <h1 class="page-title" id="detail-title">Session Detail</h1>
+                </div>
+            </div>
+            <div class="card" style="flex:1; overflow:hidden;">
+                <div class="card-header">
+                    <span class="card-title">Conversation Layout</span>
+                </div>
+                <div class="card-body" id="detail-log">
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <!-- Scripts -->
@@ -769,6 +868,148 @@
         });
 
         setupListeners();
+
+        // -------------------------
+        // View Switching Logic
+        // -------------------------
+        const navHome = document.getElementById('navHome');
+        const navHistory = document.getElementById('navHistory');
+        const viewHome = document.getElementById('view-home');
+        const viewHistory = document.getElementById('view-history');
+        const viewDetail = document.getElementById('view-detail');
+        const historyList = document.getElementById('history-list');
+        const btnBackToHistory = document.getElementById('btnBackToHistory');
+        const detailLog = document.getElementById('detail-log');
+        const detailTitle = document.getElementById('detail-title');
+
+        navHome.addEventListener('click', () => switchView('home'));
+        navHistory.addEventListener('click', () => switchView('history'));
+        btnBackToHistory.addEventListener('click', () => switchView('history'));
+
+        // Reuse appendHtml logic for Detail view, but target detailLog
+        function appendToDetail(html) {
+            const div = document.createElement("div");
+            if (html.includes("log-entry") || html.includes("log-system-entry")) {
+                const temp = document.createElement('div');
+                temp.innerHTML = html;
+                while (temp.firstChild) {
+                    detailLog.appendChild(temp.firstChild);
+                }
+            } else {
+                div.className = "log-entry";
+                div.innerHTML = html;
+                detailLog.appendChild(div);
+            }
+        }
+
+        // Helper to format transcript items for Detail View
+        function renderTranscriptItem(item) {
+            let text = item.text || "";
+            let source = item.source || 'system';
+            const isUser = source === 'user';
+            const alignClass = isUser ? 'user' : 'system';
+            const label = isUser ? 'Me' : 'Speaker';
+
+            // We don't have exact timestamp in transcript unless saved. 
+            // The JSONL currently saves {text, source}. 
+            // We can fake it or omit it. Let's omit or generic.
+
+            return `
+                <div class="log-entry ${alignClass}">
+                    <div class="log-meta">
+                        <span style="font-weight:600;">${label}</span>
+                    </div>
+                    <div class="log-bubble">
+                        ${text}
+                    </div>
+                </div>
+            `;
+        }
+
+
+        function switchView(viewName) {
+            // Hide all
+            viewHome.style.display = 'none';
+            viewHistory.style.display = 'none';
+            viewDetail.style.display = 'none';
+
+            // Sidebar States
+            navHome.classList.remove('active');
+            navHistory.classList.remove('active');
+
+            if (viewName === 'home') {
+                viewHome.style.display = 'flex';
+                navHome.classList.add('active');
+            } else if (viewName === 'history') {
+                viewHistory.style.display = 'flex';
+                navHistory.classList.add('active');
+                fetchHistory(); // Reload history
+            } else if (viewName === 'detail') {
+                viewDetail.style.display = 'flex';
+                // Keep history active
+                navHistory.classList.add('active');
+            }
+        }
+
+        async function fetchHistory() {
+            historyList.innerHTML = '<div style="padding:24px; color:#6B7280; text-align:center;">Loading sessions...</div>';
+            try {
+                const sessions = await invoke('get_sessions');
+                historyList.innerHTML = '';
+
+                if (!sessions || sessions.length === 0) {
+                    historyList.innerHTML = `
+                        <div class="empty-state" style="margin-top: 40px;">
+                            <div class="empty-icon"></div>
+                            <p style="margin-top:16px;">No recording history found.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                sessions.forEach(session => {
+                    const el = document.createElement('div');
+                    el.className = 'history-item';
+                    el.innerHTML = `
+                        <div>
+                            <div class="history-date">${session.date}</div>
+                            <div class="history-meta">${session.preview}</div>
+                        </div>
+                        <svg width="20" height="20" fill="none" stroke="#9CA3AF" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                        </svg>
+                    `;
+                    el.addEventListener('click', () => loadSessionDetail(session.id));
+                    historyList.appendChild(el);
+                });
+
+            } catch (err) {
+                historyList.innerHTML = `<div class="log-error" style="padding:20px;">Failed to load history: ${err}</div>`;
+            }
+        }
+
+        async function loadSessionDetail(sessionId) {
+            switchView('detail');
+            detailTitle.textContent = sessionId; // Or format it?
+            detailLog.innerHTML = '<div style="padding:20px; text-align:center;">Loading transcript...</div>';
+
+            try {
+                const detail = await invoke('get_session_detail', { id: sessionId });
+                detailLog.innerHTML = ''; // Clear loading
+
+                if (detail.transcript && detail.transcript.length > 0) {
+                    detail.transcript.forEach(item => {
+                        const html = renderTranscriptItem(item);
+                        appendToDetail(html);
+                    });
+                } else {
+                    detailLog.innerHTML = '<div style="padding:40px; text-align:center; color:#9CA3AF;">No transcript data available for this session.</div>';
+                }
+
+            } catch (err) {
+                detailLog.innerHTML = `<div class="log-error" style="padding:20px;">Error loading detail: ${err}</div>`;
+            }
+        }
     </script>
 </body>
 
