@@ -391,11 +391,18 @@ fn get_last_record_base() -> Option<std::path::PathBuf> {
     LAST_RECORD_BASE.lock().unwrap().clone()
 }
 
+// Global handle for the whisper sidecar process
+static WHISPER_PROCESS: Lazy<Mutex<Option<tauri_plugin_shell::process::CommandChild>>> =
+    Lazy::new(|| Mutex::new(None));
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // For now, adhere to the user's existing logic (hide on close),
+                // but this contributes to the "zombie process" feeling if not careful.
+                // However, the main fix is ensuring real exit kills the child.
                 window.hide().unwrap();
                 api.prevent_close();
             }
@@ -418,7 +425,7 @@ fn main() {
 
             let h2 = handle.clone();
             handle.listen("tray-record-start", move |_| {
-                use tauri::Emitter; // Ensure Emitter trait is available for emit
+                use tauri::Emitter;
                 let _ = h2.emit("tray-log", "▶ start_recording...");
                 println!("▶ start_recording...");
                 match start_recording(h2.clone()) {
@@ -479,17 +486,49 @@ fn main() {
                     "127.0.0.1",
                 ]);
 
-                let (mut rx, mut child) = sidecar_command
+                let (mut rx, child) = sidecar_command
                     .spawn()
                     .expect("Failed to spawn whisper sidecar");
+
                 println!(
                     "🚀 Whisper sidecar spawned with PID: {:?} on port 8178",
                     child.pid()
                 );
+
+                // Store the child process handle globally
+                *WHISPER_PROCESS.lock().unwrap() = Some(child);
+
+                // Continuously read the sidecar's output to prevent pipe blocking
+                use tauri_plugin_shell::process::CommandEvent;
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        CommandEvent::Stdout(line) => {
+                            // Only print if needed, or just consume it
+                            let log = String::from_utf8_lossy(&line);
+                            println!("[Whisper] {}", log.trim());
+                        }
+                        CommandEvent::Stderr(line) => {
+                            let log = String::from_utf8_lossy(&line);
+                            eprintln!("[Whisper Err] {}", log.trim());
+                        }
+                        _ => {}
+                    }
+                }
+                println!("⚠️ Whisper sidecar channel closed");
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Cleanup sidecar on exit
+                let mut guard = WHISPER_PROCESS.lock().unwrap();
+                if let Some(child) = guard.take() {
+                    println!("🛑 Killing whisper sidecar (PID: {:?})", child.pid());
+                    let _ = child.kill();
+                }
+            }
+        });
 }
