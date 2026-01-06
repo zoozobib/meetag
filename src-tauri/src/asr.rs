@@ -10,6 +10,7 @@ pub fn realtime_inference_worker(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut rx: std::sync::mpsc::Receiver<i16>,
     source: String,
+    transcript_writer: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -158,11 +159,25 @@ pub fn realtime_inference_worker(
                                     density * 100.0,
                                     buf.len() / 16
                                 );
-                                send_audio_to_asr(&app, &client, server_url, &buf, &source);
+                                send_audio_to_asr(
+                                    &app,
+                                    &client,
+                                    server_url,
+                                    &buf,
+                                    &source,
+                                    &transcript_writer,
+                                );
                             } else {
                                 println!("🚀 Sending audio to ASR [{}](Condition 1: Silence Cut), density={:.1}%", source, density * 100.0);
                                 // 1000 samples ~ 60ms
-                                send_audio_to_asr(&app, &client, server_url, &buf, &source);
+                                send_audio_to_asr(
+                                    &app,
+                                    &client,
+                                    server_url,
+                                    &buf,
+                                    &source,
+                                    &transcript_writer,
+                                );
                             }
                         }
                         buf.clear();
@@ -176,7 +191,14 @@ pub fn realtime_inference_worker(
                 // 2. Max Length (Force send at 5s)
                 if buf.len() >= max_len_samples {
                     if is_speaking {
-                        send_audio_to_asr(&app, &client, server_url, &buf, &source);
+                        send_audio_to_asr(
+                            &app,
+                            &client,
+                            server_url,
+                            &buf,
+                            &source,
+                            &transcript_writer,
+                        );
                     }
                     buf.clear();
                     is_speaking = false;
@@ -205,7 +227,7 @@ pub fn realtime_inference_worker(
 
     // Final flush
     if !buf.is_empty() && is_speaking {
-        send_audio_to_asr(&app, &client, server_url, &buf, &source);
+        send_audio_to_asr(&app, &client, server_url, &buf, &source, &transcript_writer);
     }
 
     Ok(())
@@ -217,6 +239,7 @@ fn send_audio_to_asr(
     url: &str,
     samples: &[i16],
     source: &str,
+    transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
 ) {
     // Add 300ms silence padding to end (Post-roll) to help ASR complete the last word
     let mut padded = Vec::with_capacity(samples.len() + 4800);
@@ -284,6 +307,19 @@ fn send_audio_to_asr(
                                             "source": source
                                         });
                                         let _ = app.emit("asr_final", payload.to_string());
+
+                                        // LOGGING: Append to transcript.jsonl
+                                        let entry = serde_json::json!({
+                                            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                                            "speaker": source,
+                                            "text": t
+                                        });
+                                        if let Ok(line) = serde_json::to_string(&entry) {
+                                            use std::io::Write;
+                                            if let Ok(mut w) = transcript_writer.lock() {
+                                                let _ = writeln!(w, "{}", line);
+                                            }
+                                        }
                                     }
                                 }
                             }

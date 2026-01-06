@@ -54,14 +54,31 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     }
 
     // Output dir
-    let base: PathBuf = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    // Output dir: app_data/sessions/YYYY-MM-DD_HH-mm-ss
+    let base_app_data: PathBuf = app.path().app_data_dir().map_err(|e| e.to_string())?;
 
-    let system_path = base.join("system.wav");
-    let mic_path = base.join("mic.wav");
-    let mic_asr_path = base.join("mic_asr_16k_mono.wav");
-    let mix_path = base.join("mix.wav");
-    let mix_asr_path = base.join("mix_asr_16k_mono.wav");
+    // Generate session timestamp
+    let now = std::time::SystemTime::now();
+    let dt: chrono::DateTime<chrono::Local> = now.into();
+    let folder_name = dt.format("%Y-%m-%d_%H-%M-%S").to_string();
+    let session_dir = base_app_data.join("sessions").join(folder_name);
+
+    std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
+
+    let system_path = session_dir.join("system.wav");
+    let mic_path = session_dir.join("mic.wav");
+    let mic_asr_path = session_dir.join("mic_asr_16k_mono.wav");
+    let mix_path = session_dir.join("mix.wav");
+    let mix_asr_path = session_dir.join("mix_asr_16k_mono.wav");
+    let transcript_path = session_dir.join("transcript.jsonl");
+
+    // Create transcript writer
+    let transcript_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript_path)
+        .map_err(|e| e.to_string())?;
+    let transcript_writer = Arc::new(Mutex::new(transcript_file));
 
     // Create writers
     let system_writer = Arc::new(Mutex::new(
@@ -116,17 +133,29 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     // ASR worker thread 1: User (Mic)
     let asr_app_1 = app.clone();
     let stop_asr_1 = stop.clone();
+    let tw_1 = transcript_writer.clone();
     std::thread::spawn(move || {
-        let _ =
-            asr::realtime_inference_worker(asr_app_1, stop_asr_1, asr_mic_rx, "user".to_string());
+        let _ = asr::realtime_inference_worker(
+            asr_app_1,
+            stop_asr_1,
+            asr_mic_rx,
+            "user".to_string(),
+            tw_1,
+        );
     });
 
     // ASR worker thread 2: System (Speaker)
     let asr_app_2 = app.clone();
     let stop_asr_2 = stop.clone();
+    let tw_2 = transcript_writer.clone();
     std::thread::spawn(move || {
-        let _ =
-            asr::realtime_inference_worker(asr_app_2, stop_asr_2, asr_sys_rx, "system".to_string());
+        let _ = asr::realtime_inference_worker(
+            asr_app_2,
+            stop_asr_2,
+            asr_sys_rx,
+            "system".to_string(),
+            tw_2,
+        );
     });
 
     let stop2 = stop.clone();
@@ -309,7 +338,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     *guard = Some(RecorderHandle {
         stop,
         join,
-        base_dir: base.clone(),
+        base_dir: session_dir.clone(),
         mic_path: mic_path.clone(),
         system_path: system_path.clone(),
         mix_path: mix_path.clone(),
