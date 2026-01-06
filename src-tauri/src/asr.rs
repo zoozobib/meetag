@@ -9,6 +9,7 @@ pub fn realtime_inference_worker(
     app: tauri::AppHandle,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut rx: std::sync::mpsc::Receiver<i16>,
+    source: String,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -74,7 +75,7 @@ pub fn realtime_inference_worker(
 
                     if speech_run_count % 50 == 0 && is_voice {
                         // Debug log occasionally to check RMS levels during speech
-                        println!("🔉 VAD: Speech frame RMS={:.1}", rms);
+                        println!("🔉 VAD [{}]: Speech frame RMS={:.1}", source, rms);
                     }
 
                     vad_accum.clear();
@@ -90,12 +91,12 @@ pub fn realtime_inference_worker(
                     if speech_run_count >= min_speech_frames {
                         if !is_speaking {
                             is_speaking = true;
-                            println!("🎤 VAD: Speech START");
+                            println!("🎤 VAD [{}]: Speech START", source);
                         }
                         if silence_frames > 0 {
                             println!(
-                                "🔄 VAD: Silence RESET by speech run ({} frames)",
-                                speech_run_count
+                                "🔄 VAD [{}]: Silence RESET by speech run ({} frames)",
+                                source, speech_run_count
                             );
                         }
                         silence_frames = 0;
@@ -106,8 +107,8 @@ pub fn realtime_inference_worker(
                             // Debug log every 10 frames of silence (~200ms) to track why it's not cutting
                             if silence_frames % 5 == 0 {
                                 println!(
-                                    "... VAD: Silence frame {} (Threshold: ...)",
-                                    silence_frames
+                                    "... VAD [{}]: Silence frame {} (Threshold: ...)",
+                                    source, silence_frames
                                 );
                             }
                         }
@@ -128,7 +129,8 @@ pub fn realtime_inference_worker(
                     if is_speaking {
                         if silence_frames % 5 == 0 {
                             println!(
-                                "📊 VAD Status: len={} samples, silence={} frames, limit={}",
+                                "📊 VAD Status [{}]: len={} samples, silence={} frames, limit={}",
+                                source,
                                 buf.len(),
                                 silence_frames,
                                 current_threshold
@@ -151,15 +153,16 @@ pub fn realtime_inference_worker(
                             // Filter out low density (e.g. < 15% speech) if buffer is long enough (>2s)
                             if buf.len() > 32000 && density < 0.15 {
                                 println!(
-                                    "⚠️ Low speech density: {:.1}% (len={}ms) - Sending anyway to preserve latency",
+                                    "⚠️ Low speech density [{}]: {:.1}% (len={}ms) - Sending anyway to preserve latency",
+                                    source,
                                     density * 100.0,
                                     buf.len() / 16
                                 );
-                                send_audio_to_asr(&app, &client, server_url, &buf);
+                                send_audio_to_asr(&app, &client, server_url, &buf, &source);
                             } else {
-                                println!("🚀 Sending audio to ASR (Condition 1: Silence Cut), density={:.1}%", density * 100.0);
+                                println!("🚀 Sending audio to ASR [{}](Condition 1: Silence Cut), density={:.1}%", source, density * 100.0);
                                 // 1000 samples ~ 60ms
-                                send_audio_to_asr(&app, &client, server_url, &buf);
+                                send_audio_to_asr(&app, &client, server_url, &buf, &source);
                             }
                         }
                         buf.clear();
@@ -173,7 +176,7 @@ pub fn realtime_inference_worker(
                 // 2. Max Length (Force send at 5s)
                 if buf.len() >= max_len_samples {
                     if is_speaking {
-                        send_audio_to_asr(&app, &client, server_url, &buf);
+                        send_audio_to_asr(&app, &client, server_url, &buf, &source);
                     }
                     buf.clear();
                     is_speaking = false;
@@ -202,7 +205,7 @@ pub fn realtime_inference_worker(
 
     // Final flush
     if !buf.is_empty() && is_speaking {
-        send_audio_to_asr(&app, &client, server_url, &buf);
+        send_audio_to_asr(&app, &client, server_url, &buf, &source);
     }
 
     Ok(())
@@ -213,6 +216,7 @@ fn send_audio_to_asr(
     client: &reqwest::blocking::Client,
     url: &str,
     samples: &[i16],
+    source: &str,
 ) {
     // Add 300ms silence padding to end (Post-roll) to help ASR complete the last word
     let mut padded = Vec::with_capacity(samples.len() + 4800);
@@ -275,7 +279,11 @@ fn send_audio_to_asr(
                                     if text_filter::is_hallucination(t) {
                                         println!("🗑️ Discarding hallucination: {:?}", t);
                                     } else {
-                                        let _ = app.emit("asr_final", t.to_string());
+                                        let payload = serde_json::json!({
+                                            "text": t,
+                                            "source": source
+                                        });
+                                        let _ = app.emit("asr_final", payload.to_string());
                                     }
                                 }
                             }

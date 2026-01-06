@@ -333,18 +333,61 @@
 
         /* Transcript Styling */
         .log-entry {
+            margin-bottom: 8px;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+        }
+
+        .log-bubble {
+            padding: 8px 12px;
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.5;
+            max-width: 85%;
+            word-wrap: break-word;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+
+        /* User (Me) -> Right, Blue */
+        .log-entry.user {
+            align-items: flex-end;
+        }
+
+        .log-entry.user .log-bubble {
+            background-color: #EFF6FF;
+            /* Blue-50 */
+            color: #1E3A8A;
+            /* Blue-900 */
+            border: 1px solid #DBEAFE;
+            border-bottom-right-radius: 2px;
+        }
+
+        /* System (Speaker) -> Left, Gray/White */
+        .log-entry.system {
+            align-items: flex-start;
+        }
+
+        .log-entry.system .log-bubble {
+            background-color: #FFFFFF;
+            color: #1F2937;
+            border: 1px solid #E5E7EB;
+            border-bottom-left-radius: 2px;
+        }
+
+        .log-meta {
+            font-size: 11px;
+            color: #9CA3AF;
+            margin-bottom: 4px;
+            display: flex;
+            gap: 6px;
+        }
+
+        /* Log System Messages (preserved) */
+        .log-system-entry {
             margin-bottom: 4px;
             font-family: "SF Mono", "Monaco", "Menlo", monospace;
             font-size: 13px;
-            color: #374151;
-        }
-
-        .log-timestamp {
-            color: #9CA3AF;
-            margin-right: 8px;
-        }
-
-        .log-system {
             color: #6B7280;
             font-style: italic;
             display: flex;
@@ -574,15 +617,31 @@
 
         function getTimeStr() {
             const now = new Date();
-            return `[${now.toLocaleTimeString('zh-CN', { hour12: false })}]`;
+            return now.toLocaleTimeString('zh-CN', { hour12: false });
         }
 
         // Modified append logic to support HTML structures for icons
         function appendHtml(html) {
             const div = document.createElement("div");
-            div.className = "log-entry";
-            div.innerHTML = html;
-            logEl.appendChild(div);
+            // Standard log entry (system message) usually just simpler, but we can reuse logic.
+            // If the HTML provided is full structure, we just append it.
+            // But 'appendHtml' usually wraps. Let's make it flexible.
+            if (html.includes("log-entry") || html.includes("log-system-entry")) {
+                div.innerHTML = html;
+                // unwrap the inner div if we accidentally double wrapped? 
+                // Actually simpler: logEl.innerHTML += html. But that resets scroll.
+                // Let's just create a container.
+                // If the input HTML defines the class, we should probably append directly to logEl
+                const temp = document.createElement('div');
+                temp.innerHTML = html;
+                while (temp.firstChild) {
+                    logEl.appendChild(temp.firstChild);
+                }
+            } else {
+                div.className = "log-entry"; // Default fallback
+                div.innerHTML = html;
+                logEl.appendChild(div);
+            }
             // Auto scroll
             logEl.scrollTop = logEl.scrollHeight;
         }
@@ -601,7 +660,7 @@
             }
 
             const html = `
-                <div class="log-system">
+                <div class="log-system-entry">
                     ${iconSvg}
                     <span>${msg}</span>
                 </div>
@@ -609,10 +668,35 @@
             appendHtml(html);
         }
 
-        function appendTranscript(text) {
+        function appendTranscript(payload) {
+            let text = payload;
+            let source = 'system'; // Default
+
+            // Try to parse JSON
+            try {
+                const obj = JSON.parse(payload);
+                if (obj.text) {
+                    text = obj.text;
+                    if (obj.source) source = obj.source;
+                }
+            } catch (e) {
+                // Not JSON, assume generic text (legacy)
+            }
+
+            const isUser = source === 'user';
+            const alignClass = isUser ? 'user' : 'system';
+            const label = isUser ? 'Me' : 'Speaker';
+
             const html = `
-                <span class="log-timestamp">${getTimeStr()}</span>
-                <span>${text}</span>
+                <div class="log-entry ${alignClass}">
+                    <div class="log-meta">
+                        <span style="font-weight:600;">${label}</span>
+                        <span>${getTimeStr()}</span>
+                    </div>
+                    <div class="log-bubble">
+                        ${text}
+                    </div>
+                </div>
             `;
             appendHtml(html);
         }
@@ -622,8 +706,6 @@
                 statusBadge.textContent = "Listening...";
                 statusBadge.style.backgroundColor = "#DBEAFE";
                 statusBadge.style.color = "#1E40AF";
-                // Optionally show partials? The UI usually shows final only in log list.
-                // We could update a temporary line at bottom if needed.
             });
 
             await listen("asr_final", (e) => {

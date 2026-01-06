@@ -82,7 +82,8 @@ fn find_best_input_device(host: &cpal::Host) -> Result<cpal::Device> {
 pub fn start_mic_stream(
     writer_raw: Arc<Mutex<WavWriter>>,
     writer_asr: Arc<Mutex<WavWriter>>,
-    mic_tx: std::sync::mpsc::Sender<i16>,
+    mixer_tx: std::sync::mpsc::Sender<i16>,
+    asr_tx: std::sync::mpsc::Sender<i16>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
 
@@ -141,7 +142,8 @@ pub fn start_mic_stream(
             let mut rs_phase: f32 = 0.0;
             let ratio: f32 = sample_rate as f32 / 16_000.0;
             let mut prev_mono: f32 = 0.0;
-            let tx = mic_tx.clone();
+            let tx_mix = mixer_tx.clone();
+            let tx_asr = asr_tx.clone();
 
             let stream = dev.build_input_stream(
                 &stream_config,
@@ -218,10 +220,11 @@ pub fn start_mic_stream(
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
 
-                        // Send 16k mono ASR samples to mixer
+                        // Send 16k mono ASR samples to mixer AND ASR worker
                         for ch in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch[0], ch[1]]);
-                            let _ = tx.send(v);
+                            let _ = tx_mix.send(v);
+                            let _ = tx_asr.send(v);
                         }
                     }
 
@@ -276,7 +279,8 @@ pub fn start_mic_stream(
             let mut rs_phase: f32 = 0.0;
             let ratio: f32 = sample_rate as f32 / 16_000.0;
             let mut prev_mono: f32 = 0.0;
-            let tx = mic_tx.clone();
+            let tx_mix = mixer_tx.clone();
+            let tx_asr = asr_tx.clone();
 
             let stream = dev.build_input_stream(
                 &stream_config,
@@ -361,10 +365,11 @@ pub fn start_mic_stream(
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
 
-                        // Send 16k mono ASR samples to mixer
+                        // Send 16k mono ASR samples to mixer AND ASR worker
                         for ch in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch[0], ch[1]]);
-                            let _ = tx.send(v);
+                            let _ = tx_mix.send(v);
+                            let _ = tx_asr.send(v);
                         }
                     }
                 },
@@ -379,7 +384,8 @@ pub fn start_mic_stream(
             let mut rs_phase: f32 = 0.0;
             let ratio: f32 = sample_rate as f32 / 16_000.0;
             let mut prev_mono: f32 = 0.0;
-            let tx = mic_tx.clone();
+            let tx_mix = mixer_tx.clone();
+            let tx_asr = asr_tx.clone();
 
             let stream = dev.build_input_stream(
                 &stream_config,
@@ -457,10 +463,11 @@ pub fn start_mic_stream(
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
 
-                        // Send 16k mono ASR samples to mixer
+                        // Send 16k mono ASR samples to mixer AND ASR worker
                         for ch in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch[0], ch[1]]);
-                            let _ = tx.send(v);
+                            let _ = tx_mix.send(v);
+                            let _ = tx_asr.send(v);
                         }
                     }
                 },

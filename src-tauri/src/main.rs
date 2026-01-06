@@ -81,6 +81,10 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     let (sys_pcm_tx, sys_pcm_rx) = std::sync::mpsc::channel::<i16>();
     let (mix_pcm_tx, mix_pcm_rx) = std::sync::mpsc::channel::<i16>();
 
+    // Valid for ASR (Independent channels)
+    let (asr_mic_tx, asr_mic_rx) = std::sync::mpsc::channel::<i16>();
+    let (asr_sys_tx, asr_sys_rx) = std::sync::mpsc::channel::<i16>();
+
     *MIC_PCM_TX.lock().unwrap() = Some(mic_pcm_tx.clone());
     *SYS_PCM_TX.lock().unwrap() = Some(sys_pcm_tx.clone());
 
@@ -109,11 +113,20 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         }
     });
 
-    // ASR worker thread (chunks -> /inference)
-    let asr_app = app.clone();
-    let stop_asr = stop.clone();
+    // ASR worker thread 1: User (Mic)
+    let asr_app_1 = app.clone();
+    let stop_asr_1 = stop.clone();
     std::thread::spawn(move || {
-        let _ = asr::realtime_inference_worker(asr_app, stop_asr, mix_pcm_rx);
+        let _ =
+            asr::realtime_inference_worker(asr_app_1, stop_asr_1, asr_mic_rx, "user".to_string());
+    });
+
+    // ASR worker thread 2: System (Speaker)
+    let asr_app_2 = app.clone();
+    let stop_asr_2 = stop.clone();
+    std::thread::spawn(move || {
+        let _ =
+            asr::realtime_inference_worker(asr_app_2, stop_asr_2, asr_sys_rx, "system".to_string());
     });
 
     let stop2 = stop.clone();
@@ -132,6 +145,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             mic_writer.clone(),
             mic_asr_writer.clone(),
             mic_tx_for_capture,
+            asr_mic_tx, // Send to User ASR
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -204,6 +218,8 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                             if let Some(tx) = SYS_PCM_TX.lock().unwrap().as_ref() {
                                 let _ = tx.send(v_asr);
                             }
+                            // Also send to System ASR
+                            let _ = asr_sys_tx.send(v_asr);
                             rs_phase -= 1.0;
                         }
                         prev_sample = s;
