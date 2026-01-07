@@ -113,6 +113,7 @@
             border-radius: 6px;
             overflow: hidden;
             white-space: nowrap;
+            outline: none;
         }
 
         /* Centering icons when collapsed */
@@ -135,11 +136,13 @@
         }
 
         .nav-text {
+            display: none;
             opacity: 0;
             transition: opacity 0.2s;
         }
 
         .sidebar.expanded .nav-text {
+            display: inline;
             opacity: 1;
         }
 
@@ -534,25 +537,16 @@
         </div>
 
         <a href="#" class="nav-item active" id="navHome">
-            <!-- Waveform Icon -->
-            <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                xmlns="http://www.w3.org/2000/svg">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                    d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 3-2 3 2zm0 0v-8"></path>
-                <!-- Custom "Audio" wave look -->
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                    d="M4 10h3v4H4zM8 8h3v8H8zM12 6h3v12h-3zM16 8h3v8h-3zM20 10h3v4h-3z"></path>
-            </svg>
+            <!-- "1" Icon (Text) -->
+            <span class="nav-icon"
+                style="display:flex; justify-content:center; align-items:center; font-weight:700; font-size:18px; color:currentColor;">1</span>
             <span class="nav-text">Realtime ASR Test</span>
         </a>
 
         <a href="#" class="nav-item" id="navHistory">
-            <!-- History Icon -->
-            <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                xmlns="http://www.w3.org/2000/svg">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                    d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-            </svg>
+            <!-- "H" Icon (Text) -->
+            <span class="nav-icon"
+                style="display:flex; justify-content:center; align-items:center; font-weight:700; font-size:18px; color:currentColor;">H</span>
             <span class="nav-text">History</span>
         </a>
 
