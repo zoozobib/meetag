@@ -542,6 +542,12 @@
             margin-bottom: 8px;
         }
 
+        .notes-preview {
+            user-select: text;
+            -webkit-user-select: text;
+            cursor: auto;
+        }
+
         .notes-preview ul,
         .notes-preview ol {
             margin-bottom: 8px;
@@ -715,6 +721,8 @@
 
                             <!-- Actions -->
                             <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                                <button id="btnCopyNotes" class="btn btn-secondary"
+                                    style="padding: 6px 12px; font-size: 13px;" title="Copy to clipboard">Copy</button>
                                 <button id="btnEditNotes" class="btn btn-secondary"
                                     style="padding: 6px 12px; font-size: 13px;">Edit</button>
                                 <button id="btnSaveNotes" class="btn btn-primary"
@@ -793,6 +801,7 @@
 
         const notesPreview = document.getElementById("notes-preview");
         const btnEditNotes = document.getElementById("btnEditNotes");
+        const btnCopyNotes = document.getElementById("btnCopyNotes");
 
         let isEditing = false;
 
@@ -881,6 +890,28 @@
 
         btnEditNotes.addEventListener("click", () => {
             toggleEditMode(true);
+        });
+
+        btnCopyNotes.addEventListener("click", async () => {
+            // If editing, copy textarea. If preview, copy rendered text?
+            // User wants "rendered content" but copying raw usually better for clipboard.
+            // But let's copy textarea value (the source) so they can paste rich text if they render it, 
+            // actually writeText is plain text. 
+            // Let's copy the raw Markdown source which is the Source of Truth.
+            const content = notesEditor.value;
+            if (!content) return;
+            try {
+                await navigator.clipboard.writeText(content);
+                // Visual feedback
+                const originals = btnCopyNotes.innerHTML;
+                btnCopyNotes.textContent = "Copied!";
+                setTimeout(() => {
+                    btnCopyNotes.innerHTML = originals;
+                }, 1500);
+            } catch (err) {
+                console.error('Failed to copy!', err);
+                appendSystemMessage("Failed to copy notes: " + err, "error");
+            }
         });
 
         btnSaveNotes.addEventListener("click", async () => {
