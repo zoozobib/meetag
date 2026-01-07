@@ -518,7 +518,45 @@
             font-size: 13px;
             color: var(--text-secondary);
         }
+
+        .notes-preview h1,
+        .notes-preview h2,
+        .notes-preview h3 {
+            margin-top: 10px;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #111827;
+        }
+
+        .notes-preview h1 {
+            font-size: 1.25em;
+            border-bottom: 1px solid #e5e7eb;
+            padding-bottom: 4px;
+        }
+
+        .notes-preview h2 {
+            font-size: 1.1em;
+        }
+
+        .notes-preview p {
+            margin-bottom: 8px;
+        }
+
+        .notes-preview ul,
+        .notes-preview ol {
+            margin-bottom: 8px;
+            padding-left: 20px;
+        }
+
+        .notes-preview li {
+            margin-bottom: 4px;
+        }
+
+        .notes-preview strong {
+            color: #1f2937;
+        }
     </style>
+    <script src="vendor/marked.min.js"></script>
 </head>
 
 <body>
@@ -664,11 +702,23 @@
                         </div>
 
                         <!-- Real Editor Area (Hidden by default) -->
+                        <!-- Real Editor Area (Hidden by default) -->
                         <div id="notes-editor-container" style="display: none; height: 100%; flex-direction: column;">
+                            <!-- Preview Mode -->
+                            <div id="notes-preview" class="notes-preview"
+                                style="flex: 1; overflow-y: auto; border: 1px solid transparent; padding: 12px; font-size: 14px; line-height: 1.6; color: #374151;">
+                            </div>
+
+                            <!-- Edit Mode -->
                             <textarea id="notes-editor"
-                                style="flex: 1; border: 1px solid #E5E7EB; border-radius: 6px; padding: 12px; font-family: 'Menlo', monospace; font-size: 13px; line-height: 1.5; resize: none; outline: none; margin-bottom: 12px;"></textarea>
-                            <div style="display: flex; justify-content: flex-end;">
-                                <button id="btnSaveNotes" class="btn btn-primary">Save Notes</button>
+                                style="display: none; flex: 1; border: 1px solid #E5E7EB; border-radius: 6px; padding: 12px; font-family: 'Menlo', monospace; font-size: 13px; line-height: 1.5; resize: none; outline: none; margin-bottom: 12px;"></textarea>
+
+                            <!-- Actions -->
+                            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                                <button id="btnEditNotes" class="btn btn-secondary"
+                                    style="padding: 6px 12px; font-size: 13px;">Edit</button>
+                                <button id="btnSaveNotes" class="btn btn-primary"
+                                    style="display: none; padding: 6px 12px; font-size: 13px;">Save</button>
                             </div>
                         </div>
                     </div>
@@ -741,6 +791,38 @@
             sidebar.classList.toggle("expanded");
         });
 
+        const notesPreview = document.getElementById("notes-preview");
+        const btnEditNotes = document.getElementById("btnEditNotes");
+
+        let isEditing = false;
+
+        function renderMarkdown(text) {
+            if (window.marked) {
+                try {
+                    return marked.parse(text);
+                } catch (e) { console.error("Marked parse error", e); return text; }
+            }
+            return text; // Fallback
+        }
+
+        function toggleEditMode(edit) {
+            isEditing = edit;
+            if (isEditing) {
+                notesPreview.style.display = "none";
+                notesEditor.style.display = "block";
+                btnEditNotes.style.display = "none";
+                btnSaveNotes.style.display = "inline-flex";
+                notesEditor.focus();
+            } else {
+                notesEditor.style.display = "none";
+                notesPreview.style.display = "block";
+                btnSaveNotes.style.display = "none";
+                btnEditNotes.style.display = "inline-flex";
+                // Render preview
+                notesPreview.innerHTML = renderMarkdown(notesEditor.value);
+            }
+        }
+
         // --- Summary Logic ---
         btnSummary.addEventListener("click", async () => {
             if (!currentSessionId) {
@@ -757,24 +839,35 @@
                 Generating...
              `;
 
-            // Show editor with "loading" text or clear it
+            // Reset UI
             notesEmptyState.style.display = "none";
             notesEditorContainer.style.display = "flex";
-            notesEditor.value = "Generating summary with local LLM (this may take a minute)...";
+            // Default to View Mode with "Generating..." text
+            toggleEditMode(false);
+            notesPreview.innerHTML = `<div style="color:#6B7280; font-style:italic;">Generating summary with local LLM...</div>`;
+            // Disable edit button while generating
+            btnEditNotes.disabled = true;
 
             try {
                 const res = await invoke("generate_summary", { sessionId: currentSessionId });
                 if (res.success) {
-                    notesEditor.value = res.content || "";
+                    const content = res.content || "";
+                    notesEditor.value = content;
+                    notesPreview.innerHTML = renderMarkdown(content);
                     appendSystemMessage("Summary generated successfully.", "success");
                 } else {
-                    notesEditor.value = "Error generating summary.\nDetails: " + (res.error || "Unknown error");
+                    const errText = "Error generating summary.\nDetails: " + (res.error || "Unknown error");
+                    notesEditor.value = errText;
+                    notesPreview.textContent = errText;
                     appendSystemMessage("Summary generation failed: " + res.error, "error");
                 }
             } catch (e) {
                 notesEditor.value = "Error invoking backend: " + e;
+                notesPreview.textContent = "Error invoking backend: " + e;
                 appendSystemMessage("Summary invoke failed: " + e, "error");
             } finally {
+                btnEditNotes.disabled = false; // Enable edit
+
                 // Re-enable button? Maybe keep it disabled or change text to "Regenerate"
                 btnSummary.disabled = false;
                 btnSummary.innerHTML = `
@@ -786,12 +879,19 @@
             }
         });
 
+        btnEditNotes.addEventListener("click", () => {
+            toggleEditMode(true);
+        });
+
         btnSaveNotes.addEventListener("click", async () => {
             if (!currentSessionId) return;
             const content = notesEditor.value;
             try {
+                // Save first
                 await invoke("save_summary", { sessionId: currentSessionId, content });
                 appendSystemMessage("Notes saved.", "success");
+                // Then switch to view
+                toggleEditMode(false);
             } catch (e) {
                 alert("Failed to save notes: " + e);
             }
