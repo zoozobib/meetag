@@ -171,6 +171,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
     // Spawn recording thread
     let sys_speaking_mic = system_speaking.clone();
+    let rec_app = app.clone();
     let join = std::thread::spawn(move || {
         // 1) MIC stream
         let mic_stream = match capture::start_mic_stream(
@@ -320,18 +321,41 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         let _ = mic_writer.lock().unwrap().finalize();
         let _ = mic_asr_writer.lock().unwrap().finalize();
 
-        // 5) Mix
-        if let Err(e) = crate::wav::mix_pcm16_wav(&mic_path_t, &system_path_t, &mix_path_t) {
-            eprintln!("❌ mix failed: {e:?}");
-        } else {
-            println!("✅ mix.wav: {}", mix_path_t.display());
+        // 5) Mix (Background Thread)
+        // We spawn a new thread so the join handle returns immediately,
+        // allowing stop_recording to return to UI without waiting for mix.
+        let mix_app = rec_app.clone();
+        std::thread::spawn(move || {
+            use tauri::Emitter;
+            // Notify start of mixing (optional, mainly for debug logs)
+            println!("⏳ Starting background mix...");
 
-            // Convert mix.wav -> mix_asr_16k_mono.wav
-            match crate::wav::convert_wav_to_16k_mono_pcm16(&mix_path_t, &mix_asr_path_t) {
-                Ok(()) => println!("✅ mix_asr_16k_mono.wav: {}", mix_asr_path_t.display()),
-                Err(e) => eprintln!("❌ convert mix_asr failed: {e:?}"),
+            if let Err(e) = crate::wav::mix_pcm16_wav(&mic_path_t, &system_path_t, &mix_path_t) {
+                eprintln!("❌ mix failed: {e:?}");
+                let _ = mix_app.emit("tray-log", format!("❌ Background mix failed: {}", e));
+            } else {
+                println!("✅ mix.wav: {}", mix_path_t.display());
+
+                // Convert mix.wav -> mix_asr_16k_mono.wav
+                match crate::wav::convert_wav_to_16k_mono_pcm16(&mix_path_t, &mix_asr_path_t) {
+                    Ok(()) => {
+                        println!("✅ mix_asr_16k_mono.wav: {}", mix_asr_path_t.display());
+                        let _ = mix_app.emit(
+                            "tray-log",
+                            format!(
+                                "✅ Mixing & Resampling complete: {}",
+                                mix_path_t.file_name().unwrap_or_default().to_string_lossy()
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("❌ convert mix_asr failed: {e:?}");
+                        let _ =
+                            mix_app.emit("tray-log", format!("❌ Convert mix_asr failed: {}", e));
+                    }
+                }
             }
-        }
+        });
     });
 
     *guard = Some(RecorderHandle {
