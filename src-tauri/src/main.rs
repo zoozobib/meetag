@@ -12,6 +12,7 @@ mod asr;
 mod audio;
 mod capture;
 mod history;
+mod llm;
 mod text_filter;
 mod tray;
 mod vad;
@@ -545,7 +546,11 @@ fn main() {
             start_recording,
             stop_recording,
             history::get_sessions,
-            history::get_session_detail
+            history::get_sessions,
+            history::get_session_detail,
+            llm::generate_summary,
+            llm::save_summary,
+            llm::get_summary
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

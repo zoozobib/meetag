@@ -600,6 +600,19 @@
                     </svg>
                     Stop
                 </button>
+
+                <!-- Spacer to push summary button to the right -->
+                <div style="flex: 1;"></div>
+
+                <button id="btnSummary" class="btn btn-secondary" disabled
+                    title="Generate Summary after recording stops">
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd"
+                            d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z"
+                            clip-rule="evenodd" />
+                    </svg>
+                    Generate Summary
+                </button>
             </div>
 
             <div class="content-grid">
@@ -627,7 +640,7 @@
                         </svg>
                     </div>
                     <div class="card-body">
-                        <div class="empty-state">
+                        <div id="notes-empty-state" class="empty-state">
                             <!-- Simple Page Icon SVG -->
                             <svg width="64" height="64" viewBox="0 0 64 64" fill="none"
                                 xmlns="http://www.w3.org/2000/svg">
@@ -636,7 +649,6 @@
                                 <path d="M26 26H38M26 32H38M26 38H34" stroke="white" stroke-width="2"
                                     stroke-linecap="round" />
                                 <circle cx="28" cy="40" r="4" fill="#6B7280" opacity="0.6" />
-                                <!-- Star badge simulacrum -->
                             </svg>
 
                             <div>
@@ -648,6 +660,15 @@
                                     <li>Action items</li>
                                     <li>Decisions</li>
                                 </ul>
+                            </div>
+                        </div>
+
+                        <!-- Real Editor Area (Hidden by default) -->
+                        <div id="notes-editor-container" style="display: none; height: 100%; flex-direction: column;">
+                            <textarea id="notes-editor"
+                                style="flex: 1; border: 1px solid #E5E7EB; border-radius: 6px; padding: 12px; font-family: 'Menlo', monospace; font-size: 13px; line-height: 1.5; resize: none; outline: none; margin-bottom: 12px;"></textarea>
+                            <div style="display: flex; justify-content: flex-end;">
+                                <button id="btnSaveNotes" class="btn btn-primary">Save Notes</button>
                             </div>
                         </div>
                     </div>
@@ -700,6 +721,18 @@
         const logEl = document.getElementById("log");
         const statusBadge = document.getElementById("statusBadge");
 
+        const btnStart = document.getElementById("btnStart");
+        const btnStop = document.getElementById("btnStop");
+        const btnSummary = document.getElementById("btnSummary");
+
+        // Notes UI
+        const notesEmptyState = document.getElementById("notes-empty-state");
+        const notesEditorContainer = document.getElementById("notes-editor-container");
+        const notesEditor = document.getElementById("notes-editor");
+        const btnSaveNotes = document.getElementById("btnSaveNotes");
+
+        let currentSessionId = null; // Track current session for summary generation logic (naive: only last recorded)
+
         // Sidebar logic
         const sidebar = document.getElementById("sidebar");
         const toggleBtn = document.getElementById("sidebarToggle");
@@ -707,6 +740,141 @@
         toggleBtn.addEventListener("click", () => {
             sidebar.classList.toggle("expanded");
         });
+
+        // --- Summary Logic ---
+        btnSummary.addEventListener("click", async () => {
+            if (!currentSessionId) {
+                alert("No recent session to summarize.");
+                return;
+            }
+
+            btnSummary.disabled = true;
+            btnSummary.innerHTML = `
+                <svg class="animate-spin" style="animation: spin 1s linear infinite; margin-right: 6px;" width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Generating...
+             `;
+
+            // Show editor with "loading" text or clear it
+            notesEmptyState.style.display = "none";
+            notesEditorContainer.style.display = "flex";
+            notesEditor.value = "Generating summary with local LLM (this may take a minute)...";
+
+            try {
+                const res = await invoke("generate_summary", { sessionId: currentSessionId });
+                if (res.success) {
+                    notesEditor.value = res.content || "";
+                    appendSystemMessage("Summary generated successfully.", "success");
+                } else {
+                    notesEditor.value = "Error generating summary.\nDetails: " + (res.error || "Unknown error");
+                    appendSystemMessage("Summary generation failed: " + res.error, "error");
+                }
+            } catch (e) {
+                notesEditor.value = "Error invoking backend: " + e;
+                appendSystemMessage("Summary invoke failed: " + e, "error");
+            } finally {
+                // Re-enable button? Maybe keep it disabled or change text to "Regenerate"
+                btnSummary.disabled = false;
+                btnSummary.innerHTML = `
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
+                    </svg>
+                    Regenerate Summary
+                 `;
+            }
+        });
+
+        btnSaveNotes.addEventListener("click", async () => {
+            if (!currentSessionId) return;
+            const content = notesEditor.value;
+            try {
+                await invoke("save_summary", { sessionId: currentSessionId, content });
+                appendSystemMessage("Notes saved.", "success");
+            } catch (e) {
+                alert("Failed to save notes: " + e);
+            }
+        });
+
+        // Add spinner style
+        const style = document.createElement('style');
+        style.innerHTML = `
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        `;
+        document.head.appendChild(style);
+
+        // Start Logic update (override listener slightly by adding logic before or inside)
+        // Since we can't easily remove anonymous listeners, we just add our own parallel logic
+        // But here we are replacing the existing block.
+        btnStart.addEventListener("click", async () => {
+            btnStart.disabled = true;
+            btnStop.disabled = false;
+            // Reset UI for new session
+            notesEmptyState.style.display = "flex";
+            notesEditorContainer.style.display = "none";
+            notesEditor.value = "";
+            btnSummary.disabled = true; // Disable until stopped
+            currentSessionId = null;
+
+            appendSystemMessage("start_recording...", "play");
+            try {
+                // invoke returns (system_path, mic_path) tuple as array/object
+                const out = await invoke("start_recording");
+                appendSystemMessage(`started: ${JSON.stringify(out)}`, "play");
+
+                // Robust Session ID Extraction from returned path
+                // out[0] or out[1] should contain ".../sessions/<SESSION_ID>/..."
+                try {
+                    let pathStr = "";
+                    if (Array.isArray(out)) {
+                        pathStr = out[0];
+                    } else if (typeof out === 'string') {
+                        pathStr = out; // Should not happen based on Rust signature but safety first
+                    }
+
+                    if (pathStr) {
+                        // pathStr like: /Users/.../sessions/2023-01-01_10-00-00/system.wav
+                        const parts = pathStr.split("/sessions/");
+                        if (parts.length > 1) {
+                            const sub = parts[1].split("/")[0];
+                            currentSessionId = sub;
+                            console.log("Captured Session ID from invoke:", currentSessionId);
+                        }
+                    }
+                } catch (err) {
+                    console.error("Failed to extract session ID from start result:", err);
+                }
+
+            } catch (e) {
+                console.error(e);
+                appendSystemMessage("❌ start_recording failed: " + e, "error");
+                btnStart.disabled = false;
+                btnStop.disabled = true;
+            }
+        });
+
+        document.getElementById("btnStop").addEventListener("click", async () => {
+            appendHtml(`<div class="log-system" style="margin-top:8px; margin-bottom:8px; border-top:1px dashed #E5E7EB;"></div>`);
+            try {
+                const out = await invoke("stop_recording");
+                appendSystemMessage(`stopped: ${JSON.stringify(out)}`, "play");
+                // Enable summary button if we have a valid session ID
+                if (currentSessionId) {
+                    const btnSummary = document.getElementById("btnSummary");
+                    if (btnSummary) {
+                        btnSummary.disabled = false;
+                        btnSummary.title = "Generate summary for " + currentSessionId;
+                    }
+                }
+            } catch (e) {
+                appendSystemMessage("❌ stop_recording failed: " + e, "error");
+            }
+        });
+
 
         function getTimeStr() {
             const now = new Date();
@@ -816,6 +984,21 @@
                     statusBadge.style.color = "#991B1B";
                 } else if (msg.includes("started:")) {
                     appendSystemMessage(msg, "play");
+                    // Parse Session ID: "started: [".../sessions/SESSION_ID/system.wav", ...]"
+                    try {
+                        const jsonPart = msg.substring(msg.indexOf("["));
+                        const paths = JSON.parse(jsonPart);
+                        if (paths && paths.length > 0) {
+                            // Extract ID from path
+                            // Assuming path contains /sessions/<ID>/
+                            const parts = paths[0].split("/sessions/");
+                            if (parts.length > 1) {
+                                const sub = parts[1].split("/")[0]; // ID is the next segment
+                                currentSessionId = sub;
+                                console.log("Captured Session ID:", currentSessionId);
+                            }
+                        }
+                    } catch (e) { console.error("Error parsing session ID", e); }
                 } else if (msg.includes("stop_recording")) {
                     appendHtml(`<div class="log-system" style="margin-top:8px; margin-bottom:8px; border-top:1px dashed #E5E7EB;"></div>`);
                 } else if (msg.includes("stopped:")) {
@@ -823,8 +1006,19 @@
                     statusBadge.textContent = "Idle";
                     statusBadge.style.backgroundColor = "#E5E7EB";
                     statusBadge.style.color = "#374151";
+
+                    if (currentSessionId) {
+                        const btnSummary = document.getElementById("btnSummary");
+                        if (btnSummary) {
+                            btnSummary.disabled = false;
+                            btnSummary.title = "Generate summary for " + currentSessionId;
+                        }
+                    }
                 } else if (msg.includes("failed") || msg.includes("❌")) {
                     appendSystemMessage(msg, "error");
+                    // Re-enable start button if start failed
+                    document.getElementById("btnStart").disabled = false;
+                    document.getElementById("btnStop").disabled = true;
                 } else {
                     appendSystemMessage(msg, "info");
                 }
@@ -834,32 +1028,8 @@
             appendSystemMessage("ASR listeners ready", "success");
         }
 
-        document.getElementById("btnStart").addEventListener("click", async () => {
-            appendSystemMessage("start_recording...", "play");
-            try {
-                const out = await invoke("start_recording");
-                // The out is (sys_path, mic_path)
-                appendSystemMessage(`started: ${JSON.stringify(out)}`, "play");
-                statusBadge.textContent = "Recording";
-                statusBadge.style.backgroundColor = "#FEE2E2";
-                statusBadge.style.color = "#991B1B";
-            } catch (err) {
-                appendSystemMessage("❌ start_recording failed: " + err);
-            }
-        });
+        // Old listeners removed to prevent duplicates
 
-        document.getElementById("btnStop").addEventListener("click", async () => {
-            appendHtml(`<div class="log-system" style="margin-top:8px; margin-bottom:8px; border-top:1px dashed #E5E7EB;"></div>`); // Separator
-            try {
-                const out = await invoke("stop_recording");
-                appendSystemMessage(`stopped: ${JSON.stringify(out)}`, "play");
-                statusBadge.textContent = "Idle";
-                statusBadge.style.backgroundColor = "#E5E7EB";
-                statusBadge.style.color = "#374151";
-            } catch (err) {
-                appendSystemMessage("❌ stop_recording failed: " + err);
-            }
-        });
 
         setupListeners();
 
