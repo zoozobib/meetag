@@ -12,6 +12,7 @@ pub struct SessionInfo {
 pub struct SessionDetail {
     id: String,
     transcript: Vec<serde_json::Value>,
+    summary: Option<String>,
 }
 
 #[tauri::command]
@@ -71,5 +72,17 @@ pub fn get_session_detail(app: tauri::AppHandle, id: String) -> Result<SessionDe
         }
     }
 
-    Ok(SessionDetail { id, transcript })
+    // Read summary if exists
+    let summary_path = session_dir.join("summary.md");
+    let summary = if summary_path.exists() {
+        std::fs::read_to_string(summary_path).ok()
+    } else {
+        None
+    };
+
+    Ok(SessionDetail {
+        id,
+        transcript,
+        summary,
+    })
 }

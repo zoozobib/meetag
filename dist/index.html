@@ -1292,13 +1292,35 @@
                 const detail = await invoke('get_session_detail', { id: sessionId });
                 detailLog.innerHTML = ''; // Clear loading
 
+                // Render Summary if exists
+                if (detail.summary) {
+                    const summaryDiv = document.createElement('div');
+                    summaryDiv.className = 'card';
+                    summaryDiv.style.marginBottom = '16px';
+                    summaryDiv.style.border = '1px solid #E5E7EB';
+                    summaryDiv.innerHTML = `
+                        <div class="card-header" style="background:#F9FAFB;">
+                            <span class="card-title">Session Summary</span>
+                        </div>
+                        <div class="card-body notes-preview" style="padding:16px;">
+                            ${renderMarkdown(detail.summary)}
+                        </div>
+                    `;
+                    detailLog.appendChild(summaryDiv);
+                }
+
                 if (detail.transcript && detail.transcript.length > 0) {
                     detail.transcript.forEach(item => {
                         const html = renderTranscriptItem(item);
                         appendToDetail(html);
                     });
                 } else {
-                    detailLog.innerHTML = '<div style="padding:40px; text-align:center; color:#9CA3AF;">No transcript data available for this session.</div>';
+                    const emptyDiv = document.createElement('div');
+                    emptyDiv.style.padding = '40px';
+                    emptyDiv.style.textAlign = 'center';
+                    emptyDiv.style.color = '#9CA3AF';
+                    emptyDiv.textContent = 'No transcript data available for this session.';
+                    detailLog.appendChild(emptyDiv);
                 }
 
             } catch (err) {
