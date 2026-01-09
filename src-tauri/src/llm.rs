@@ -1,11 +1,9 @@
 use crate::history::SessionDetail;
 use anyhow::{Context, Result};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
 use tauri::Manager;
 
 // =====================
@@ -50,36 +48,69 @@ pub struct SummaryResult {
 #[derive(Debug, Deserialize)]
 struct PromptConfig {
     #[serde(flatten)]
-    templates: HashMap<String, String>,
+    templates: HashMap<String, Vec<String>>,
 }
 
-static INSTRUCTIONS: Lazy<PromptConfig> = Lazy::new(|| {
-    let json_str = include_str!("llm_config/instructions.json");
-    serde_json::from_str(json_str).expect("Failed to parse instructions.json")
-});
+fn load_runtime_config(filename: &str) -> PromptConfig {
+    // Try to read relative to CWD (usually project root during dev)
+    // Path: src-tauri/src/llm_config/<filename>
+    let path = format!("src-tauri/src/llm_config/{}", filename);
 
-static OUTPUT_FORMATS: Lazy<PromptConfig> = Lazy::new(|| {
-    let json_str = include_str!("llm_config/output_formats.json");
-    serde_json::from_str(json_str).expect("Failed to parse output_formats.json")
-});
+    // Attempt to read file
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(config) = serde_json::from_str(&content) {
+            return config;
+        } else {
+            println!("[LLM Config] JSON parse error for {}", path);
+        }
+    } else {
+        println!("[LLM Config] Failed to read file {}, using fallback.", path);
+    }
+
+    // Fallback logic
+    match filename {
+        "instructions.json" => {
+            let json_str = include_str!("llm_config/instructions.json");
+            serde_json::from_str(json_str).expect("Failed to parse fallback instructions")
+        }
+        "output_formats.json" => {
+            let json_str = include_str!("llm_config/output_formats.json");
+            serde_json::from_str(json_str).expect("Failed to parse fallback output_formats")
+        }
+        _ => panic!("Unknown config file: {}", filename),
+    }
+}
 
 const OLLAMA_API_URL: &str = "http://localhost:11434/api/generate";
 // Default model, can be made configurable later
 const DEFAULT_MODEL: &str = "qwen3:4b";
 
 fn build_prompt(transcript_text: &str) -> String {
-    let instruction = INSTRUCTIONS.templates.get("default").unwrap_or_else(|| {
-        panic!("Default instruction not found!");
-    });
+    // 1. Get Instructions
+    let instruction_config = load_runtime_config("instructions.json");
+    let instruction_lines = instruction_config
+        .templates
+        .get("default")
+        .unwrap_or_else(|| {
+            panic!("Default instruction not found!");
+        });
+    let instruction = instruction_lines.join("\n");
 
-    let format_req = OUTPUT_FORMATS.templates.get("default").unwrap_or_else(|| {
+    // 2. Get Output Formats
+    let format_config = load_runtime_config("output_formats.json");
+    let format_lines = format_config.templates.get("default").unwrap_or_else(|| {
         panic!("Default output format not found!");
     });
+    let format_req = format_lines.join("\n");
 
-    format!(
+    let prompt = format!(
         "{}\n\n{}\n\n----------------\n\n【会议录音转写文本】：\n{}\n",
         instruction, format_req, transcript_text
-    )
+    );
+
+    println!("[LLM Prompt Debug] Generated Prompt:\n{}", prompt);
+
+    prompt
 }
 
 // =====================
