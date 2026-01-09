@@ -1,6 +1,8 @@
 use crate::history::SessionDetail;
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -41,27 +43,42 @@ pub struct SummaryResult {
 // Constants / Prompt
 // =====================
 
+// =====================
+// Configuration for Prompts
+// =====================
+
+#[derive(Debug, Deserialize)]
+struct PromptConfig {
+    #[serde(flatten)]
+    templates: HashMap<String, String>,
+}
+
+static INSTRUCTIONS: Lazy<PromptConfig> = Lazy::new(|| {
+    let json_str = include_str!("llm_config/instructions.json");
+    serde_json::from_str(json_str).expect("Failed to parse instructions.json")
+});
+
+static OUTPUT_FORMATS: Lazy<PromptConfig> = Lazy::new(|| {
+    let json_str = include_str!("llm_config/output_formats.json");
+    serde_json::from_str(json_str).expect("Failed to parse output_formats.json")
+});
+
 const OLLAMA_API_URL: &str = "http://localhost:11434/api/generate";
 // Default model, can be made configurable later
 const DEFAULT_MODEL: &str = "qwen3:4b";
 
 fn build_prompt(transcript_text: &str) -> String {
+    let instruction = INSTRUCTIONS.templates.get("default").unwrap_or_else(|| {
+        panic!("Default instruction not found!");
+    });
+
+    let format_req = OUTPUT_FORMATS.templates.get("default").unwrap_or_else(|| {
+        panic!("Default output format not found!");
+    });
+
     format!(
-        r#"【指令】：你是一位专业的会议秘书。请根据下方提供的【会议录音转写文本】，整理一份结构清晰的会议纪要。忽略口语废话（如“那个”、“嗯”、“就是”），重点提取关键信息。
-
-【输出 格式要求】：
-1. 会议主题
-2. 参与人员（根据文本推测）
-3. 核心讨论点（列点说明）
-4. 达成的决议
-5. 待办事项/Action Items（格式：[负责人] 任务内容 - 截止时间）
-
-----------------
-
-【会议录音转写文本】：
-{}
-"#,
-        transcript_text
+        "{}\n\n{}\n\n----------------\n\n【会议录音转写文本】：\n{}\n",
+        instruction, format_req, transcript_text
     )
 }
 
