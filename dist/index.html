@@ -1137,6 +1137,10 @@
                     statusBadge.textContent = "Idle";
                     statusBadge.style.backgroundColor = "#E5E7EB";
                     statusBadge.style.color = "#374151";
+                    
+                    // Reset button states
+                    document.getElementById("btnStart").disabled = false;
+                    document.getElementById("btnStop").disabled = true;
 
                     if (currentSessionId) {
                         const btnSummary = document.getElementById("btnSummary");

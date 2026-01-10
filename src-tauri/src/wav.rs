@@ -258,16 +258,31 @@ pub fn mix_pcm16_wav(
     let sys = read_pcm16_wav(sys_path)?;
 
     // 检查采样率一致（最小版本先不做 resample）
+    // 检查采样率一致，如果不一致，则标记需要重采样 System -> Mic
+    // 理由：Mic 是主轨道，Sys 是伴奏。
+    let mut sys_mono = to_mono(&sys);
+
     if mic.sample_rate != sys.sample_rate {
-        anyhow::bail!(
-            "sample rate mismatch: mic={} sys={}",
-            mic.sample_rate,
-            sys.sample_rate
+        println!(
+            "⚠️ Sample rate mismatch: mic={} sys={}. Resampling System to match Mic...",
+            mic.sample_rate, sys.sample_rate
         );
+        // Resample system to match mic
+        let sys_f32: Vec<f32> = sys_mono.iter().map(|&s| s as f32).collect();
+        let sys_resampled =
+            resample_f32(&sys_f32, sys.sample_rate as usize, mic.sample_rate as usize);
+
+        // Convert back to i16 (saturating)
+        sys_mono = sys_resampled
+            .iter()
+            .map(|&s| (s.clamp(i16::MIN as f32, i16::MAX as f32)) as i16)
+            .collect();
+    } else {
+        // Same rate, already mono-ed above
     }
 
     let mic_mono = to_mono(&mic);
-    let sys_mono = to_mono(&sys);
+    // let sys_mono = to_mono(&sys); // Moved up
 
     // 1) 计算 RMS
     let mic_rms = rms_i16(&mic_mono);
@@ -329,11 +344,11 @@ pub fn mix_pcm16_wav(
     Ok(())
 }
 
-pub fn resample_f32_to_16k(input: &[f32], in_rate: usize) -> Vec<f32> {
-    if in_rate == 16_000 {
+pub fn resample_f32(input: &[f32], in_rate: usize, out_rate: usize) -> Vec<f32> {
+    if in_rate == out_rate {
         return input.to_vec();
     }
-    let ratio = in_rate as f64 / 16_000.0;
+    let ratio = in_rate as f64 / out_rate as f64;
     let out_len = (input.len() as f64 / ratio).ceil() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
@@ -345,6 +360,10 @@ pub fn resample_f32_to_16k(input: &[f32], in_rate: usize) -> Vec<f32> {
         out.push(a + (b - a) * frac);
     }
     out
+}
+
+pub fn resample_f32_to_16k(input: &[f32], in_rate: usize) -> Vec<f32> {
+    resample_f32(input, in_rate, 16000)
 }
 
 pub fn write_pcm16_wav_16k_mono(path: &std::path::Path, samples: &[i16]) -> std::io::Result<()> {
