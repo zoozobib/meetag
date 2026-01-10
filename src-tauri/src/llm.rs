@@ -14,6 +14,10 @@ use tauri::Manager;
 struct OllamaOptions {
     num_ctx: u32,
     temperature: f32,
+    presence_penalty: f64,
+    top_k: i32,
+    top_p: f64,
+    // num_predict: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -190,7 +194,11 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
         stream: false,
         options: OllamaOptions {
             num_ctx: 4096,
-            temperature: 0.3,
+            // num_predict: 256,
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            presence_penalty: 1.5,
         },
         prompt,
     };
