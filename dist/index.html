@@ -1143,8 +1143,28 @@
                     statusBadge.textContent = "Recording";
                     statusBadge.style.backgroundColor = "#FEE2E2";
                     statusBadge.style.color = "#991B1B";
+
+                    // Sync buttons
+                    const btnStart = document.getElementById("btnStart");
+                    const btnStop = document.getElementById("btnStop");
+                    if (btnStart) btnStart.disabled = true;
+                    if (btnStop) btnStop.disabled = false;
+
+                    const btnSummary = document.getElementById("btnSummary");
+                    if (btnSummary) btnSummary.disabled = true;
+
                 } else if (msg.includes("started:")) {
                     appendSystemMessage(msg, "play");
+
+                    // Ensure buttons are synced (idempotent)
+                    const btnStart = document.getElementById("btnStart");
+                    const btnStop = document.getElementById("btnStop");
+                    if (btnStart) btnStart.disabled = true;
+                    if (btnStop) btnStop.disabled = false;
+
+                    statusBadge.textContent = "Recording";
+                    statusBadge.style.backgroundColor = "#FEE2E2";
+                    statusBadge.style.color = "#991B1B";
                     // Parse Session ID: "started: [".../sessions/SESSION_ID/system.wav", ...]"
                     try {
                         const jsonPart = msg.substring(msg.indexOf("["));
