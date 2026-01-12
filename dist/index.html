@@ -944,6 +944,12 @@
         btnStart.addEventListener("click", async () => {
             btnStart.disabled = true;
             btnStop.disabled = false;
+
+            // Update Badge Logic
+            statusBadge.textContent = "Recording";
+            statusBadge.style.backgroundColor = "#FEE2E2";
+            statusBadge.style.color = "#991B1B";
+
             // Reset UI for new session
             notesEmptyState.style.display = "flex";
             notesEditorContainer.style.display = "none";
@@ -983,16 +989,33 @@
             } catch (e) {
                 console.error(e);
                 appendSystemMessage("❌ start_recording failed: " + e, "error");
+                // Revert UI state on error
                 btnStart.disabled = false;
                 btnStop.disabled = true;
+                statusBadge.textContent = "Idle";
+                statusBadge.style.backgroundColor = "#E5E7EB"; // Gray
+                statusBadge.style.color = "#374151";
             }
         });
 
         document.getElementById("btnStop").addEventListener("click", async () => {
+            // Prevent double clicking
+            if (document.getElementById("btnStop").disabled) return;
+            document.getElementById("btnStop").disabled = true;
+
             appendHtml(`<div class="log-system" style="margin-top:8px; margin-bottom:8px; border-top:1px dashed #E5E7EB;"></div>`);
             try {
                 const out = await invoke("stop_recording");
                 appendSystemMessage(`stopped: ${JSON.stringify(out)}`, "play");
+
+                // Reset UI State to Idle
+                statusBadge.textContent = "Idle";
+                statusBadge.style.backgroundColor = "#E5E7EB";
+                statusBadge.style.color = "#374151";
+
+                btnStart.disabled = false;
+                // btnStop.disabled = true; // Already disabled above
+
                 // Enable summary button if we have a valid session ID
                 if (currentSessionId) {
                     const btnSummary = document.getElementById("btnSummary");
@@ -1002,7 +1025,14 @@
                     }
                 }
             } catch (e) {
-                appendSystemMessage("❌ stop_recording failed: " + e, "error");
+                console.error(e);
+                appendSystemMessage("stop failed: " + e, "error");
+                // On error, we still want to allow user to try again or at least not be stuck.
+                // Assuming "recording not running" is a common error if already stopped.
+                btnStart.disabled = false;
+                statusBadge.textContent = "Idle"; // Safety reset
+                statusBadge.style.backgroundColor = "#E5E7EB";
+                statusBadge.style.color = "#374151";
             }
         });
 
@@ -1137,7 +1167,7 @@
                     statusBadge.textContent = "Idle";
                     statusBadge.style.backgroundColor = "#E5E7EB";
                     statusBadge.style.color = "#374151";
-                    
+
                     // Reset button states
                     document.getElementById("btnStart").disabled = false;
                     document.getElementById("btnStop").disabled = true;
