@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use log;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -193,12 +194,12 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             return;
         }
 
-        // 2) System stream (CoreAudio)
-        let mut system_stream =
-            match audio::capture::core_audio::CoreAudioCapture::new().and_then(|c| c.stream()) {
+        // 2) System stream (Hybrid: SCKit or CoreAudio)
+        let mut system_stream: audio::capture::SystemAudioStream =
+            match tauri::async_runtime::block_on(audio::capture::start_system_audio_capture()) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("❌ CoreAudioCapture failed: {e:?}");
+                    eprintln!("❌ SystemAudioCapture failed: {e:?}");
                     return;
                 }
             };
@@ -248,6 +249,15 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                 match timeout(Duration::from_millis(200), system_stream.next()).await {
                     Ok(Some(s)) => {
                         let s: f32 = s;
+
+                        // DEBUG: Trace data arrival in main loop
+                        static MAIN_LOG_COUNTER: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let count = MAIN_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        if count % 10000 == 0 {
+                            println!("MAIN_LOOP: Got system sample: {}", s);
+                        }
+
                         let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         buf.push(v);
 
@@ -420,6 +430,11 @@ static WHISPER_PROCESS: Lazy<Mutex<Option<tauri_plugin_shell::process::CommandCh
     Lazy::new(|| Mutex::new(None));
 
 fn main() {
+    // Initialize logging to enable info!() macros in CoreAudio code
+    std::env::set_var("RUST_LOG", "info");
+    env_logger::init();
+    log::info!("Starting application...");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .on_window_event(|window, event| {

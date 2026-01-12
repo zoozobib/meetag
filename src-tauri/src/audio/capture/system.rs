@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as AnyhowContext, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
@@ -7,11 +7,13 @@ use std::task::{Context, Poll};
 #[cfg(target_os = "macos")]
 use super::core_audio::CoreAudioCapture;
 #[cfg(target_os = "macos")]
+use super::sc_capture::ScreenCaptureKitCapture;
+#[cfg(target_os = "macos")]
 use futures_channel::mpsc;
 #[cfg(target_os = "macos")]
-use log::info;
+use log::{info, warn};
 
-/// System audio capture using Core Audio tap (macOS) or CPAL (other platforms)
+/// System audio capture using ScreenCaptureKit or Core Audio tap (macOS) or CPAL (other platforms)
 pub struct SystemAudioCapture {
     _host: cpal::Host,
 }
@@ -38,11 +40,79 @@ impl SystemAudioCapture {
         Ok(device_names)
     }
 
-    pub fn start_system_audio_capture(&self) -> Result<SystemAudioStream> {
+    pub async fn start_system_audio_capture(&self) -> Result<SystemAudioStream> {
         #[cfg(target_os = "macos")]
         {
-            info!("Starting Core Audio system capture (macOS)");
-            // Use Core Audio tap for system audio capture
+            // Try ScreenCaptureKit first (supports USB headphones)
+            info!("🎙️ Attempting ScreenCaptureKit for system audio capture...");
+            match ScreenCaptureKitCapture::new().await {
+                Ok(capture) => {
+                    match capture.stream().await {
+                        Ok(sc_stream) => {
+                            let sample_rate = sc_stream.sample_rate();
+                            info!(
+                                "✅ ScreenCaptureKit capture started successfully ({}Hz)",
+                                sample_rate
+                            );
+
+                            // Convert ScreenCaptureKitStream to SystemAudioStream
+                            let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
+                            let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+
+                            // Spawn task to forward samples
+                            tokio::spawn(async move {
+                                use futures_util::StreamExt;
+                                let mut stream = sc_stream;
+                                let mut buffer = Vec::new();
+                                let chunk_size = 1024;
+
+                                loop {
+                                    if drop_rx.try_recv().is_ok() {
+                                        break;
+                                    }
+
+                                    match stream.next().await {
+                                        Some(sample) => {
+                                            buffer.push(sample);
+                                            if buffer.len() >= chunk_size {
+                                                if tx.unbounded_send(buffer.clone()).is_err() {
+                                                    break;
+                                                }
+                                                buffer.clear();
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+
+                                if !buffer.is_empty() {
+                                    let _ = tx.unbounded_send(buffer);
+                                }
+                            });
+
+                            let receiver = rx.map(futures_util::stream::iter).flatten();
+
+                            return Ok(SystemAudioStream {
+                                drop_tx,
+                                sample_rate,
+                                receiver: Box::pin(receiver),
+                                _keep_alive: None,
+                            });
+                        }
+                        Err(e) => {
+                            warn!("⚠️ ScreenCaptureKit stream creation failed: {}", e);
+                            warn!("📦 Falling back to Core Audio Process Tap...");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️ ScreenCaptureKit initialization failed: {}", e);
+                    warn!("📦 Falling back to Core Audio Process Tap...");
+                }
+            }
+
+            // Fallback: Core Audio Process Tap
+            info!("🎵 Starting Core Audio Process Tap for system audio capture...");
             let core_audio = CoreAudioCapture::new()?;
             let core_audio_stream = core_audio.stream()?;
             let sample_rate = core_audio_stream.sample_rate();
@@ -87,12 +157,13 @@ impl SystemAudioCapture {
 
             let receiver = rx.map(futures_util::stream::iter).flatten();
 
-            info!("Core Audio system capture started successfully");
+            info!("✅ Core Audio Process Tap started successfully");
 
             Ok(SystemAudioStream {
                 drop_tx,
                 sample_rate,
                 receiver: Box::pin(receiver),
+                _keep_alive: None,
             })
         }
 
@@ -116,6 +187,7 @@ pub struct SystemAudioStream {
     drop_tx: std::sync::mpsc::Sender<()>,
     sample_rate: u32,
     receiver: Pin<Box<dyn Stream<Item = f32> + Send + Sync>>,
+    _keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Drop for SystemAudioStream {
@@ -141,7 +213,7 @@ impl SystemAudioStream {
 /// Public interface for system audio capture
 pub async fn start_system_audio_capture() -> Result<SystemAudioStream> {
     let capture = SystemAudioCapture::new()?;
-    capture.start_system_audio_capture()
+    capture.start_system_audio_capture().await
 }
 
 pub fn list_system_audio_devices() -> Result<Vec<String>> {

@@ -9,5 +9,9 @@
   <!-- macOS 14.4+ 系统音频捕获权限（仅系统录音 / AudioCapture） -->
   <key>NSAudioCaptureUsageDescription</key>
   <string>Need system audio recording access to capture call audio.</string>
+
+  <!-- 屏幕录制权限（仅用于音频捕获，不访问屏幕画面） -->
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>本应用仅用于录制系统音频（如扬声器、耳机输出），不会捕获任何屏幕画面或视觉内容。This app only captures system audio output (speakers/headphones) for recording. No screen content or visual data is accessed.</string>
 </dict>
 </plist>
