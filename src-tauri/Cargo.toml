@@ -30,6 +30,10 @@ webrtc-vad = "0.4.0"
 chrono = "0.4"
 lazy_static = "1.4"
 
+# Audio Processing: Professional quality enhancement
+ebur128 = "0.1"           # EBU R128 loudness normalization (broadcast standard)
+nnnoiseless = "0.5"       # RNNoise-based neural network noise reduction
+
 # PERFORMANCE: Enable Metal GPU + CoreML acceleration automatically on macOS
 # CoreML provides additional acceleration for Apple Silicon chips
 whisper-rs = { version = "0.13.2", features = ["raw-api", "metal", "coreml"] }

@@ -11,6 +11,7 @@ use std::{
 
 mod asr;
 mod audio;
+mod audio_processor;
 mod capture;
 mod history;
 mod llm;

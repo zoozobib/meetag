@@ -1,8 +1,12 @@
 use anyhow::Result;
+use once_cell::sync::OnceCell;
 use tauri::Emitter;
 use webrtc_vad::{Vad, VadMode};
 
 use crate::text_filter;
+
+/// Global singleton for AudioProcessor (lazily initialized)
+static AUDIO_PROCESSOR: OnceCell<crate::audio_processor::AudioProcessor> = OnceCell::new();
 
 pub fn realtime_inference_worker(
     app: tauri::AppHandle,
@@ -220,13 +224,34 @@ fn send_audio_to_asr(
     padded.extend_from_slice(samples);
     padded.resize(padded.len() + 4800, 0);
 
+    // === NOISE REDUCTION ===
+    // Apply RNNoise neural network denoising before transcription
+    let audio_processor =
+        AUDIO_PROCESSOR.get_or_init(|| crate::audio_processor::AudioProcessor::new(16000));
+
+    // Convert i16 to f32 for denoising
+    let samples_f32: Vec<f32> = padded.iter().map(|&s| s as f32 / 32768.0).collect();
+    let denoise_result = audio_processor.denoise(&samples_f32);
+
+    // Convert denoised f32 back to i16 for whisper
+    let denoised_i16: Vec<i16> = denoise_result
+        .samples
+        .iter()
+        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+        .collect();
+
+    println!(
+        "🔇 [ASR] Noise reduction applied: RMS {:.4} -> {:.4} ({:.1} dB reduction)",
+        denoise_result.rms_before, denoise_result.rms_after, denoise_result.noise_reduction_db
+    );
+
     // Use whisper-rs directly instead of HTTP call
     let whisper = crate::whisper::WhisperManager::get();
 
     // Transcribe with Chinese language and meeting context prompt
     let initial_prompt = "这是一段会议记录，请使用规范的书面语进行转写。";
 
-    match whisper.transcribe(&padded, "zh", Some(initial_prompt)) {
+    match whisper.transcribe(&denoised_i16, "zh", Some(initial_prompt)) {
         Ok(result) => {
             // Check if any segment has low confidence (avg_logprob < -1.0)
             let is_reliable = result.segments.iter().all(|seg| {
