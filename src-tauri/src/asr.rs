@@ -3,7 +3,6 @@ use tauri::Emitter;
 use webrtc_vad::{Vad, VadMode};
 
 use crate::text_filter;
-use crate::wav::write_pcm16_wav_16k_mono;
 
 pub fn realtime_inference_worker(
     app: tauri::AppHandle,
@@ -14,8 +13,6 @@ pub fn realtime_inference_worker(
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    let client = reqwest::blocking::Client::new();
-    let server_url = "http://127.0.0.1:8178/inference";
 
     // Strict Dynamic VAD Parameters
     // We use WebRTC VAD (very aggressive) instead of simple RMS
@@ -159,25 +156,11 @@ pub fn realtime_inference_worker(
                                     density * 100.0,
                                     buf.len() / 16
                                 );
-                                send_audio_to_asr(
-                                    &app,
-                                    &client,
-                                    server_url,
-                                    &buf,
-                                    &source,
-                                    &transcript_writer,
-                                );
+                                send_audio_to_asr(&app, &buf, &source, &transcript_writer);
                             } else {
                                 println!("🚀 Sending audio to ASR [{}](Condition 1: Silence Cut), density={:.1}%", source, density * 100.0);
                                 // 1000 samples ~ 60ms
-                                send_audio_to_asr(
-                                    &app,
-                                    &client,
-                                    server_url,
-                                    &buf,
-                                    &source,
-                                    &transcript_writer,
-                                );
+                                send_audio_to_asr(&app, &buf, &source, &transcript_writer);
                             }
                         }
                         buf.clear();
@@ -191,14 +174,7 @@ pub fn realtime_inference_worker(
                 // 2. Max Length (Force send at 5s)
                 if buf.len() >= max_len_samples {
                     if is_speaking {
-                        send_audio_to_asr(
-                            &app,
-                            &client,
-                            server_url,
-                            &buf,
-                            &source,
-                            &transcript_writer,
-                        );
+                        send_audio_to_asr(&app, &buf, &source, &transcript_writer);
                     }
                     buf.clear();
                     is_speaking = false;
@@ -227,7 +203,7 @@ pub fn realtime_inference_worker(
 
     // Final flush
     if !buf.is_empty() && is_speaking {
-        send_audio_to_asr(&app, &client, server_url, &buf, &source, &transcript_writer);
+        send_audio_to_asr(&app, &buf, &source, &transcript_writer);
     }
 
     Ok(())
@@ -235,8 +211,6 @@ pub fn realtime_inference_worker(
 
 fn send_audio_to_asr(
     app: &tauri::AppHandle,
-    client: &reqwest::blocking::Client,
-    url: &str,
     samples: &[i16],
     source: &str,
     transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
@@ -246,87 +220,62 @@ fn send_audio_to_asr(
     padded.extend_from_slice(samples);
     padded.resize(padded.len() + 4800, 0);
 
-    if let Ok(tmp) = tempfile::NamedTempFile::new() {
-        if let Ok(_) = write_pcm16_wav_16k_mono(tmp.path(), &padded) {
-            let form = reqwest::blocking::multipart::Form::new()
-                .text("response_format", "verbose_json")
-                .text("language", "zh")
-                // Prompt strategy: Context + Style Guide
-                // 1. Context: "Meeting Record" -> Formal setting
-                // 2. Style: "Standard Written Language" -> Biases against slang (e.g. "浅整" -> "虔诚")
-                .text(
-                    "initial_prompt",
-                    "这是一段会议记录，请使用规范的书面语进行转写。",
-                )
-                // REMOVED Anti-Hallucination Parameters to fix latency issue.
-                // We rely on Post-Processing (text_filter) and VAD LOGS for now.
-                .part(
-                    "file",
-                    reqwest::blocking::multipart::Part::file(tmp.path()).unwrap(), // safe unwrap for temp file we just wrote
-                );
+    // Use whisper-rs directly instead of HTTP call
+    let whisper = crate::whisper::WhisperManager::get();
 
-            if let Ok(resp) = client.post(url).multipart(form).send() {
-                if let Ok(txt) = resp.text() {
-                    // Parse verbose_json response
-                    // Expected structure: { "text": "...", "segments": [ { "avg_logprob": -0.5, ... }, ... ] }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                        // Check logprobs first
-                        let mut is_reliable = true;
-                        if let Some(segments) = v.get("segments").and_then(|arr| arr.as_array()) {
-                            for seg in segments {
-                                if let Some(lp) = seg.get("avg_logprob").and_then(|f| f.as_f64()) {
-                                    if lp < -1.0 {
-                                        eprintln!(
-                                            "⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}",
-                                            lp,
-                                            seg.get("text")
-                                        );
-                                        is_reliable = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        } else {
-                            // If no segments found, we can't verify logprob.
-                            // Depending on strategy, either trust or warn.
-                            // For now, let's warn but proceed if text exists,
-                            // OR assume it might be a simple json fallback (unlikely if we asked for verbose_json).
-                            eprintln!("⚠️ ASR response missing segments for logprob check");
-                        }
+    // Transcribe with Chinese language and meeting context prompt
+    let initial_prompt = "这是一段会议记录，请使用规范的书面语进行转写。";
 
-                        if is_reliable {
-                            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                                let t = t.trim();
-                                if !t.is_empty() {
-                                    // 3. Text Post-processing (Blacklist/Repetition)
-                                    if text_filter::is_hallucination(t) {
-                                        println!("🗑️ Discarding hallucination: {:?}", t);
-                                    } else {
-                                        let payload = serde_json::json!({
-                                            "text": t,
-                                            "source": source
-                                        });
-                                        let _ = app.emit("asr_final", payload.to_string());
+    match whisper.transcribe(&padded, "zh", Some(initial_prompt)) {
+        Ok(result) => {
+            // Check if any segment has low confidence (avg_logprob < -1.0)
+            let is_reliable = result.segments.iter().all(|seg| {
+                if seg.avg_logprob < -1.0 {
+                    eprintln!(
+                        "⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}",
+                        seg.avg_logprob, seg.text
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
 
-                                        // LOGGING: Append to transcript.jsonl
-                                        let entry = serde_json::json!({
-                                            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
-                                            "speaker": source,
-                                            "text": t
-                                        });
-                                        if let Ok(line) = serde_json::to_string(&entry) {
-                                            use std::io::Write;
-                                            if let Ok(mut w) = transcript_writer.lock() {
-                                                let _ = writeln!(w, "{}", line);
-                                            }
-                                        }
-                                    }
-                                }
+            if is_reliable {
+                let t = result.text.trim();
+                if !t.is_empty() {
+                    // Text Post-processing (Blacklist/Repetition)
+                    if crate::text_filter::is_hallucination(t) {
+                        println!("🗑️ Discarding hallucination: {:?}", t);
+                    } else {
+                        let payload = serde_json::json!({
+                            "text": t,
+                            "source": source
+                        });
+                        let _ = app.emit("asr_final", payload.to_string());
+
+                        // LOGGING: Append to transcript.jsonl
+                        let entry = serde_json::json!({
+                            "timestamp": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis(),
+                            "speaker": source,
+                            "text": t,
+                            "inference_time_ms": result.inference_time_ms
+                        });
+                        if let Ok(line) = serde_json::to_string(&entry) {
+                            use std::io::Write;
+                            if let Ok(mut w) = transcript_writer.lock() {
+                                let _ = writeln!(w, "{}", line);
                             }
                         }
                     }
                 }
             }
+        }
+        Err(e) => {
+            eprintln!("❌ [WHISPER] Transcription error: {}", e);
         }
     }
 }

@@ -18,6 +18,7 @@ mod text_filter;
 mod tray;
 mod vad;
 mod wav;
+mod whisper;
 
 use crate::wav::WavWriter;
 use tauri::{Listener, Manager};
@@ -554,10 +555,6 @@ fn get_last_record_base() -> Option<std::path::PathBuf> {
     LAST_RECORD_BASE.lock().unwrap().clone()
 }
 
-// Global handle for the whisper sidecar process
-static WHISPER_PROCESS: Lazy<Mutex<Option<tauri_plugin_shell::process::CommandChild>>> =
-    Lazy::new(|| Mutex::new(None));
-
 fn main() {
     // Initialize logging to enable info!() macros in CoreAudio code
     std::env::set_var("RUST_LOG", "info");
@@ -619,45 +616,12 @@ fn main() {
                     )
                     .unwrap();
 
-                // Start whisper server sidecar
-                let sidecar_command = handle.shell().sidecar("whisper-server").unwrap().args([
-                    "-m",
-                    resource_path.to_str().unwrap(),
-                    "--port",
-                    "8178",
-                    "--host",
-                    "127.0.0.1",
-                ]);
-
-                let (mut rx, child) = sidecar_command
-                    .spawn()
-                    .expect("Failed to spawn whisper sidecar");
-
-                println!(
-                    "🚀 Whisper sidecar spawned with PID: {:?} on port 8178",
-                    child.pid()
-                );
-
-                // Store the child process handle globally
-                *WHISPER_PROCESS.lock().unwrap() = Some(child);
-
-                // Continuously read the sidecar's output to prevent pipe blocking
-                use tauri_plugin_shell::process::CommandEvent;
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        CommandEvent::Stdout(line) => {
-                            // Only print if needed, or just consume it
-                            let log = String::from_utf8_lossy(&line);
-                            println!("[Whisper] {}", log.trim());
-                        }
-                        CommandEvent::Stderr(line) => {
-                            let log = String::from_utf8_lossy(&line);
-                            eprintln!("[Whisper Err] {}", log.trim());
-                        }
-                        _ => {}
-                    }
+                // Initialize whisper-rs directly (no sidecar needed)
+                println!("🎙️ Initializing Whisper model...");
+                if let Err(e) = crate::whisper::WhisperManager::init(&resource_path) {
+                    eprintln!("❌ Failed to initialize Whisper: {}", e);
+                    // Continue anyway, transcription will fail gracefully
                 }
-                println!("⚠️ Whisper sidecar channel closed");
             });
             Ok(())
         })
@@ -675,12 +639,8 @@ fn main() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                // Cleanup sidecar on exit
-                let mut guard = WHISPER_PROCESS.lock().unwrap();
-                if let Some(child) = guard.take() {
-                    println!("🛑 Killing whisper sidecar (PID: {:?})", child.pid());
-                    let _ = child.kill();
-                }
+                // Whisper model will be cleaned up automatically when WhisperManager drops
+                println!("🛑 Application exiting, Whisper resources will be released.");
             }
         });
 }
