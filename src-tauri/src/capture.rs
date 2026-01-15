@@ -48,6 +48,8 @@ fn find_best_input_device(host: &cpal::Host) -> Result<cpal::Device> {
             || lower.contains("aggregate")
             || lower.contains("multi-output")
             || lower.contains("lark")
+            || lower.contains("meetily")
+            || lower.contains("audio-tap")
         {
             score -= 50;
         }
@@ -119,6 +121,8 @@ pub fn start_mic_stream(
     use std::sync::atomic::{AtomicU32, Ordering};
     // Initial gain: Start LOW (3.0) instead of HIGH (50.0) to avoid initial noise blast
     static MIC_GAIN_Q8: AtomicU32 = AtomicU32::new((3.0_f32 * 256.0_f32) as u32);
+    // 每次新录音重置增益，避免上次会话的状态影响
+    MIC_GAIN_Q8.store((3.0_f32 * 256.0_f32) as u32, Ordering::Relaxed);
 
     // Tunables (safe defaults)
     // Base gain keeps your original loudness in non-call scenarios.

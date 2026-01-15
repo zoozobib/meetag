@@ -48,9 +48,12 @@ impl SystemAudioCapture {
     pub async fn start_system_audio_capture(&self) -> Result<SystemAudioStream> {
         #[cfg(target_os = "macos")]
         {
+            // 每次新录音重置失败标志，给予 ScreenCaptureKit 重试机会
+            SC_KIT_FAILED.store(false, Ordering::Relaxed);
+
             // Try ScreenCaptureKit first (supports USB headphones)
             if !SC_KIT_FAILED.load(Ordering::Relaxed) {
-                info!("🎙️ Attempting ScreenCaptureKit for system audio capture...");
+                info!("🎙️ Attempting ScreenCaptureKit for system audio capture... [LIFECYCLE: SCKit attempt START]");
                 match ScreenCaptureKitCapture::new().await {
                     Ok(capture) => {
                         match capture.stream().await {
@@ -63,43 +66,57 @@ impl SystemAudioCapture {
 
                                 // Convert ScreenCaptureKitStream to SystemAudioStream
                                 let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
-                                let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+                                let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
 
                                 // Spawn task to forward samples
+                                info!("🔄 [LIFECYCLE: SCKit forwarding task SPAWN] Starting tokio task to forward SCKit samples...");
                                 tokio::spawn(async move {
+                                    info!(
+                                        "🔄 [LIFECYCLE: SCKit forwarding task ENTER] Task started"
+                                    );
                                     use futures_util::StreamExt;
                                     let mut stream = sc_stream;
                                     let mut buffer = Vec::new();
                                     let chunk_size = 1024;
 
                                     loop {
-                                        if drop_rx.try_recv().is_ok() {
-                                            break;
-                                        }
-
-                                        match stream.next().await {
-                                            Some(sample) => {
-                                                buffer.push(sample);
-                                                if buffer.len() >= chunk_size {
-                                                    if tx.unbounded_send(buffer.clone()).is_err() {
+                                        // Use tokio::select! for proper async cancellation
+                                        tokio::select! {
+                                            _ = &mut drop_rx => {
+                                                info!("🛑 [LIFECYCLE: SCKit forwarding task] Received drop signal via select!, exiting loop...");
+                                                break;
+                                            }
+                                            maybe_sample = stream.next() => {
+                                                match maybe_sample {
+                                                    Some(sample) => {
+                                                        buffer.push(sample);
+                                                        if buffer.len() >= chunk_size {
+                                                            if tx.unbounded_send(buffer.clone()).is_err() {
+                                                                info!("🛑 [LIFECYCLE: SCKit forwarding task] Channel closed, exiting...");
+                                                                break;
+                                                            }
+                                                            buffer.clear()
+                                                        }
+                                                    }
+                                                    None => {
+                                                        info!("🛑 [LIFECYCLE: SCKit forwarding task] Stream ended (None), exiting...");
                                                         break;
                                                     }
-                                                    buffer.clear();
                                                 }
                                             }
-                                            None => break,
                                         }
                                     }
 
                                     if !buffer.is_empty() {
                                         let _ = tx.unbounded_send(buffer);
                                     }
+                                    info!("🛑 [LIFECYCLE: SCKit forwarding task EXIT] Task ended");
                                 });
 
                                 let receiver = rx.map(futures_util::stream::iter).flatten();
 
                                 return Ok(SystemAudioStream {
-                                    drop_tx,
+                                    drop_tx: Some(drop_tx),
                                     sample_rate,
                                     receiver: Box::pin(receiver),
                                     _keep_alive: None,
@@ -123,40 +140,59 @@ impl SystemAudioCapture {
             }
 
             // Fallback: Core Audio Process Tap
-            info!("🎵 Starting Core Audio Process Tap for system audio capture...");
+            info!("🎵 Starting Core Audio Process Tap for system audio capture... [LIFECYCLE: CoreAudio fallback START]");
             let core_audio = CoreAudioCapture::new()?;
+            info!(
+                "🎵 [LIFECYCLE: CoreAudio fallback] CoreAudioCapture created, calling stream()..."
+            );
             let core_audio_stream = core_audio.stream()?;
             let sample_rate = core_audio_stream.sample_rate();
+            info!(
+                "🎵 [LIFECYCLE: CoreAudio fallback] CoreAudioStream created, sample_rate={}",
+                sample_rate
+            );
 
             // Convert CoreAudioStream to SystemAudioStream
             let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
-            let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+            // Use tokio oneshot for proper async cancellation
+            let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
 
             // Spawn task to forward Core Audio samples
+            info!("🔄 [LIFECYCLE: CoreAudio forwarding task SPAWN] Starting tokio task to forward CoreAudio samples...");
             tokio::spawn(async move {
+                info!("🔄 [LIFECYCLE: CoreAudio forwarding task ENTER] Task started, holding CoreAudioStream");
                 use futures_util::StreamExt;
                 let mut stream = core_audio_stream;
                 let mut buffer = Vec::new();
                 let chunk_size = 1024;
 
                 loop {
-                    // Check if we should stop
-                    if drop_rx.try_recv().is_ok() {
-                        break;
-                    }
-
-                    // Poll the Core Audio stream
-                    match stream.next().await {
-                        Some(sample) => {
-                            buffer.push(sample);
-                            if buffer.len() >= chunk_size {
-                                if tx.unbounded_send(buffer.clone()).is_err() {
+                    // Use tokio::select! to respond to drop signal immediately
+                    tokio::select! {
+                        // Check for drop signal (this branch will win immediately when signal is sent)
+                        _ = &mut drop_rx => {
+                            info!("🛑 [LIFECYCLE: CoreAudio forwarding task] Received drop signal via select!, exiting loop...");
+                            break;
+                        }
+                        // Poll the Core Audio stream
+                        maybe_sample = stream.next() => {
+                            match maybe_sample {
+                                Some(sample) => {
+                                    buffer.push(sample);
+                                    if buffer.len() >= chunk_size {
+                                        if tx.unbounded_send(buffer.clone()).is_err() {
+                                            info!("🛑 [LIFECYCLE: CoreAudio forwarding task] Channel closed, exiting...");
+                                            break;
+                                        }
+                                        buffer.clear();
+                                    }
+                                }
+                                None => {
+                                    info!("🛑 [LIFECYCLE: CoreAudio forwarding task] Stream ended (None), exiting...");
                                     break;
                                 }
-                                buffer.clear();
                             }
                         }
-                        None => break,
                     }
                 }
 
@@ -164,6 +200,8 @@ impl SystemAudioCapture {
                 if !buffer.is_empty() {
                     let _ = tx.unbounded_send(buffer);
                 }
+                info!("🛑 [LIFECYCLE: CoreAudio forwarding task EXIT] Task ended, dropping CoreAudioStream...");
+                // CoreAudioStream will be dropped here when `stream` goes out of scope
             });
 
             let receiver = rx.map(futures_util::stream::iter).flatten();
@@ -171,7 +209,7 @@ impl SystemAudioCapture {
             info!("✅ Core Audio Process Tap started successfully");
 
             Ok(SystemAudioStream {
-                drop_tx,
+                drop_tx: Some(drop_tx),
                 sample_rate,
                 receiver: Box::pin(receiver),
                 _keep_alive: None,
@@ -195,7 +233,8 @@ impl SystemAudioCapture {
 }
 
 pub struct SystemAudioStream {
-    drop_tx: std::sync::mpsc::Sender<()>,
+    // Use Option<Sender> so we can take() the sender in drop (oneshot can only send once)
+    drop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     sample_rate: u32,
     receiver: Pin<Box<dyn Stream<Item = f32> + Send + Sync>>,
     _keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
@@ -203,7 +242,18 @@ pub struct SystemAudioStream {
 
 impl Drop for SystemAudioStream {
     fn drop(&mut self) {
-        let _ = self.drop_tx.send(());
+        println!("🛑 [LIFECYCLE: SystemAudioStream::drop START] Sending drop signal to forwarding task...");
+        if let Some(tx) = self.drop_tx.take() {
+            let result = tx.send(());
+            println!(
+                "🛑 [LIFECYCLE: SystemAudioStream::drop] drop_tx.send result: {:?}",
+                result.is_ok()
+            );
+        } else {
+            println!("🛑 [LIFECYCLE: SystemAudioStream::drop] drop_tx already consumed!");
+        }
+        println!("🛑 [LIFECYCLE: SystemAudioStream::drop END] Signal sent, SystemAudioStream dropping...");
+        // Note: The tokio task should now exit promptly thanks to tokio::select!
     }
 }
 

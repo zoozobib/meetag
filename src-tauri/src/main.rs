@@ -26,7 +26,10 @@ static RECORDER: Lazy<Mutex<Option<RecorderHandle>>> = Lazy::new(|| Mutex::new(N
 
 struct RecorderHandle {
     stop: Arc<AtomicBool>,
-    join: std::thread::JoinHandle<()>,
+    rec_join: std::thread::JoinHandle<()>,
+    mixer_join: std::thread::JoinHandle<()>,
+    asr_user_join: std::thread::JoinHandle<()>,
+    asr_system_join: std::thread::JoinHandle<()>,
     base_dir: PathBuf,
     mic_path: PathBuf,
     system_path: PathBuf,
@@ -50,12 +53,17 @@ static SYS_PCM_TX: Lazy<Mutex<Option<std::sync::mpsc::Sender<i16>>>> =
 #[tauri::command]
 fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
     use tauri::Emitter;
+    println!("\n========================================");
+    println!("▶ [LIFECYCLE: start_recording] Called");
+    println!("========================================");
     let _ = app.emit("tray-log", "▶ start_recording...");
 
     let mut guard = RECORDER.lock().unwrap();
     if guard.is_some() {
+        println!("❌ [LIFECYCLE: start_recording] Already running, returning error");
         return Err("recording already running".into());
     }
+    println!("✅ [LIFECYCLE: start_recording] No existing recorder, proceeding...");
 
     let res = (|| -> Result<(String, String), String> {
         // Output dir
@@ -112,7 +120,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
         // Mixer thread
         let stop_mix = stop.clone();
-        std::thread::spawn(move || {
+        let mixer_join = std::thread::spawn(move || {
             let mut s_last: i16 = 0;
             // Synchronize on Mic stream (16kHz clock)
             while let Ok(mic_sample) = mic_pcm_rx.recv() {
@@ -139,7 +147,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         let asr_app_1 = app.clone();
         let stop_asr_1 = stop.clone();
         let tw_1 = transcript_writer.clone();
-        std::thread::spawn(move || {
+        let asr_user_join = std::thread::spawn(move || {
             let _ = asr::realtime_inference_worker(
                 asr_app_1,
                 stop_asr_1,
@@ -153,7 +161,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         let asr_app_2 = app.clone();
         let stop_asr_2 = stop.clone();
         let tw_2 = transcript_writer.clone();
-        std::thread::spawn(move || {
+        let asr_system_join = std::thread::spawn(move || {
             let _ = asr::realtime_inference_worker(
                 asr_app_2,
                 stop_asr_2,
@@ -178,8 +186,11 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         // Spawn recording thread
         let sys_speaking_mic = system_speaking.clone();
         let rec_app = app.clone();
-        let join = std::thread::spawn(move || {
+        println!("\n🔄 [LIFECYCLE: start_recording] Spawning main recording thread...");
+        let rec_join = std::thread::spawn(move || {
+            println!("🔄 [LIFECYCLE: rec_join thread ENTER] Recording thread started");
             // 1) MIC stream
+            println!("🎤 [LIFECYCLE: rec_join] Creating mic stream...");
             let mic_stream = match capture::start_mic_stream(
                 mic_writer.clone(),
                 mic_asr_writer.clone(),
@@ -187,7 +198,10 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                 asr_mic_tx, // Send to User ASR
                 sys_speaking_mic,
             ) {
-                Ok(s) => s,
+                Ok(s) => {
+                    println!("✅ [LIFECYCLE: rec_join] Mic stream created successfully");
+                    s
+                }
                 Err(e) => {
                     eprintln!("❌ start_mic_stream failed: {e:?}");
                     return;
@@ -197,11 +211,16 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                 eprintln!("❌ mic_stream.play failed: {e:?}");
                 return;
             }
+            println!("✅ [LIFECYCLE: rec_join] Mic stream playing");
 
             // 2) System stream (Hybrid: SCKit or CoreAudio)
+            println!("🔊 [LIFECYCLE: rec_join] Creating system audio stream...");
             let mut system_stream: audio::capture::SystemAudioStream =
                 match tauri::async_runtime::block_on(audio::capture::start_system_audio_capture()) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        println!("✅ [LIFECYCLE: rec_join] System stream created successfully");
+                        s
+                    }
                     Err(e) => {
                         eprintln!("❌ SystemAudioCapture failed: {e:?}");
                         return;
@@ -320,10 +339,14 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                 // Give mic callback some time to flush tail
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 println!("✅ System capture loop ended, flushing complete.");
+                println!("🛑 [LIFECYCLE: rt.block_on async] About to exit async block, system_stream will be dropped...");
+                // system_stream is moved into this async block and will be dropped when the block ends
             });
             println!("✅ System capture runtime finished.");
+            println!("🛑 [LIFECYCLE: rt.block_on] Async block exited, system_stream should have been dropped");
 
             // 4) Clean up
+            println!("\n🛑 [LIFECYCLE: rec_join] System capture loop ended, starting cleanup...");
             println!("🛑 Pausing mic stream...");
             if let Err(e) = cpal::traits::StreamTrait::pause(&mic_stream) {
                 eprintln!("⚠️ Failed to pause mic stream: {:?}", e);
@@ -333,9 +356,15 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             println!("✅ Mic stream dropped.");
 
             // Finalize WAVs
+            println!("💾 [LIFECYCLE: rec_join] Finalizing WAV files...");
             let _ = system_writer.lock().unwrap().finalize();
             let _ = mic_writer.lock().unwrap().finalize();
             let _ = mic_asr_writer.lock().unwrap().finalize();
+            println!("✅ [LIFECYCLE: rec_join] WAV files finalized");
+
+            // NOTE: system_stream was already moved into rt.block_on(async move {...})
+            // and was dropped when that block returned. The SystemAudioStream::drop
+            // should have sent a signal to the tokio forwarding task.
 
             // 5) Mix (Background Thread)
             // We spawn a new thread so the join handle returns immediately,
@@ -373,11 +402,15 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                     }
                 }
             });
+            println!("🔄 [LIFECYCLE: rec_join thread EXIT] Recording thread ending");
         });
 
         *guard = Some(RecorderHandle {
             stop,
-            join,
+            rec_join,
+            mixer_join,
+            asr_user_join,
+            asr_system_join,
             base_dir: session_dir.clone(),
             mic_path: mic_path.clone(),
             system_path: system_path.clone(),
@@ -407,23 +440,76 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 #[tauri::command]
 async fn stop_recording(app: tauri::AppHandle) -> Result<(String, String, String), String> {
     use tauri::Emitter;
+    println!("\n========================================");
+    println!("▶ [LIFECYCLE: stop_recording] Called");
+    println!("========================================");
     let _ = app.emit("tray-log", "▶ stop_recording...");
 
     let res = (async || -> Result<(String, String, String), String> {
         let handle = {
             let mut guard = RECORDER.lock().unwrap();
-            guard.take().ok_or("recording is not running")?
+            match guard.take() {
+                Some(h) => {
+                    println!("✅ [LIFECYCLE: stop_recording] Got recorder handle");
+                    h
+                }
+                None => {
+                    println!("❌ [LIFECYCLE: stop_recording] No recorder handle found!");
+                    return Err("recording is not running".into());
+                }
+            }
         };
 
+        println!("🛑 [LIFECYCLE: stop_recording] Setting stop flag to true...");
         handle.stop.store(true, Ordering::Release);
+        println!("✅ [LIFECYCLE: stop_recording] Stop flag set");
 
         // Join in blocking thread
         let system_path = handle.system_path.clone();
         let mic_path = handle.mic_path.clone();
         let mix_path = handle.mix_path.clone();
 
+        println!("🔄 [LIFECYCLE: stop_recording] Spawning blocking task for thread joins...");
         tauri::async_runtime::spawn_blocking(move || {
-            let _ = handle.join.join();
+            println!("🔄 [LIFECYCLE: spawn_blocking ENTER] Starting thread joins...");
+
+            // 1. Join 主录音线程
+            println!("⏳ [LIFECYCLE: spawn_blocking] Joining rec_join thread...");
+            let rec_result = handle.rec_join.join();
+            println!(
+                "✅ [LIFECYCLE: spawn_blocking] rec_join thread joined: {:?}",
+                rec_result.is_ok()
+            );
+
+            // 2. 清理全局 PCM 通道，关闭 channel 唤醒阻塞的 mixer 线程
+            println!("🧹 [LIFECYCLE: spawn_blocking] Clearing global PCM channels...");
+            *MIC_PCM_TX.lock().unwrap() = None;
+            *SYS_PCM_TX.lock().unwrap() = None;
+            println!("✅ [LIFECYCLE: spawn_blocking] PCM channels cleared");
+
+            // 3. Join 所有辅助线程
+            println!("⏳ [LIFECYCLE: spawn_blocking] Joining mixer thread...");
+            let mixer_result = handle.mixer_join.join();
+            println!(
+                "✅ [LIFECYCLE: spawn_blocking] mixer_join thread joined: {:?}",
+                mixer_result.is_ok()
+            );
+
+            println!("⏳ [LIFECYCLE: spawn_blocking] Joining asr_user thread...");
+            let asr_user_result = handle.asr_user_join.join();
+            println!(
+                "✅ [LIFECYCLE: spawn_blocking] asr_user_join thread joined: {:?}",
+                asr_user_result.is_ok()
+            );
+
+            println!("⏳ [LIFECYCLE: spawn_blocking] Joining asr_system thread...");
+            let asr_sys_result = handle.asr_system_join.join();
+            println!(
+                "✅ [LIFECYCLE: spawn_blocking] asr_system_join thread joined: {:?}",
+                asr_sys_result.is_ok()
+            );
+
+            println!("🔄 [LIFECYCLE: spawn_blocking EXIT] All threads joined!");
             (system_path, mic_path, mix_path)
         })
         .await
@@ -441,14 +527,19 @@ async fn stop_recording(app: tauri::AppHandle) -> Result<(String, String, String
     match &res {
         Ok((sys, mic, mix)) => {
             let msg = format!("stopped: [\"{}\",\"{}\",\"{}\"]", sys, mic, mix);
+            println!("✅ [LIFECYCLE: stop_recording] Success: {}", msg);
             let _ = app.emit("tray-log", &msg);
         }
         Err(e) => {
             let msg = format!("❌ stop_recording failed: {}", e);
+            println!("❌ [LIFECYCLE: stop_recording] Failed: {}", e);
             let _ = app.emit("tray-log", &msg);
         }
     }
 
+    println!("========================================");
+    println!("▶ [LIFECYCLE: stop_recording] Returning");
+    println!("========================================\n");
     res
 }
 
