@@ -672,6 +672,16 @@
                     <div class="card-body" id="log">
                         <!-- Logs will appear here -->
                     </div>
+                    <!-- Manual Input Section -->
+                    <div
+                        style="padding: 12px; border-top: 1px solid #E5E7EB; background-color: #F9FAFB; border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; display: flex; gap: 8px; align-items: center;">
+                        <input type="text" id="manualInput" placeholder="Type to add to transcript..."
+                            style="flex: 1; border: 1px solid #D1D5DB; border-radius: 6px; padding: 8px 12px; font-size: 14px; outline: none; transition: border-color 0.2s;">
+                        <button id="btnManualAdd" class="btn btn-primary"
+                            style="padding: 8px 16px; white-space: nowrap;">
+                            Add
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Meeting Notes Card (Placeholder) -->
@@ -1381,6 +1391,85 @@
                 detailLog.innerHTML = `<div class="log-error" style="padding:20px;">Error loading detail: ${err}</div>`;
             }
         }
+        // --- Manual Input Logic ---
+        const manualInput = document.getElementById("manualInput");
+        const btnManualAdd = document.getElementById("btnManualAdd");
+
+        async function submitManualInput() {
+            const text = manualInput.value.trim();
+            if (!text) return;
+
+            // Optimistic UI update (optional, but backend emit handles it too)
+            // Let's rely on backend emit 'asr_final' for consistency if active.
+            // But if we are in history view? This UI is on Home View.
+
+            // Disable while sending
+            manualInput.disabled = true;
+            btnManualAdd.disabled = true;
+
+            try {
+                await invoke("add_manual_transcript", {
+                    text: text,
+                    sessionId: currentSessionId // Pass current ID if available (active recording or last one?)
+                    // Logic in backend: 
+                    // - if active recording matches this ID (or no ID passed), writes to active file & EMITS 'asr_final'.
+                    // - if different/inactive, writes to file. 
+
+                    // ISSUE: If we stopped recording, `currentSessionId` might still be set to the last one.
+                    // The backend `add_manual_transcript` handles "no active recording" by checking session_id.
+                    // If we pass session_id, it appends to that file.
+                    // Does it emit 'asr_final'? NO, only if active.
+                    // So we must manually append to log if not active.
+                });
+
+                // Clear input
+                manualInput.value = "";
+
+                // If we are NOT recording (or backend didn't emit because it wasn't "active"),
+                // we should show it in the UI anyway.
+                // How do we know? backend doesn't return "emitted".
+                // But generally, if we added it, we want to see it.
+                // If active, we might get double entry if we append manually + receive emit.
+                // WE SHOULD CHECK STATUS.
+
+                const isRecording = statusBadge.textContent === "Recording" || statusBadge.textContent === "Listening...";
+                if (!isRecording) {
+                    // Manually append to UI log since backend won't emit 'asr_final' for inactive session
+                    // Create a fake payload
+                    const payload = JSON.stringify({
+                        text: text,
+                        source: "user",
+                        is_manual: true
+                    });
+                    appendTranscript(payload);
+                }
+
+            } catch (err) {
+                console.error(err);
+                alert("Failed to add transcript: " + err);
+            } finally {
+                manualInput.disabled = false;
+                btnManualAdd.disabled = false;
+                manualInput.focus();
+            }
+        }
+
+        btnManualAdd.addEventListener("click", submitManualInput);
+
+        manualInput.addEventListener("keypress", (e) => {
+            if (e.key === "Enter") {
+                submitManualInput();
+            }
+        });
+
+        // Add focus style
+        manualInput.addEventListener('focus', () => {
+            manualInput.style.borderColor = 'var(--primary-blue)';
+        });
+        manualInput.addEventListener('blur', () => {
+            manualInput.style.borderColor = '#D1D5DB';
+        });
+
     </script>
 </body>
 

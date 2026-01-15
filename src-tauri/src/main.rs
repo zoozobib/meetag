@@ -37,6 +37,7 @@ struct RecorderHandle {
     system_path: PathBuf,
     mix_path: PathBuf,
     mix_asr_path: PathBuf,
+    transcript_writer: Arc<Mutex<std::fs::File>>,
 }
 
 // Global PCM channels for real-time mixer
@@ -418,6 +419,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             system_path: system_path.clone(),
             mix_path: mix_path.clone(),
             mix_asr_path: mix_asr_path.clone(),
+            transcript_writer: transcript_writer.clone(),
         });
 
         Ok((
@@ -545,6 +547,86 @@ async fn stop_recording(app: tauri::AppHandle) -> Result<(String, String, String
     res
 }
 
+#[derive(serde::Serialize)]
+struct ManualTranscriptEntry {
+    text: String,
+    source: String,
+    is_manual: bool,
+}
+
+#[tauri::command]
+fn add_manual_transcript(
+    app: tauri::AppHandle,
+    text: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    use std::io::Write;
+    use tauri::Manager;
+
+    // Create entry JSON
+    let entry = ManualTranscriptEntry {
+        text: text.clone(),
+        source: "user".to_string(),
+        is_manual: true,
+    };
+    let json_line = serde_json::to_string(&entry).map_err(|e| e.to_string())? + "\n";
+
+    let mut handled_active = false;
+
+    // Check active recorder
+    {
+        let guard = RECORDER.lock().unwrap();
+        if let Some(handle) = guard.as_ref() {
+            let active_path = &handle.base_dir;
+            let active_id = active_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+
+            let target_id = session_id.as_deref().unwrap_or(active_id);
+
+            if active_id == target_id {
+                let mut writer = handle
+                    .transcript_writer
+                    .lock()
+                    .map_err(|_| "Failed to lock transcript writer".to_string())?;
+                writer
+                    .write_all(json_line.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                writer.flush().map_err(|e| e.to_string())?;
+                handled_active = true;
+            }
+        }
+    }
+
+    if handled_active {
+        use tauri::Emitter;
+        let _ = app.emit("asr_final", &json_line);
+        return Ok(());
+    }
+
+    if let Some(sid) = session_id {
+        let base_app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let session_dir = base_app_data.join("sessions").join(&sid);
+        if !session_dir.exists() {
+            return Err("Session not found".into());
+        }
+        let transcript_path = session_dir.join("transcript.jsonl");
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(transcript_path)
+            .map_err(|e| e.to_string())?;
+
+        file.write_all(json_line.as_bytes())
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    Err("No active recording and no session ID provided".into())
+}
+
 // App entry wrapper for last record base (helpers if needed, but unused in main flow)
 static LAST_RECORD_BASE: Lazy<Mutex<Option<std::path::PathBuf>>> = Lazy::new(|| Mutex::new(None));
 #[allow(dead_code)]
@@ -634,7 +716,8 @@ fn main() {
             history::get_session_detail,
             llm::generate_summary,
             llm::save_summary,
-            llm::get_summary
+            llm::get_summary,
+            add_manual_transcript
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
