@@ -48,10 +48,8 @@ impl SystemAudioCapture {
     pub async fn start_system_audio_capture(&self) -> Result<SystemAudioStream> {
         #[cfg(target_os = "macos")]
         {
-            // 每次新录音重置失败标志，给予 ScreenCaptureKit 重试机会
-            SC_KIT_FAILED.store(false, Ordering::Relaxed);
-
             // Try ScreenCaptureKit first (supports USB headphones)
+            // Note: SC_KIT_FAILED persists for app lifetime to avoid repeated permission prompts
             if !SC_KIT_FAILED.load(Ordering::Relaxed) {
                 info!("🎙️ Attempting ScreenCaptureKit for system audio capture... [LIFECYCLE: SCKit attempt START]");
                 match ScreenCaptureKitCapture::new().await {
