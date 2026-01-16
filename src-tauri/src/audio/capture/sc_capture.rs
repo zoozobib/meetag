@@ -149,9 +149,12 @@ impl ScreenCaptureKitCapture {
         config.set_sample_rate(48000);
         config.set_channel_count(2); // Stereo, we'll convert to mono later
 
-        // Video is disabled by default, but set minimal params
-        config.set_width(1);
-        config.set_height(1);
+        // ScreenCaptureKit requires valid video dimensions even for audio-only capture
+        // Minimum valid resolution and lowest frame rate to minimize overhead
+        config.set_width(64);
+        config.set_height(64);
+        config.set_minimum_frame_interval(cm::Time::new(1, 1)); // 1 fps
+        config.set_shows_cursor(false);
 
         info!("✅ ScreenCaptureKit: Configuration created (audio-only, 48kHz stereo)");
 
