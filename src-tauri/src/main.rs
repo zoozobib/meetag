@@ -229,12 +229,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                         return;
                     }
                 };
-
-            let sr = system_stream.sample_rate();
-            if let Err(e) = system_writer.lock().unwrap().init_pcm16(sr, 1) {
-                eprintln!("❌ init system wav failed: {e:?}");
-                return;
-            }
+            // WAV writer will be initialized lazily in the audio loop with detected sample rate
 
             // 3) Tokio Runtime for System Capture
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -255,33 +250,112 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                 use futures_util::StreamExt;
                 use tokio::time::{timeout, Duration, Instant};
 
-                let mut buf: Vec<i16> = Vec::with_capacity(48000);
+                // Lazy initialization - will be set on first audio packet
+                let mut wav_initialized = false;
+                let mut buf: Vec<i16> = Vec::new();
                 let mut last_flush = Instant::now();
 
+                // Resampler state - ratio will be calculated on first packet
                 let mut rs_phase: f32 = 0.0;
-                let ratio = sr as f32 / 16_000.0;
+                let mut ratio: f32 = 3.0; // Default, will be updated
                 let mut prev_sample: f32 = 0.0;
+                let mut actual_sr: u32 = 48000; // Will be updated
 
                 // AEC Gate State
                 let mut rms_window_sum = 0.0;
                 let mut rms_window_count = 0;
-                let rms_window_size = 480; // ~10ms at 48kHz (adjust based on SR)
-                let gate_threshold = 0.05; // Adjust this sensitivity!
+                let mut rms_window_size = 480; // Will be updated based on actual SR
+                let gate_threshold = 0.05;
                 let mut hang_timer = 0;
-                let hang_duration = 5; // Hold gate for ~5 windows (50ms) after loud sound
+                let hang_duration = 5;
 
                 while !stop2.load(Ordering::Acquire) {
-                    // Don't block forever
                     match timeout(Duration::from_millis(200), system_stream.next()).await {
                         Ok(Some(s)) => {
                             let s: f32 = s;
 
-                            // DEBUG: Trace data arrival in main loop
+                            // Lazy initialization on first audio packet
+                            if !wav_initialized {
+                                // Get the dynamically detected sample rate
+                                actual_sr = system_stream.sample_rate();
+                                
+                                println!("╔══════════════════════════════════════════════════════════════╗");
+                                println!("║           MAIN LOOP - FIRST AUDIO PACKET                     ║");
+                                println!("╠══════════════════════════════════════════════════════════════╣");
+                                println!("║ SAMPLE RATE INFO:                                            ║");
+                                println!("║   Detected from stream: {} Hz", actual_sr);
+                                println!("║   First sample value: {:.6}", s);
+                                println!("║   Sample looks like float: {}", s.abs() <= 1.1);
+                                
+                                println!("╠══════════════════════════════════════════════════════════════╣");
+                                println!("║ WAV WRITER CONFIG:                                           ║");
+                                println!("║   Output sample rate: {} Hz", actual_sr);
+                                println!("║   Channels: 1 (mono)                                         ║");
+                                println!("║   Format: PCM 16-bit                                         ║");
+                                
+                                // Initialize WAV writer with correct sample rate
+                                match system_writer2.lock().unwrap().init_pcm16(actual_sr, 1) {
+                                    Ok(_) => println!("║   Status: ✅ Initialized successfully                        ║"),
+                                    Err(e) => println!("║   Status: ❌ Failed: {:?}", e),
+                                }
+
+                                println!("╠══════════════════════════════════════════════════════════════╣");
+                                println!("║ RESAMPLING CONFIG (for ASR):                                 ║");
+                                ratio = actual_sr as f32 / 16_000.0;
+                                println!("║   Source: {} Hz -> Target: 16000 Hz", actual_sr);
+                                println!("║   Ratio: {:.4}", ratio);
+
+                                println!("╠══════════════════════════════════════════════════════════════╣");
+                                println!("║ AEC CONFIG:                                                  ║");
+                                rms_window_size = (actual_sr / 100) as usize;
+                                println!("║   RMS window: {} samples (~10ms)", rms_window_size);
+                                println!("║   Gate threshold: {}", gate_threshold);
+
+                                println!("╠══════════════════════════════════════════════════════════════╣");
+                                println!("║ BUFFER CONFIG:                                               ║");
+                                buf = Vec::with_capacity(actual_sr as usize);
+                                println!("║   Capacity: {} samples (~1 sec)", actual_sr);
+                                println!("╚══════════════════════════════════════════════════════════════╝");
+                                println!("");
+                                println!("⚠️ If WAV playback has wrong pitch:");
+                                println!("   - Higher pitch (cartoon): WAV SR > actual data SR");
+                                println!("   - Lower pitch (slow): WAV SR < actual data SR");
+                                println!("   Check SCK format diagnostic above for correct interpretation.");
+                                println!("");
+
+                                wav_initialized = true;
+                            }
+
+                            // DEBUG: Trace data arrival with stats
                             static MAIN_LOG_COUNTER: std::sync::atomic::AtomicUsize =
                                 std::sync::atomic::AtomicUsize::new(0);
+                            static SAMPLE_SUM: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            static SAMPLE_SQ_SUM: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            static SAMPLE_MIN: std::sync::atomic::AtomicI32 =
+                                std::sync::atomic::AtomicI32::new(i32::MAX);
+                            static SAMPLE_MAX: std::sync::atomic::AtomicI32 =
+                                std::sync::atomic::AtomicI32::new(i32::MIN);
+                                
                             let count = MAIN_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                            if count % 10000 == 0 {
-                                println!("MAIN_LOOP: Got system sample: {}", s);
+                            
+                            // Track sample statistics
+                            let s_int = (s * 1000000.0) as i64;
+                            SAMPLE_SUM.fetch_add(s_int.unsigned_abs(), Ordering::Relaxed);
+                            SAMPLE_SQ_SUM.fetch_add((s * s * 1000000.0) as u64, Ordering::Relaxed);
+                            SAMPLE_MIN.fetch_min((s * 1000000.0) as i32, Ordering::Relaxed);
+                            SAMPLE_MAX.fetch_max((s * 1000000.0) as i32, Ordering::Relaxed);
+                            
+                            // Log every 48000 samples (~1 second at 48kHz)
+                            if count > 0 && count % 48000 == 0 {
+                                let n = count as f64;
+                                let avg = SAMPLE_SUM.load(Ordering::Relaxed) as f64 / n / 1000000.0;
+                                let rms_val = (SAMPLE_SQ_SUM.load(Ordering::Relaxed) as f64 / n / 1000000.0).sqrt();
+                                let min_val = SAMPLE_MIN.load(Ordering::Relaxed) as f64 / 1000000.0;
+                                let max_val = SAMPLE_MAX.load(Ordering::Relaxed) as f64 / 1000000.0;
+                                println!("📊 [MAIN_LOOP] Stats after {} samples: avg_abs={:.6}, RMS={:.6}, range=[{:.6}, {:.6}]",
+                                         count, avg, rms_val, min_val, max_val);
                             }
 
                             let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
@@ -303,9 +377,8 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                                 rms_window_sum = 0.0;
                                 rms_window_count = 0;
                             }
-                            // --------------------------------------
 
-                            // --- Resample to 16kHz for ASR Mixer ---
+                            // --- Resample to 16kHz for ASR ---
                             rs_phase += 1.0 / ratio;
                             while rs_phase >= 1.0 {
                                 let t = 1.0 - (rs_phase - 1.0);
@@ -315,20 +388,19 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                                 if let Some(tx) = SYS_PCM_TX.lock().unwrap().as_ref() {
                                     let _ = tx.send(v_asr);
                                 }
-                                // Also send to System ASR
                                 let _ = asr_sys_tx.send(v_asr);
                                 rs_phase -= 1.0;
                             }
                             prev_sample = s;
-                            // ---------------------------------------
 
-                            if buf.len() >= 48000 || last_flush.elapsed() >= Duration::from_secs(1)
+                            // Flush WAV periodically
+                            if buf.len() >= actual_sr as usize || last_flush.elapsed() >= Duration::from_secs(1)
                             {
                                 crate::wav::flush_i16(system_writer2.clone(), &mut buf);
                                 last_flush = Instant::now();
                             }
                         }
-                        Ok(None) => break, // stream ended
+                        Ok(None) => break,
                         Err(_) => {
                             // timeout: check stop flag again
                         }

@@ -58,6 +58,7 @@ struct AudioProcessor {
     waker_state: Arc<Mutex<WakerState>>,
     should_terminate: Arc<AtomicBool>,
     samples_processed: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
 }
 
 /// Inner data for StreamOutputHandler
@@ -145,9 +146,12 @@ impl ScreenCaptureKitCapture {
         let mut config = sc::StreamCfg::new();
 
         // Audio configuration
+        // SCK delivers Stereo f32 at 48000 Hz (verified via diagnostic logs)
+        let requested_sample_rate = 48000i64;
+        let requested_channels = 2i64;
         config.set_captures_audio(true);
-        config.set_sample_rate(48000);
-        config.set_channel_count(2); // Stereo, we'll convert to mono later
+        config.set_sample_rate(requested_sample_rate);
+        config.set_channel_count(requested_channels);
 
         // ScreenCaptureKit requires valid video dimensions even for audio-only capture
         // Minimum valid resolution and lowest frame rate to minimize overhead
@@ -156,7 +160,10 @@ impl ScreenCaptureKitCapture {
         config.set_minimum_frame_interval(cm::Time::new(1, 1)); // 1 fps
         config.set_shows_cursor(false);
 
-        info!("✅ ScreenCaptureKit: Configuration created (audio-only, 48kHz stereo)");
+        info!(
+            "📋 SCK Config: requested_sr={}Hz, requested_ch={}, video=64x64@1fps",
+            requested_sample_rate, requested_channels
+        );
 
         // Create ring buffer for audio data
         let buffer_size = 48000 * 10; // 10 seconds at 48kHz
@@ -171,12 +178,15 @@ impl ScreenCaptureKitCapture {
         let should_terminate = Arc::new(AtomicBool::new(false));
         let samples_processed = Arc::new(AtomicU32::new(0));
 
+        let detected_sample_rate = Arc::new(AtomicU32::new(48000)); // Initial guess, will be updated
+
         // Create audio processor
         let processor = Arc::new(Mutex::new(AudioProcessor {
             producer,
             waker_state: waker_state.clone(),
             should_terminate: should_terminate.clone(),
             samples_processed: samples_processed.clone(),
+            sample_rate: detected_sample_rate.clone(),
         }));
 
         // Create stream
@@ -216,7 +226,7 @@ impl ScreenCaptureKitCapture {
             consumer,
             waker_state,
             should_terminate,
-            sample_rate: Arc::new(AtomicU32::new(self.sample_rate)),
+            sample_rate: detected_sample_rate, // Use the shared atomic that processor will update
         })
     }
 
@@ -225,7 +235,6 @@ impl ScreenCaptureKitCapture {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl AudioProcessor {
     fn process_audio_buffer(&mut self, sample_buffer: &mut cm::SampleBuf) -> Result<()> {
         // Get block buffer
@@ -243,21 +252,400 @@ impl AudioProcessor {
             return Ok(());
         }
 
-        // Cast to f32 slice (assuming PCM float32 format)
-        let data_ptr = data_slice.as_ptr() as *const f32;
-        let sample_count = data_slice.len() / 8; // 4 bytes per f32, 2 channels
+        // Get duration info for sample rate calculation
+        let duration = sample_buffer.duration();
+        let duration_valid = duration.flags.contains(cm::TimeFlags::VALID);
+        let duration_sec = if duration.scale > 0 {
+            duration.value as f64 / duration.scale as f64
+        } else {
+            0.0
+        };
 
-        if sample_count == 0 {
+        // === COMPREHENSIVE DIAGNOSTIC LOG (once) ===
+        static DIAGNOSTIC_LOGGED: std::sync::Once = std::sync::Once::new();
+        DIAGNOSTIC_LOGGED.call_once(|| {
+            info!("╔══════════════════════════════════════════════════════════════╗");
+            info!("║      SCK AUDIO FORMAT DIAGNOSTIC (FIRST PACKET)              ║");
+            info!("╠══════════════════════════════════════════════════════════════╣");
+
+            // === TRY TO GET AUTHORITATIVE FORMAT INFO FROM format_desc ===
+            info!("║ AUDIO FORMAT DESCRIPTION (from CMFormatDesc):                ║");
+            if let Some(format_desc) = sample_buffer.format_desc() {
+                // The format_desc should give us the ASBD (AudioStreamBasicDescription)
+                // which contains authoritative sample rate, channels, format info
+                unsafe {
+                    // Try to cast to AudioFormatDesc and get ASBD
+                    let audio_desc: &cidre::cm::AudioFormatDesc = std::mem::transmute(format_desc);
+                    if let Some(asbd) = audio_desc.stream_basic_desc() {
+                        info!("║   ✅ ASBD FOUND - THIS IS THE AUTHORITATIVE FORMAT!");
+                        info!("║   sample_rate: {} Hz", asbd.sample_rate);
+                        info!("║   channels_per_frame: {}", asbd.channels_per_frame);
+                        info!("║   bits_per_channel: {}", asbd.bits_per_channel);
+                        info!("║   bytes_per_frame: {}", asbd.bytes_per_frame);
+                        info!("║   bytes_per_packet: {}", asbd.bytes_per_packet);
+                        info!("║   frames_per_packet: {}", asbd.frames_per_packet);
+                        info!("║   format: {:?}", asbd.format);
+                        info!("║   format_flags: {:?}", asbd.format_flags);
+
+                        // Use cidre's built-in method
+                        let is_interleaved = asbd.is_interleaved();
+                        let is_native_endian = asbd.is_native_endian();
+                        
+                        // Parse format flags for additional info
+                        let flags_raw = asbd.format_flags.0;
+                        let is_float = (flags_raw & 0x1) != 0; // kAudioFormatFlagIsFloat
+
+                        info!("║   FORMAT INFO (from ASBD methods):");
+                        info!("║     is_interleaved: {} ⬅️ CRITICAL", is_interleaved);
+                        info!("║     is_native_endian: {}", is_native_endian);
+                        info!("║     isFloat (flag): {}", is_float);
+
+                        if is_interleaved {
+                            info!("║   � FORMAT IS INTERLEAVED [L0,R0,L1,R1...]");
+                        } else {
+                            info!("║   � FORMAT IS PLANAR (non-interleaved) [L0,L1...Ln,R0,R1...Rn]");
+                        }
+                    } else {
+                        info!("║   ⚠️ No ASBD available from format_desc");
+                    }
+                }
+            } else {
+                info!("║   ⚠️ No format_desc available from sample_buffer");
+            }
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ RAW BUFFER INFO:                                             ║");
+            info!("║   data_slice.len() = {} bytes", data_slice.len());
+            info!("║   data_len (block_buf) = {} bytes", data_len);
+
+            // Show first few bytes as hex
+            let preview: Vec<u8> = data_slice.iter().take(32).cloned().collect();
+            info!("║   First 32 bytes (hex): {:02X?}", preview);
+
+            // Interpret first few bytes as different formats
+            if data_slice.len() >= 16 {
+                // As float32
+                let ptr_f32 = data_slice.as_ptr() as *const f32;
+                let f32_samples: Vec<f32> = (0..4).map(|i| unsafe { *ptr_f32.add(i) }).collect();
+                info!("║   As f32 (first 4): {:?}", f32_samples);
+
+                // As int16
+                let ptr_i16 = data_slice.as_ptr() as *const i16;
+                let i16_samples: Vec<i16> = (0..8).map(|i| unsafe { *ptr_i16.add(i) }).collect();
+                info!("║   As i16 (first 8): {:?}", i16_samples);
+
+                // As int32
+                let ptr_i32 = data_slice.as_ptr() as *const i32;
+                let i32_samples: Vec<i32> = (0..4).map(|i| unsafe { *ptr_i32.add(i) }).collect();
+                info!("║   As i32 (first 4): {:?}", i32_samples);
+            }
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ DURATION METADATA:                                           ║");
+            info!(
+                "║   valid={}, value={}, scale={}",
+                duration_valid, duration.value, duration.scale
+            );
+            info!("║   duration_sec = {:.6}s", duration_sec);
+            info!(
+                "║   duration.scale typically represents sample rate = {} Hz",
+                duration.scale
+            );
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ FRAME COUNT INTERPRETATIONS:                                 ║");
+
+            // Calculate frame counts for different format assumptions
+            let bytes = data_slice.len();
+
+            // Mono float32
+            let frames_mono_f32 = bytes / 4;
+            let sr_mono_f32 = if duration_sec > 0.0 {
+                frames_mono_f32 as f64 / duration_sec
+            } else {
+                0.0
+            };
+            info!(
+                "║   Mono f32:   {} frames -> {:.0} Hz",
+                frames_mono_f32, sr_mono_f32
+            );
+
+            // Stereo float32
+            let frames_stereo_f32 = bytes / 8;
+            let sr_stereo_f32 = if duration_sec > 0.0 {
+                frames_stereo_f32 as f64 / duration_sec
+            } else {
+                0.0
+            };
+            info!(
+                "║   Stereo f32: {} frames -> {:.0} Hz",
+                frames_stereo_f32, sr_stereo_f32
+            );
+
+            // Mono int16
+            let frames_mono_i16 = bytes / 2;
+            let sr_mono_i16 = if duration_sec > 0.0 {
+                frames_mono_i16 as f64 / duration_sec
+            } else {
+                0.0
+            };
+            info!(
+                "║   Mono i16:   {} frames -> {:.0} Hz",
+                frames_mono_i16, sr_mono_i16
+            );
+
+            // Stereo int16
+            let frames_stereo_i16 = bytes / 4;
+            let sr_stereo_i16 = if duration_sec > 0.0 {
+                frames_stereo_i16 as f64 / duration_sec
+            } else {
+                0.0
+            };
+            info!(
+                "║   Stereo i16: {} frames -> {:.0} Hz",
+                frames_stereo_i16, sr_stereo_i16
+            );
+
+            // Mono int32
+            let frames_mono_i32 = bytes / 4;
+            let sr_mono_i32 = if duration_sec > 0.0 {
+                frames_mono_i32 as f64 / duration_sec
+            } else {
+                0.0
+            };
+            info!(
+                "║   Mono i32:   {} frames -> {:.0} Hz",
+                frames_mono_i32, sr_mono_i32
+            );
+
+            // Stereo int32
+            let frames_stereo_i32 = bytes / 8;
+            let sr_stereo_i32 = if duration_sec > 0.0 {
+                frames_stereo_i32 as f64 / duration_sec
+            } else {
+                0.0
+            };
+            info!(
+                "║   Stereo i32: {} frames -> {:.0} Hz",
+                frames_stereo_i32, sr_stereo_i32
+            );
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!(
+                "║ EXPECTED: duration.scale ({}) should match calculated SR      ║",
+                duration.scale
+            );
+            info!("║ If Stereo f32 matches duration.scale -> data is stereo f32   ║");
+            info!("║ If Mono f32 matches duration.scale -> data is mono f32       ║");
+
+            // Determine which format matches
+            let scale = duration.scale as f64;
+            if (sr_stereo_f32 - scale).abs() < 1000.0 {
+                info!(
+                    "║ ✅ MATCH: Stereo f32 ({:.0} Hz ≈ {} Hz)",
+                    sr_stereo_f32, duration.scale
+                );
+            } else if (sr_mono_f32 - scale).abs() < 1000.0 {
+                info!(
+                    "║ ✅ MATCH: Mono f32 ({:.0} Hz ≈ {} Hz)",
+                    sr_mono_f32, duration.scale
+                );
+            } else if (sr_stereo_i16 - scale).abs() < 1000.0 {
+                info!(
+                    "║ ✅ MATCH: Stereo i16 ({:.0} Hz ≈ {} Hz)",
+                    sr_stereo_i16, duration.scale
+                );
+            } else if (sr_mono_i16 - scale).abs() < 1000.0 {
+                info!(
+                    "║ ✅ MATCH: Mono i16 ({:.0} Hz ≈ {} Hz)",
+                    sr_mono_i16, duration.scale
+                );
+            } else {
+                info!("║ ⚠️ NO CLEAR MATCH - format unknown!");
+            }
+
+            // === CRITICAL: Compare INTERLEAVED vs PLANAR sample interpretation ===
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ STEREO FORMAT COMPARISON (INTERLEAVED vs PLANAR):             ║");
+
+            let data_ptr = data_slice.as_ptr() as *const f32;
+            let total_f32_samples = bytes / 4;
+            let all_f32 = unsafe { std::slice::from_raw_parts(data_ptr, total_f32_samples) };
+            let frame_count_stereo = total_f32_samples / 2;
+
+            // Find first non-zero samples for meaningful comparison
+            let mut first_nonzero_idx = 0usize;
+            for (i, &s) in all_f32.iter().enumerate() {
+                if s.abs() > 0.0001 {
+                    first_nonzero_idx = i;
+                    break;
+                }
+            }
+
+            info!("║ First non-zero sample index: {}", first_nonzero_idx);
+            info!(
+                "║ Total f32 samples: {}, frame_count: {}",
+                total_f32_samples, frame_count_stereo
+            );
+
+            // Show raw sample values at offset for both interpretations
+            let offset = first_nonzero_idx.saturating_sub(2);
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ RAW SAMPLES at offset {} (10 values):", offset);
+            let preview: Vec<f32> = all_f32.iter().skip(offset).take(10).copied().collect();
+            info!("║   {:?}", preview);
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ INTERPRETATION 1: INTERLEAVED [L0,R0,L1,R1...]");
+            info!("║   Meaning: samples alternate left-right-left-right");
+            // Show how it would be mixed to mono
+            let mut interleaved_mono: Vec<f32> = Vec::new();
+            for chunk in all_f32.chunks(2) {
+                if chunk.len() == 2 {
+                    interleaved_mono.push((chunk[0] + chunk[1]) / 2.0);
+                }
+            }
+            let preview_start = offset / 2;
+            let interleaved_preview: Vec<f32> = interleaved_mono
+                .iter()
+                .skip(preview_start)
+                .take(5)
+                .copied()
+                .collect();
+            info!("║   Mono mix preview: {:?}", interleaved_preview);
+
+            // Calculate RMS for interleaved interpretation
+            let interleaved_rms: f32 = (interleaved_mono.iter().map(|x| x * x).sum::<f32>()
+                / interleaved_mono.len() as f32)
+                .sqrt();
+            info!("║   RMS: {:.6}", interleaved_rms);
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ INTERPRETATION 2: PLANAR [L0,L1...Ln, R0,R1...Rn]");
+            info!("║   Meaning: first half = all left, second half = all right");
+            // Show how it would be mixed to mono
+            let left_half = &all_f32[..frame_count_stereo];
+            let right_half = &all_f32[frame_count_stereo..];
+            let mut planar_mono: Vec<f32> = Vec::new();
+            for (l, r) in left_half.iter().zip(right_half.iter()) {
+                planar_mono.push((l + r) / 2.0);
+            }
+            let planar_preview: Vec<f32> = planar_mono
+                .iter()
+                .skip(preview_start)
+                .take(5)
+                .copied()
+                .collect();
+            info!("║   Mono mix preview: {:?}", planar_preview);
+
+            // Calculate RMS for planar interpretation
+            let planar_rms: f32 =
+                (planar_mono.iter().map(|x| x * x).sum::<f32>() / planar_mono.len() as f32).sqrt();
+            info!("║   RMS: {:.6}", planar_rms);
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ INTERPRETATION 3: MONO (no mixing needed)");
+            info!("║   Meaning: data is already mono, just use first half");
+            let mono_preview: Vec<f32> = all_f32.iter().skip(offset).take(5).copied().collect();
+            info!("║   Sample preview: {:?}", mono_preview);
+            let mono_rms: f32 = (all_f32
+                .iter()
+                .take(frame_count_stereo)
+                .map(|x| x * x)
+                .sum::<f32>()
+                / frame_count_stereo as f32)
+                .sqrt();
+            info!("║   RMS (first half): {:.6}", mono_rms);
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ DECISION HELPER:");
+            info!("║   - If audio sounds HIGH PITCHED: wrong interpretation");
+            info!("║   - Compare RMS values - they should be similar");
+            info!("║   - Interleaved RMS: {:.6}", interleaved_rms);
+            info!("║   - Planar RMS: {:.6}", planar_rms);
+            info!("║   - Mono RMS: {:.6}", mono_rms);
+
+            // Check for signs of planar vs interleaved
+            // In planar, left_half[0] and right_half[0] should be correlated
+            // In interleaved, all_f32[0] and all_f32[1] should be correlated (L and R of same time)
+            let correlation_interleaved: f32 = all_f32
+                .chunks(2)
+                .take(100)
+                .filter(|c| c.len() == 2)
+                .map(|c| c[0] * c[1])
+                .sum::<f32>()
+                / 100.0;
+            let correlation_planar: f32 = left_half
+                .iter()
+                .zip(right_half.iter())
+                .take(100)
+                .map(|(l, r)| l * r)
+                .sum::<f32>()
+                / 100.0;
+
+            info!("║   Correlation (higher = more likely correct):");
+            info!("║     Interleaved L*R: {:.6}", correlation_interleaved);
+            info!("║     Planar L*R: {:.6}", correlation_planar);
+
+            if correlation_interleaved > correlation_planar {
+                info!("║   ➡️ LIKELY: INTERLEAVED format");
+            } else if correlation_planar > correlation_interleaved {
+                info!("║   ➡️ LIKELY: PLANAR format");
+            } else {
+                info!("║   ⚠️ UNCERTAIN - correlations are similar");
+            }
+
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ CURRENT CODE USES: PLANAR format                             ║");
+            info!("╚══════════════════════════════════════════════════════════════╝");
+        });
+
+        // STEREO float32 format (verified from diagnostic logs)
+        // SCK delivers interleaved stereo: [L0, R0, L1, R1, ...]
+        let bytes_per_sample = 4usize; // f32
+        let channels = 2u16; // STEREO
+        let bytes_per_frame = bytes_per_sample * channels as usize; // 8 bytes per frame
+        let frame_count = data_slice.len() / bytes_per_frame;
+
+        if frame_count == 0 {
+            warn!(
+                "⚠️ SCK: frame_count=0, data_slice.len()={}, skipping",
+                data_slice.len()
+            );
             return Ok(());
         }
 
-        // Convert to slice
-        let samples = unsafe { std::slice::from_raw_parts(data_ptr, sample_count * 2) };
+        // Update sample rate from duration metadata
+        if duration_valid && duration.scale > 0 && duration.value > 0 && duration_sec > 0.0001 {
+            let calculated_rate = (frame_count as f64 / duration_sec).round() as u32;
+            if calculated_rate >= 8000 && calculated_rate <= 192000 {
+                let current = self.sample_rate.load(Ordering::Relaxed);
+                if current != calculated_rate {
+                    info!(
+                        "🔄 SCK SR Update: {} Hz -> {} Hz (frames={}, dur={:.6}s, format=stereo_f32)",
+                        current, calculated_rate, frame_count, duration_sec
+                    );
+                    self.sample_rate.store(calculated_rate, Ordering::Relaxed);
+                }
+            }
+        }
 
-        // Mix stereo to mono
-        let mono_samples: Vec<f32> = samples
-            .chunks(2)
-            .map(|chunk| (chunk[0] + chunk.get(1).unwrap_or(&0.0)) / 2.0)
+        // Cast to f32 slice
+        // NOTE: SCK may provide PLANAR stereo [L0,L1,L2...Ln, R0,R1,R2...Rn]
+        // instead of INTERLEAVED [L0,R0,L1,R1...]
+        let data_ptr = data_slice.as_ptr() as *const f32;
+        let total_samples = frame_count * 2; // L and R for each frame
+        let all_samples = unsafe { std::slice::from_raw_parts(data_ptr, total_samples) };
+
+        // Try PLANAR format: first half = left channel, second half = right channel
+        let left_samples = &all_samples[..frame_count];
+        let right_samples = &all_samples[frame_count..];
+
+        // Mix stereo to mono: (L + R) / 2
+        let mono_samples: Vec<f32> = left_samples
+            .iter()
+            .zip(right_samples.iter())
+            .map(|(l, r)| (l + r) / 2.0)
             .collect();
 
         // Push to ring buffer
@@ -282,12 +670,29 @@ impl AudioProcessor {
             }
         }
 
-        // Debug: Log first successful capture
+        // Debug: Log first successful capture with sample preview
         static FIRST_AUDIO: std::sync::Once = std::sync::Once::new();
         FIRST_AUDIO.call_once(|| {
-            info!("🎵 ScreenCaptureKit: First audio data received!");
-            info!("   Samples: {}", mono_samples.len());
-            info!("   RMS: {:.4}", rms(&mono_samples));
+            let sr = self.sample_rate.load(Ordering::Relaxed);
+            info!("🎵 SCK First Audio Data Pushed:");
+            info!("   Stored SR: {} Hz", sr);
+            info!(
+                "   frame_count: {}, pushed to ring: {}",
+                frame_count, pushed
+            );
+            info!("   RMS: {:.6}", rms(&mono_samples));
+
+            // Show first few samples
+            let sample_preview: Vec<f32> = mono_samples.iter().take(10).copied().collect();
+            info!("   First 10 samples: {:?}", sample_preview);
+
+            // Show min/max
+            let min_val = mono_samples.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_val = mono_samples
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            info!("   Sample range: [{:.6}, {:.6}]", min_val, max_val);
         });
 
         Ok(())
