@@ -35,6 +35,9 @@ pub fn is_hallucination(text: &str) -> bool {
         "(字幕君:小小小)",
         "(中文字幕)",
         "中文字幕",
+        "请使用规范的书面语进行转写",
+        "请使用规范的书面语进行转写。",
+        "转写。",
     ];
 
     for phrase in blacklist {
