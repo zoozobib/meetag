@@ -270,62 +270,59 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                 let mut hang_timer = 0;
                 let hang_duration = 5;
 
+                // Eager initialization - ensure valid WAV header even if silent
+                actual_sr = system_stream.sample_rate();
+                
+                println!("╔══════════════════════════════════════════════════════════════╗");
+                println!("║           SYSTEM CAPTURE STARTED                             ║");
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║ SAMPLE RATE INFO:                                            ║");
+                println!("║   Detected from stream: {} Hz", actual_sr);
+                
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║ WAV WRITER CONFIG:                                           ║");
+                println!("║   Output sample rate: {} Hz", actual_sr);
+                println!("║   Channels: 1 (mono)                                         ║");
+                println!("║   Format: PCM 16-bit                                         ║");
+                
+                // Initialize WAV writer with correct sample rate
+                match system_writer2.lock().unwrap().init_pcm16(actual_sr, 1) {
+                    Ok(_) => println!("║   Status: ✅ Initialized successfully                        ║"),
+                    Err(e) => println!("║   Status: ❌ Failed: {:?}", e),
+                }
+
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║ RESAMPLING CONFIG (for ASR):                                 ║");
+                ratio = actual_sr as f32 / 16_000.0;
+                println!("║   Source: {} Hz -> Target: 16000 Hz", actual_sr);
+                println!("║   Ratio: {:.4}", ratio);
+
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║ AEC CONFIG:                                                  ║");
+                rms_window_size = (actual_sr / 100) as usize;
+                println!("║   RMS window: {} samples (~10ms)", rms_window_size);
+                println!("║   Gate threshold: {}", gate_threshold);
+
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║ BUFFER CONFIG:                                               ║");
+                buf = Vec::with_capacity(actual_sr as usize);
+                println!("║   Capacity: {} samples (~1 sec)", actual_sr);
+                println!("╚══════════════════════════════════════════════════════════════╝");
+                println!("");
+                println!("⚠️ If WAV playback has wrong pitch:");
+                println!("   - Higher pitch (cartoon): WAV SR > actual data SR");
+                println!("   - Lower pitch (slow): WAV SR < actual data SR");
+                println!("   Check SCK format diagnostic above for correct interpretation.");
+                println!("");
+
+                wav_initialized = true;
+
                 while !stop2.load(Ordering::Acquire) {
                     match timeout(Duration::from_millis(200), system_stream.next()).await {
                         Ok(Some(s)) => {
                             let s: f32 = s;
 
-                            // Lazy initialization on first audio packet
-                            if !wav_initialized {
-                                // Get the dynamically detected sample rate
-                                actual_sr = system_stream.sample_rate();
-                                
-                                println!("╔══════════════════════════════════════════════════════════════╗");
-                                println!("║           MAIN LOOP - FIRST AUDIO PACKET                     ║");
-                                println!("╠══════════════════════════════════════════════════════════════╣");
-                                println!("║ SAMPLE RATE INFO:                                            ║");
-                                println!("║   Detected from stream: {} Hz", actual_sr);
-                                println!("║   First sample value: {:.6}", s);
-                                println!("║   Sample looks like float: {}", s.abs() <= 1.1);
-                                
-                                println!("╠══════════════════════════════════════════════════════════════╣");
-                                println!("║ WAV WRITER CONFIG:                                           ║");
-                                println!("║   Output sample rate: {} Hz", actual_sr);
-                                println!("║   Channels: 1 (mono)                                         ║");
-                                println!("║   Format: PCM 16-bit                                         ║");
-                                
-                                // Initialize WAV writer with correct sample rate
-                                match system_writer2.lock().unwrap().init_pcm16(actual_sr, 1) {
-                                    Ok(_) => println!("║   Status: ✅ Initialized successfully                        ║"),
-                                    Err(e) => println!("║   Status: ❌ Failed: {:?}", e),
-                                }
-
-                                println!("╠══════════════════════════════════════════════════════════════╣");
-                                println!("║ RESAMPLING CONFIG (for ASR):                                 ║");
-                                ratio = actual_sr as f32 / 16_000.0;
-                                println!("║   Source: {} Hz -> Target: 16000 Hz", actual_sr);
-                                println!("║   Ratio: {:.4}", ratio);
-
-                                println!("╠══════════════════════════════════════════════════════════════╣");
-                                println!("║ AEC CONFIG:                                                  ║");
-                                rms_window_size = (actual_sr / 100) as usize;
-                                println!("║   RMS window: {} samples (~10ms)", rms_window_size);
-                                println!("║   Gate threshold: {}", gate_threshold);
-
-                                println!("╠══════════════════════════════════════════════════════════════╣");
-                                println!("║ BUFFER CONFIG:                                               ║");
-                                buf = Vec::with_capacity(actual_sr as usize);
-                                println!("║   Capacity: {} samples (~1 sec)", actual_sr);
-                                println!("╚══════════════════════════════════════════════════════════════╝");
-                                println!("");
-                                println!("⚠️ If WAV playback has wrong pitch:");
-                                println!("   - Higher pitch (cartoon): WAV SR > actual data SR");
-                                println!("   - Lower pitch (slow): WAV SR < actual data SR");
-                                println!("   Check SCK format diagnostic above for correct interpretation.");
-                                println!("");
-
-                                wav_initialized = true;
-                            }
+                            // Lazy initialization removed (done above)
 
                             // DEBUG: Trace data arrival with stats
                             static MAIN_LOG_COUNTER: std::sync::atomic::AtomicUsize =
