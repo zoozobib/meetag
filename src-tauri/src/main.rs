@@ -15,6 +15,7 @@ mod audio_processor;
 mod capture;
 mod history;
 mod llm;
+mod settings; // Application settings (settings.json)
 mod text_filter;
 mod tray;
 mod vad;
@@ -729,6 +730,10 @@ fn main() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Initialize settings on startup
+            // This ensures the settings file is created if it doesn't exist
+            settings::get_settings();
 
             // Init Tray
             tray::create_tray(&handle)?;

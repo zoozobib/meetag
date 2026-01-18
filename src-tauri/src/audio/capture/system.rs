@@ -48,170 +48,223 @@ impl SystemAudioCapture {
     pub async fn start_system_audio_capture(&self) -> Result<SystemAudioStream> {
         #[cfg(target_os = "macos")]
         {
-            // Try ScreenCaptureKit first (supports USB headphones)
-            // Note: SC_KIT_FAILED persists for app lifetime to avoid repeated permission prompts
-            if !SC_KIT_FAILED.load(Ordering::Relaxed) {
-                info!("🎙️ Attempting ScreenCaptureKit for system audio capture... [LIFECYCLE: SCKit attempt START]");
-                match ScreenCaptureKitCapture::new().await {
-                    Ok(capture) => {
-                        match capture.stream().await {
-                            Ok(sc_stream) => {
-                                let sample_rate = sc_stream.sample_rate();
-                                info!(
-                                    "✅ ScreenCaptureKit capture started successfully ({}Hz)",
-                                    sample_rate
-                                );
+            use crate::settings::{get_audio_settings, AudioBackend};
 
-                                // Convert ScreenCaptureKitStream to SystemAudioStream
-                                let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
-                                let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
+            let audio_settings = get_audio_settings();
+            let preferred = audio_settings.preferred_backend;
+            let allow_fallback = audio_settings.allow_fallback;
 
-                                // Spawn task to forward samples
-                                info!("🔄 [LIFECYCLE: SCKit forwarding task SPAWN] Starting tokio task to forward SCKit samples...");
-                                tokio::spawn(async move {
-                                    info!(
-                                        "🔄 [LIFECYCLE: SCKit forwarding task ENTER] Task started"
-                                    );
-                                    use futures_util::StreamExt;
-                                    let mut stream = sc_stream;
-                                    let mut buffer = Vec::new();
-                                    let chunk_size = 1024;
+            info!("╔══════════════════════════════════════════════════════════════╗");
+            info!("║           AUDIO BACKEND SELECTION                            ║");
+            info!("╠══════════════════════════════════════════════════════════════╣");
+            info!("║ Preferred backend: {:?}", preferred);
+            info!("║ Allow fallback: {}", allow_fallback);
+            info!("╚══════════════════════════════════════════════════════════════╝");
 
-                                    loop {
-                                        // Use tokio::select! for proper async cancellation
-                                        tokio::select! {
-                                            _ = &mut drop_rx => {
-                                                info!("🛑 [LIFECYCLE: SCKit forwarding task] Received drop signal via select!, exiting loop...");
+            // Helper closures to start each backend
+            let try_screencapturekit = || async {
+                // Don't retry if previously failed in this session
+                if SC_KIT_FAILED.load(Ordering::Relaxed) {
+                    info!("⏭️ [SCK] Skipping - previously failed in this session");
+                    return Err(anyhow::anyhow!("ScreenCaptureKit previously failed"));
+                }
+
+                info!("🎙️ [SCK] Attempting ScreenCaptureKit for system audio capture...");
+                let capture = ScreenCaptureKitCapture::new().await.map_err(|e| {
+                    warn!("⚠️ [SCK] Initialization failed: {}", e);
+                    SC_KIT_FAILED.store(true, Ordering::Relaxed);
+                    e
+                })?;
+
+                let sc_stream = capture.stream().await.map_err(|e| {
+                    warn!("⚠️ [SCK] Stream creation failed: {}", e);
+                    SC_KIT_FAILED.store(true, Ordering::Relaxed);
+                    e
+                })?;
+
+                let sample_rate = sc_stream.sample_rate();
+                info!(
+                    "✅ [SCK] ScreenCaptureKit started successfully ({}Hz)",
+                    sample_rate
+                );
+
+                // Convert to SystemAudioStream
+                let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
+                let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
+
+                tokio::spawn(async move {
+                    info!("🔄 [SCK] Forwarding task started");
+                    use futures_util::StreamExt;
+                    let mut stream = sc_stream;
+                    let mut buffer = Vec::new();
+                    let chunk_size = 1024;
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut drop_rx => {
+                                info!("🛑 [SCK] Received stop signal");
+                                break;
+                            }
+                            maybe_sample = stream.next() => {
+                                match maybe_sample {
+                                    Some(sample) => {
+                                        buffer.push(sample);
+                                        if buffer.len() >= chunk_size {
+                                            if tx.unbounded_send(buffer.clone()).is_err() {
                                                 break;
                                             }
-                                            maybe_sample = stream.next() => {
-                                                match maybe_sample {
-                                                    Some(sample) => {
-                                                        buffer.push(sample);
-                                                        if buffer.len() >= chunk_size {
-                                                            if tx.unbounded_send(buffer.clone()).is_err() {
-                                                                info!("🛑 [LIFECYCLE: SCKit forwarding task] Channel closed, exiting...");
-                                                                break;
-                                                            }
-                                                            buffer.clear()
-                                                        }
-                                                    }
-                                                    None => {
-                                                        info!("🛑 [LIFECYCLE: SCKit forwarding task] Stream ended (None), exiting...");
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            buffer.clear();
                                         }
                                     }
-
-                                    if !buffer.is_empty() {
-                                        let _ = tx.unbounded_send(buffer);
-                                    }
-                                    info!("🛑 [LIFECYCLE: SCKit forwarding task EXIT] Task ended");
-                                });
-
-                                let receiver = rx.map(futures_util::stream::iter).flatten();
-
-                                return Ok(SystemAudioStream {
-                                    drop_tx: Some(drop_tx),
-                                    sample_rate,
-                                    receiver: Box::pin(receiver),
-                                    _keep_alive: None,
-                                });
-                            }
-                            Err(e) => {
-                                warn!("⚠️ ScreenCaptureKit stream creation failed: {}", e);
-                                SC_KIT_FAILED.store(true, Ordering::Relaxed);
-                                warn!("📦 Falling back to Core Audio Process Tap...");
+                                    None => break,
+                                }
                             }
                         }
+                    }
+
+                    if !buffer.is_empty() {
+                        let _ = tx.unbounded_send(buffer);
+                    }
+                    info!("🛑 [SCK] Forwarding task ended");
+                });
+
+                let receiver = rx.map(futures_util::stream::iter).flatten();
+
+                Ok(SystemAudioStream {
+                    drop_tx: Some(drop_tx),
+                    sample_rate,
+                    receiver: Box::pin(receiver),
+                    _keep_alive: None,
+                })
+            };
+
+            let try_coreaudio = || {
+                info!("🎵 [CoreAudio] Attempting Core Audio Process Tap...");
+                let core_audio = CoreAudioCapture::new().map_err(|e| {
+                    warn!("⚠️ [CoreAudio] Initialization failed: {}", e);
+                    e
+                })?;
+
+                let core_audio_stream = core_audio.stream().map_err(|e| {
+                    warn!("⚠️ [CoreAudio] Stream creation failed: {}", e);
+                    e
+                })?;
+
+                let sample_rate = core_audio_stream.sample_rate();
+                info!(
+                    "✅ [CoreAudio] Core Audio started successfully ({}Hz)",
+                    sample_rate
+                );
+
+                // Convert to SystemAudioStream
+                let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
+                let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
+
+                tokio::spawn(async move {
+                    info!("🔄 [CoreAudio] Forwarding task started");
+                    use futures_util::StreamExt;
+                    let mut stream = core_audio_stream;
+                    let mut buffer = Vec::new();
+                    let chunk_size = 1024;
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut drop_rx => {
+                                info!("🛑 [CoreAudio] Received stop signal");
+                                break;
+                            }
+                            maybe_sample = stream.next() => {
+                                match maybe_sample {
+                                    Some(sample) => {
+                                        buffer.push(sample);
+                                        if buffer.len() >= chunk_size {
+                                            if tx.unbounded_send(buffer.clone()).is_err() {
+                                                break;
+                                            }
+                                            buffer.clear();
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+
+                    if !buffer.is_empty() {
+                        let _ = tx.unbounded_send(buffer);
+                    }
+                    info!("🛑 [CoreAudio] Forwarding task ended");
+                });
+
+                let receiver = rx.map(futures_util::stream::iter).flatten();
+
+                Ok(SystemAudioStream {
+                    drop_tx: Some(drop_tx),
+                    sample_rate,
+                    receiver: Box::pin(receiver),
+                    _keep_alive: None,
+                })
+            };
+
+            // Try preferred backend first
+            match preferred {
+                AudioBackend::ScreenCaptureKit => match try_screencapturekit().await {
+                    Ok(stream) => {
+                        info!("✅ Using preferred backend: ScreenCaptureKit");
+                        return Ok(stream);
                     }
                     Err(e) => {
-                        warn!("⚠️ ScreenCaptureKit initialization failed: {}", e);
-                        SC_KIT_FAILED.store(true, Ordering::Relaxed);
-                        warn!("📦 Falling back to Core Audio Process Tap...");
-                    }
-                }
-            } else {
-                info!("⏭️ Skipping ScreenCaptureKit (previously failed), using Core Audio Process Tap...");
-            }
-
-            // Fallback: Core Audio Process Tap
-            info!("🎵 Starting Core Audio Process Tap for system audio capture... [LIFECYCLE: CoreAudio fallback START]");
-            let core_audio = CoreAudioCapture::new()?;
-            info!(
-                "🎵 [LIFECYCLE: CoreAudio fallback] CoreAudioCapture created, calling stream()..."
-            );
-            let core_audio_stream = core_audio.stream()?;
-            let sample_rate = core_audio_stream.sample_rate();
-            info!(
-                "🎵 [LIFECYCLE: CoreAudio fallback] CoreAudioStream created, sample_rate={}",
-                sample_rate
-            );
-
-            // Convert CoreAudioStream to SystemAudioStream
-            let (tx, rx) = mpsc::unbounded::<Vec<f32>>();
-            // Use tokio oneshot for proper async cancellation
-            let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
-
-            // Spawn task to forward Core Audio samples
-            info!("🔄 [LIFECYCLE: CoreAudio forwarding task SPAWN] Starting tokio task to forward CoreAudio samples...");
-            tokio::spawn(async move {
-                info!("🔄 [LIFECYCLE: CoreAudio forwarding task ENTER] Task started, holding CoreAudioStream");
-                use futures_util::StreamExt;
-                let mut stream = core_audio_stream;
-                let mut buffer = Vec::new();
-                let chunk_size = 1024;
-
-                loop {
-                    // Use tokio::select! to respond to drop signal immediately
-                    tokio::select! {
-                        // Check for drop signal (this branch will win immediately when signal is sent)
-                        _ = &mut drop_rx => {
-                            info!("🛑 [LIFECYCLE: CoreAudio forwarding task] Received drop signal via select!, exiting loop...");
-                            break;
-                        }
-                        // Poll the Core Audio stream
-                        maybe_sample = stream.next() => {
-                            match maybe_sample {
-                                Some(sample) => {
-                                    buffer.push(sample);
-                                    if buffer.len() >= chunk_size {
-                                        if tx.unbounded_send(buffer.clone()).is_err() {
-                                            info!("🛑 [LIFECYCLE: CoreAudio forwarding task] Channel closed, exiting...");
-                                            break;
-                                        }
-                                        buffer.clear();
-                                    }
+                        warn!("⚠️ Preferred backend ScreenCaptureKit failed: {}", e);
+                        if allow_fallback {
+                            info!("📦 Fallback enabled, trying CoreAudio...");
+                            match try_coreaudio() {
+                                Ok(stream) => {
+                                    info!("✅ Fallback to CoreAudio successful");
+                                    return Ok(stream);
                                 }
-                                None => {
-                                    info!("🛑 [LIFECYCLE: CoreAudio forwarding task] Stream ended (None), exiting...");
-                                    break;
+                                Err(e2) => {
+                                    return Err(anyhow::anyhow!(
+                                        "Both backends failed. SCK: {}, CoreAudio: {}",
+                                        e,
+                                        e2
+                                    ));
                                 }
                             }
+                        } else {
+                            info!("❌ Fallback disabled, not trying other backends");
+                            return Err(e);
                         }
                     }
-                }
-
-                // Send any remaining samples
-                if !buffer.is_empty() {
-                    let _ = tx.unbounded_send(buffer);
-                }
-                info!("🛑 [LIFECYCLE: CoreAudio forwarding task EXIT] Task ended, dropping CoreAudioStream...");
-                // CoreAudioStream will be dropped here when `stream` goes out of scope
-            });
-
-            let receiver = rx.map(futures_util::stream::iter).flatten();
-
-            info!("✅ Core Audio Process Tap started successfully");
-
-            Ok(SystemAudioStream {
-                drop_tx: Some(drop_tx),
-                sample_rate,
-                receiver: Box::pin(receiver),
-                _keep_alive: None,
-            })
+                },
+                AudioBackend::CoreAudio => match try_coreaudio() {
+                    Ok(stream) => {
+                        info!("✅ Using preferred backend: CoreAudio");
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Preferred backend CoreAudio failed: {}", e);
+                        if allow_fallback {
+                            info!("📦 Fallback enabled, trying ScreenCaptureKit...");
+                            match try_screencapturekit().await {
+                                Ok(stream) => {
+                                    info!("✅ Fallback to ScreenCaptureKit successful");
+                                    return Ok(stream);
+                                }
+                                Err(e2) => {
+                                    return Err(anyhow::anyhow!(
+                                        "Both backends failed. CoreAudio: {}, SCK: {}",
+                                        e,
+                                        e2
+                                    ));
+                                }
+                            }
+                        } else {
+                            info!("❌ Fallback disabled, not trying other backends");
+                            return Err(e);
+                        }
+                    }
+                },
+            }
         }
 
         #[cfg(not(target_os = "macos"))]

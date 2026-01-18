@@ -161,6 +161,7 @@ dependencies = [
  "chrono",
  "cidre",
  "cpal",
+ "dirs",
  "ebur128",
  "env_logger",
  "futures-channel",
