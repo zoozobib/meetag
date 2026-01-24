@@ -1,4 +1,4 @@
-# Meetily Rec (Tauri Edition)
+# Meetag Rec (Tauri Edition)
 
 <div align="center">
 
