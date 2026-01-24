@@ -245,62 +245,116 @@ fn send_audio_to_asr(
         denoise_result.rms_before, denoise_result.rms_after, denoise_result.noise_reduction_db
     );
 
-    // Use whisper-rs directly instead of HTTP call
-    let whisper = crate::whisper::WhisperManager::get();
+    // Check backend setting
+    let backend = crate::settings::SETTINGS.read().unwrap().asr.backend;
 
-    // Transcribe with Chinese language and meeting context prompt
-    let initial_prompt = "这是一段会议记录，请使用规范的书面语进行转写。";
+    match backend {
+        crate::settings::AsrBackend::FunAsr => {
+            // Use FunASR (SenseVoice)
+            if !crate::funasr::SenseVoiceManager::is_initialized() {
+                eprintln!("❌ [ASR] FunASR selected but not initialized!");
+                return;
+            }
+            let funasr = crate::funasr::SenseVoiceManager::get();
+            match funasr.transcribe(&denoised_i16) {
+                Ok(result) => {
+                    let t = result.text.trim();
+                    if !t.is_empty() {
+                        // Text Post-processing (Blacklist/Repetition)
+                        if crate::text_filter::is_hallucination(t) {
+                            println!("🗑️ Discarding hallucination: {:?}", t);
+                        } else {
+                            let payload = serde_json::json!({
+                                "text": t,
+                                "source": source
+                            });
+                            let _ = app.emit("asr_final", payload.to_string());
 
-    match whisper.transcribe(&denoised_i16, "zh", Some(initial_prompt)) {
-        Ok(result) => {
-            // Check if any segment has low confidence (avg_logprob < -1.0)
-            let is_reliable = result.segments.iter().all(|seg| {
-                if seg.avg_logprob < -1.0 {
-                    eprintln!(
-                        "⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}",
-                        seg.avg_logprob, seg.text
-                    );
-                    false
-                } else {
-                    true
-                }
-            });
-
-            if is_reliable {
-                let t = result.text.trim();
-                if !t.is_empty() {
-                    // Text Post-processing (Blacklist/Repetition)
-                    if crate::text_filter::is_hallucination(t) {
-                        println!("🗑️ Discarding hallucination: {:?}", t);
-                    } else {
-                        let payload = serde_json::json!({
-                            "text": t,
-                            "source": source
-                        });
-                        let _ = app.emit("asr_final", payload.to_string());
-
-                        // LOGGING: Append to transcript.jsonl
-                        let entry = serde_json::json!({
-                            "timestamp": std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis(),
-                            "speaker": source,
-                            "text": t,
-                            "inference_time_ms": result.inference_time_ms
-                        });
-                        if let Ok(line) = serde_json::to_string(&entry) {
-                            use std::io::Write;
-                            if let Ok(mut w) = transcript_writer.lock() {
-                                let _ = writeln!(w, "{}", line);
+                            // LOGGING: Append to transcript.jsonl
+                            let entry = serde_json::json!({
+                                "timestamp": std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis(),
+                                "speaker": source,
+                                "text": t,
+                                "inference_time_ms": result.inference_time_ms,
+                                "backend": "funasr"
+                            });
+                            if let Ok(line) = serde_json::to_string(&entry) {
+                                use std::io::Write;
+                                if let Ok(mut w) = transcript_writer.lock() {
+                                    let _ = writeln!(w, "{}", line);
+                                }
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    eprintln!("❌ [FUNASR] Transcription error: {}", e);
+                }
             }
         }
-        Err(e) => {
-            eprintln!("❌ [WHISPER] Transcription error: {}", e);
+        crate::settings::AsrBackend::Whisper => {
+            // Use whisper-rs directly instead of HTTP call
+            let whisper = crate::whisper::WhisperManager::get();
+
+            // Transcribe with Chinese language and meeting context prompt
+            let initial_prompt = "这是一段会议记录，请使用规范的书面语进行转写。";
+
+            match whisper.transcribe(&denoised_i16, "zh", Some(initial_prompt)) {
+                Ok(result) => {
+                    // Check if any segment has low confidence (avg_logprob < -1.0)
+                    let is_reliable = result.segments.iter().all(|seg| {
+                        if seg.avg_logprob < -1.0 {
+                            eprintln!(
+                                "⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}",
+                                seg.avg_logprob, seg.text
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    if is_reliable {
+                        let t = result.text.trim();
+                        if !t.is_empty() {
+                            // Text Post-processing (Blacklist/Repetition)
+                            if crate::text_filter::is_hallucination(t) {
+                                println!("🗑️ Discarding hallucination: {:?}", t);
+                            } else {
+                                let payload = serde_json::json!({
+                                    "text": t,
+                                    "source": source
+                                });
+                                let _ = app.emit("asr_final", payload.to_string());
+
+                                // LOGGING: Append to transcript.jsonl
+                                let entry = serde_json::json!({
+                                    "timestamp": std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis(),
+                                    "speaker": source,
+                                    "text": t,
+                                    "inference_time_ms": result.inference_time_ms,
+                                    "backend": "whisper"
+                                });
+                                if let Ok(line) = serde_json::to_string(&entry) {
+                                    use std::io::Write;
+                                    if let Ok(mut w) = transcript_writer.lock() {
+                                        let _ = writeln!(w, "{}", line);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ [WHISPER] Transcription error: {}", e);
+                }
+            }
         }
     }
 }

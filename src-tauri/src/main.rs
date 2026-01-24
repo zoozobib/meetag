@@ -21,6 +21,7 @@ mod tray;
 mod vad;
 mod wav;
 mod whisper;
+mod funasr;
 
 use crate::wav::WavWriter;
 use tauri::{Listener, Manager};
@@ -779,6 +780,20 @@ fn main() {
                     eprintln!("❌ Failed to initialize Whisper: {}", e);
                     // Continue anyway, transcription will fail gracefully
                 }
+
+                // Initialize FunASR (SenseVoice) model
+                // We use the same base resource folder
+                let resource_base = handle
+                     .path()
+                     .resolve("resources", tauri::path::BaseDirectory::Resource)
+                     .unwrap();
+                
+                println!("🚀 [MAIN] Initializing FunASR...");
+                if let Err(e) = crate::funasr::SenseVoiceManager::init(&resource_base) {
+                     eprintln!("⚠️ Failed to initialize FunASR: {}", e);
+                     eprintln!("   (This is expected if SenseVoice model files are not downloaded)");
+                }
+
             });
             Ok(())
         })

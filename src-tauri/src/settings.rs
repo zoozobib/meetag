@@ -38,6 +38,32 @@ impl std::fmt::Display for AudioBackend {
     }
 }
 
+/// ASR backend options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AsrBackend {
+    /// Whisper (whisper-rs with Metal + CoreML)
+    Whisper,
+    /// FunASR (SenseVoiceSmall via sherpa-rs with CPU)
+    FunAsr,
+}
+
+impl Default for AsrBackend {
+    fn default() -> Self {
+        // Default to Whisper for now as requested, but allow config to switch
+        AsrBackend::Whisper
+    }
+}
+
+impl std::fmt::Display for AsrBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsrBackend::Whisper => write!(f, "Whisper"),
+            AsrBackend::FunAsr => write!(f, "FunASR"),
+        }
+    }
+}
+
 /// Audio-related settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSettings {
@@ -69,6 +95,10 @@ pub struct AsrSettings {
     /// Language for speech recognition
     #[serde(default = "default_language")]
     pub language: String,
+
+    /// Selected ASR backend
+    #[serde(default)]
+    pub backend: AsrBackend,
 }
 
 fn default_language() -> String {
@@ -79,6 +109,7 @@ impl Default for AsrSettings {
     fn default() -> Self {
         Self {
             language: default_language(),
+            backend: AsrBackend::default(),
         }
     }
 }
