@@ -74,10 +74,47 @@ pub struct AudioSettings {
     /// Whether to allow fallback to another backend if preferred fails
     #[serde(default = "default_true")]
     pub allow_fallback: bool,
+
+    /// VAD backend selection
+    #[serde(default)]
+    pub vad_backend: VadBackend,
+
+    /// VAD threshold (0.0 - 1.0)
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// VAD backend options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VadBackend {
+    /// WebRTC VAD (Fast, Standard)
+    WebRtc,
+    /// Silero VAD (High Accuracy, via ten-vad-rs)
+    Silero,
+}
+
+impl Default for VadBackend {
+    fn default() -> Self {
+        VadBackend::Silero
+    }
+}
+
+impl std::fmt::Display for VadBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VadBackend::WebRtc => write!(f, "WebRTC"),
+            VadBackend::Silero => write!(f, "Silero (TEN)"),
+        }
+    }
+}
+
+fn default_vad_threshold() -> f32 {
+    0.5
 }
 
 impl Default for AudioSettings {
@@ -85,6 +122,8 @@ impl Default for AudioSettings {
         Self {
             preferred_backend: AudioBackend::default(),
             allow_fallback: true,
+            vad_backend: VadBackend::default(),
+            vad_threshold: default_vad_threshold(),
         }
     }
 }
@@ -175,6 +214,16 @@ impl Settings {
                         settings.audio.allow_fallback
                     );
                     info!("📁 [SETTINGS]   asr.language: {}", settings.asr.language);
+
+                    // Force save to ensure file on disk is updated with new schema fields
+                    // (Migration for existing users who lack new fields like vad_backend)
+                    if let Err(e) = settings.save() {
+                        warn!(
+                            "📁 [SETTINGS] Failed to migrate/update settings file: {}",
+                            e
+                        );
+                    }
+
                     settings
                 }
                 Err(e) => {

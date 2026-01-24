@@ -27,6 +27,7 @@
     "targets": "all",
     "resources": [
       "resources/ggml-small.bin",
+      "resources/silero_vad.onnx",
       "resources/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx",
       "resources/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt",
       "libonnxruntime.1.17.1.dylib",

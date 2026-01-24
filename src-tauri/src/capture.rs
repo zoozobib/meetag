@@ -1,10 +1,9 @@
-use crate::vad::SendVad;
+use crate::vad::VadEngine;
 use crate::wav::WavWriter;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use webrtc_vad::{Vad, VadMode};
 
 // =====================
 // Helper: Find best input device (prioritize external)
@@ -109,10 +108,8 @@ pub fn start_mic_stream(
     // ASR-ready track: 16kHz mono PCM16
     writer_asr.lock().unwrap().init_pcm16(16_000, 1)?;
 
-    let mut vad_wrapper = Arc::new(Mutex::new(SendVad(Vad::new_with_rate_and_mode(
-        webrtc_vad::SampleRate::Rate16kHz,
-        VadMode::VeryAggressive,
-    ))));
+    let mut vad_wrapper: Arc<Mutex<Box<dyn VadEngine>>> =
+        Arc::new(Mutex::new(Box::new(crate::vad::WebRtcVadWrapper::new())));
     let mut vad_buf: Vec<i16> = Vec::with_capacity(320 * 10); // buffer for VAD
     let mut speech_hold_frames = 0; // for short "hangover" after speech
 
@@ -258,7 +255,7 @@ pub fn start_mic_stream(
                     let mut is_speech_now = false;
                     while vad_buf.len() >= 320 {
                         let frame: Vec<i16> = vad_buf.drain(0..320).collect();
-                        if let Ok(true) = vad_wrapper.lock().unwrap().0.is_voice_segment(&frame) {
+                        if let Ok(true) = vad_wrapper.lock().unwrap().is_voice_segment(&frame) {
                             is_speech_now = true;
                             speech_hold_frames = 20; // Hold 'speech' state for ~400ms (20 * 20ms)
                         } else {

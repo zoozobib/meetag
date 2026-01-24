@@ -18,10 +18,29 @@ pub fn realtime_inference_worker(
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    // Strict Dynamic VAD Parameters
-    // We use WebRTC VAD (very aggressive) instead of simple RMS
-    let mut vad =
-        Vad::new_with_rate_and_mode(webrtc_vad::SampleRate::Rate16kHz, VadMode::VeryAggressive);
+    // VAD Initialization
+    // We use the configured VAD backend (WebRTC or Silero/TEN)
+    let settings = crate::settings::SETTINGS.read().unwrap().audio.clone();
+    let vad_backend = settings.vad_backend;
+    let vad_threshold = settings.vad_threshold;
+
+    let mut vad: Box<dyn crate::vad::VadEngine> =
+        match crate::vad::create_vad(&app, vad_backend, vad_threshold) {
+            Ok(v) => {
+                println!("✅ [ASR] Initialized VAD backend: {}", vad_backend);
+                v
+            }
+            Err(e) => {
+                eprintln!(
+                    "❌ [ASR] Failed to init VAD backend {:?}: {}",
+                    vad_backend, e
+                );
+                eprintln!("⚠️ [ASR] Fallback to WebRTC VAD");
+                Box::new(crate::vad::WebRtcVadWrapper::new())
+            }
+        };
+
+    // Frame size: WebRTC likes 10/20/30ms. TenVad is flexible but 20ms (320 samples) is safe for both.
     let vad_frame_size = 320; // 20ms @ 16kHz
     let mut vad_accum: Vec<i16> = Vec::with_capacity(vad_frame_size);
 
