@@ -1,3 +1,3 @@
 src-tauri/bin/whisper-server-aarch64-apple-darwin
-src-tauri/resources/ggml-small.bin
+src-tauri/resources/
 src-tauri/target/

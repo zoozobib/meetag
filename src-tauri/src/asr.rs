@@ -262,7 +262,7 @@ fn send_audio_to_asr(
                     if !t.is_empty() {
                         // Text Post-processing (Blacklist/Repetition)
                         if crate::text_filter::is_hallucination(t) {
-                            println!("🗑️ Discarding hallucination: {:?}", t);
+                            println!("🗑️ [FunASR] Discarding hallucination: {:?}", t);
                         } else {
                             let payload = serde_json::json!({
                                 "text": t,
@@ -322,7 +322,7 @@ fn send_audio_to_asr(
                         if !t.is_empty() {
                             // Text Post-processing (Blacklist/Repetition)
                             if crate::text_filter::is_hallucination(t) {
-                                println!("🗑️ Discarding hallucination: {:?}", t);
+                                println!("🗑️ [Whisper] Discarding hallucination: {:?}", t);
                             } else {
                                 let payload = serde_json::json!({
                                     "text": t,

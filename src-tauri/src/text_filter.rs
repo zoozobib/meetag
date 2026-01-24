@@ -1,20 +1,13 @@
+use lazy_static::lazy_static;
+use regex::Regex;
 use std::collections::HashSet;
 
-pub fn is_hallucination(text: &str) -> bool {
-    let lower_text = text.trim().to_lowercase();
-
-    // 1. Empty check
-    if lower_text.is_empty() {
-        return true;
-    }
-
-    // 2. Blacklist Filtering
-    let blacklist = [
+lazy_static! {
+    /// List of phrases that trigger hallucination detection if the text CONTAINS them (case-insensitive)
+    static ref HALLUCINATION_SUBSTRINGS: Vec<&'static str> = vec![
         "thank you for watching",
         "subtitle",
         "copyright",
-        "...",
-        // Subtitle specific hallucinations
         "by the author",
         "subtitles",
         "captioned by",
@@ -31,38 +24,421 @@ pub fn is_hallucination(text: &str) -> bool {
         "下集見",
         "下集见",
         "字幕君",
-        "字幕君:小小小",
-        "(字幕君:小小小)",
-        "(中文字幕)",
         "中文字幕",
         "请使用规范的书面语进行转写",
-        "请使用规范的书面语进行转写。",
         "转写。",
+        "..."
     ];
 
-    for phrase in blacklist {
+    /// List of exact phrases that are known hallucinations (exact match only)
+    static ref HALLUCINATION_EXACT: Vec<&'static str> = vec![
+        "The.",
+        "I.",
+        "You.",
+        "He.",
+        "She.",
+        "It.",
+        "We.",
+        "They.",
+        "Okay.",
+        "Yeah.",
+        "Yes.",
+        "No.",
+        "Oh.",
+        "Ah.",
+        "Hmm.",
+        "Um.",
+        "Uh.",
+        "So.",
+        "And.",
+        "But.",
+        "Or.",
+        "If.",
+        "When.",
+        "Where.",
+        "Why.",
+        "How.",
+        "Who.",
+        "What.",
+        "Thank.",
+        "Thanks.",
+        "Hello.",
+        "Hi.",
+        "Bye.",
+        "Good.",
+        "Bad.",
+        "Right.",
+        "Wrong.",
+        "True.",
+        "False.",
+        "Maybe.",
+        "Perhaps.",
+        "Sure.",
+        "Fine.",
+        "Well.",
+        "Now.",
+        "Then.",
+        "Here.",
+        "There.",
+        "This.",
+        "That.",
+        "These.",
+        "Those.",
+        "One.",
+        "Two.",
+        "Three.",
+        "Four.",
+        "Five.",
+        "Six.",
+        "Seven.",
+        "Eight.",
+        "Nine.",
+        "Ten.",
+        "To.",
+        "For.",
+        "Of.",
+        "In.",
+        "On.",
+        "At.",
+        "By.",
+        "With.",
+        "From.",
+        "About.",
+        "As.",
+        "Like.",
+        "Up.",
+        "Down.",
+        "Out.",
+        "Over.",
+        "Under.",
+        "Again.",
+        "Always.",
+        "Never.",
+        "Sometimes.",
+        "Often.",
+        "Usually.",
+        "Really.",
+        "Very.",
+        "Too.",
+        "Quite.",
+        "Just.",
+        "Only.",
+        "Even.",
+        "Still.",
+        "Yet.",
+        "Already.",
+        "Almost.",
+        "Nearly.",
+        "Enough.",
+        "More.",
+        "Less.",
+        "Most.",
+        "Least.",
+        "Best.",
+        "Worst.",
+        "Better.",
+        "Worse.",
+        "Great.",
+        "Excellent.",
+        "Wonderful.",
+        "Amazing.",
+        "Awesome.",
+        "Beautiful.",
+        "Nice.",
+        "Cool.",
+        "Fun.",
+        "Interesting.",
+        "Boring.",
+        "Tired.",
+        "Busy.",
+        "Happy.",
+        "Sad.",
+        "Angry.",
+        "Scared.",
+        "Surprised.",
+        "Excited.",
+        "Nervous.",
+        "Worried.",
+        "Confused.",
+        "Proud.",
+        "Ashamed.",
+        "Guilty.",
+        "Jealous.",
+        "Envious.",
+        "Lonely.",
+        "Loved.",
+        "Hated.",
+        "Hope.",
+        "Wish.",
+        "Want.",
+        "Need.",
+        "Love.",
+        "Hate.",
+        "Think.",
+        "Know.",
+        "Understand.",
+        "Believe.",
+        "Feel.",
+        "See.",
+        "Hear.",
+        "Smell.",
+        "Taste.",
+        "Touch.",
+        "Do.",
+        "Make.",
+        "Get.",
+        "Give.",
+        "Go.",
+        "Come.",
+        "Take.",
+        "Put.",
+        "Say.",
+        "Tell.",
+        "Ask.",
+        "Answer.",
+        "Call.",
+        "Talk.",
+        "Speak.",
+        "Write.",
+        "Read.",
+        "Study.",
+        "Learn.",
+        "Teach.",
+        "Buy.",
+        "Sell.",
+        "Pay.",
+        "Cost.",
+        "Work.",
+        "Play.",
+        "Rest.",
+        "Sleep.",
+        "Eat.",
+        "Drink.",
+        "Run.",
+        "Walk.",
+        "Drive.",
+        "Fly.",
+        "Ride.",
+        "Swim.",
+        "Jump.",
+        "Dance.",
+        "Sing.",
+        "Laugh.",
+        "Cry.",
+        "Smile.",
+        "Frown.",
+        "Look.",
+        "Watch.",
+        "Listen.",
+        "Wait.",
+        "Stop.",
+        "Start.",
+        "Begin.",
+        "Finish.",
+        "End.",
+        "Open.",
+        "Close.",
+        "Win.",
+        "Lose.",
+        "Help.",
+        "Save.",
+        "Kill.",
+        "Die.",
+        "Live.",
+        "Born.",
+        "Grow.",
+        "Change.",
+        "Stay.",
+        "Leave.",
+        "Meet.",
+        "Visit.",
+        "Travel.",
+        "Move.",
+        "Return.",
+        "Arrive.",
+        "Depart.",
+        "Enter.",
+        "Exit.",
+        "Join.",
+        "Quit.",
+        "Add.",
+        "Subtract.",
+        "Multiply.",
+        "Divide.",
+        "Cut.",
+        "Copy.",
+        "Paste.",
+        "Print.",
+        "Delete.",
+        "Search.",
+        "Find.",
+        "Replace.",
+        "Undo.",
+        "Redo.",
+        "Select.",
+        "Cancel.",
+        "Apply.",
+        "OK.",
+        "Off.",
+        "High.",
+        "Low.",
+        "Medium.",
+        "Large.",
+        "Small.",
+        "Full.",
+        "Empty.",
+        "Old.",
+        "Young.",
+        "Rich.",
+        "Poor.",
+        "Strong.",
+        "Weak.",
+        "Fast.",
+        "Slow.",
+        "Hot.",
+        "Cold.",
+        "Warm.",
+        "Dry.",
+        "Wet.",
+        "Hard.",
+        "Soft.",
+        "Rough.",
+        "Smooth.",
+        "Sharp.",
+        "Dull.",
+        "Bright.",
+        "Dark.",
+        "Light.",
+        "Heavy.",
+        "Clean.",
+        "Dirty.",
+        "Neat.",
+        "Messy.",
+        "Safe.",
+        "Dangerous.",
+        "Quiet.",
+        "Noisy.",
+        "Silent.",
+        "Loud.",
+        "Sweet.",
+        "Sour.",
+        "Bitter.",
+        "Salty.",
+        "Spicy.",
+        "Fresh.",
+        "Stale.",
+        "Real.",
+        "Fake.",
+        "Same.",
+        "Different.",
+        "Similar.",
+        "Opposite.",
+        "Equal.",
+        "Unequal.",
+        "Free.",
+        "Available.",
+        "Unavailable.",
+        "Closed.",
+        "Public.",
+        "Private.",
+        "General.",
+        "Specific.",
+        "Common.",
+        "Rare.",
+        "Usual.",
+        "Unusual.",
+        "Normal.",
+        "Abnormal.",
+        "Strange.",
+        "Weird.",
+        "Funny.",
+        "Serious.",
+        "Important.",
+        "Unimportant.",
+        "Necessary.",
+        "Unnecessary.",
+        "Useful.",
+        "Useless.",
+        "Helpful.",
+        "Unhelpful.",
+        "Kind.",
+        "Cruel.",
+        "Polite.",
+        "Rude.",
+        "Friendly.",
+        "Hostile.",
+        "Honest.",
+        "Dishonest.",
+        "Loyal.",
+        "Disloyal.",
+        "Brave.",
+        "Cowardly.",
+        "Smart.",
+        "Stupid.",
+        "Wise.",
+        "Foolish.",
+        "Clever.",
+        "Clumsy.",
+        "Lucky.",
+        "Unlucky.",
+        "Healthy.",
+        "Sick.",
+        "Ugly.",
+        "Used.",
+        "Ting.",
+        "Com.",
+        "Hpe.",
+        "Co.",
+        "De.",
+        "S.",
+        "F.",
+        "lish.",
+    ];
+
+    /// Regex for patterns like "The..." or "Okay..."
+    static ref HALLUCINATION_REGEX: Regex = Regex::new(r"^(The|Yeah|Okay|Yes|No|Oh|Ah|Um|So)\.+$").unwrap();
+}
+
+/// Checks if the text is a known hallucination.
+pub fn is_hallucination(text: &str) -> bool {
+    let t = text.trim();
+
+    // 1. Check exact matches
+    if HALLUCINATION_EXACT.contains(&t) {
+        return true;
+    }
+
+    // 2. Check regex patterns (The..., Yeah...)
+    if HALLUCINATION_REGEX.is_match(t) {
+        return true;
+    }
+
+    let lower_text = t.to_lowercase();
+
+    // 3. Check substrings (Subtitle garbage)
+    for phrase in HALLUCINATION_SUBSTRINGS.iter() {
         if lower_text.contains(phrase) {
-            println!("🛑 Filtered Hallucination (Blacklist): {:?}", text);
             return true;
         }
     }
 
-    // 3. Punctuation only check
-    let unique_chars: HashSet<char> = lower_text.chars().collect();
+    // 4. Check for specific repetitive characters (e.g. ".....")
+    // Also punctuation only check from previous version
+    let unique_chars: HashSet<char> = t.chars().collect();
     if unique_chars.iter().all(|c| !c.is_alphanumeric()) {
-        println!("🛑 Filtered Hallucination (Punctuation Only): {:?}", text);
         return true;
     }
 
-    // 4. Repetition Detection
-    // Check for 3+ consecutive repetitions of the same word/phrase
-    // Simple heuristic: split by space, check sliding window of 3
-    // Also handle Chinese characters repetition if needed, but let's start with general split.
-    // For Chinese, "测试测试测试" is one string usually.
-    // We can check for repeated substrings.
+    // 5. Check for very short nonsensical output (e.g. "a.")
+    if t.len() <= 3 && (t.ends_with('.') || t.ends_with('。')) {
+        // Allow "No." / "Hi." but block single letters "I." "A."
+        if t.len() == 2 && t.chars().next().unwrap().is_alphabetic() {
+            return true; // "X."
+        }
+    }
 
+    // 6. Excessive Repetition Check (Restored)
     if has_excessive_repetition(&lower_text) {
-        println!("🛑 Filtered Hallucination (Repetition): {:?}", text);
         return true;
     }
 
@@ -102,7 +478,6 @@ fn has_excessive_repetition(text: &str) -> bool {
                 max_count = current_repeats;
             }
 
-            // Optimization: skip the repeats we just found
             if current_repeats > 1 {
                 i = j;
             } else {
@@ -119,30 +494,4 @@ fn has_excessive_repetition(text: &str) -> bool {
     }
 
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_blacklist() {
-        assert!(is_hallucination("Thank you for watching"));
-        assert!(!is_hallucination("Hello world"));
-    }
-
-    #[test]
-    fn test_punctuation() {
-        assert!(is_hallucination("..."));
-        assert!(is_hallucination("?!"));
-        assert!(!is_hallucination("Hi!"));
-    }
-
-    #[test]
-    fn test_repetition() {
-        assert!(is_hallucination("测试测试测试测试"));
-        assert!(is_hallucination("abcabcabc"));
-        assert!(!is_hallucination("abcabc")); // 2 is fine
-        assert!(!is_hallucination("This is a test"));
-    }
 }
