@@ -34,14 +34,12 @@
 
 ### 1. 环境准备
 *   Rust (最新的 stable 版本)
-*   Node.js & pnpm
 *   Tauri CLI (`cargo install tauri-cli`)
 
 ### 2. 克隆项目
 ```bash
 git clone https://github.com/your-repo/rec.git
 cd rec
-pnpm install
 ```
 
 ### 3. 下载模型文件 (关键!)
@@ -77,14 +75,14 @@ ollama run qwen2.5:7b  # 推荐使用通义千问或其他中文能力强的模�
 *会自动修复库路径并打开 App*
 ```bash
 cd src-tauri
-./build.sh --debug
+cargo tauri build --debug || ./build.sh --debug
 ```
 
 **发布构建 (Release)**:
 *生成可分发的 .dmg*
 ```bash
 cd src-tauri
-./build.sh
+cargo tauri build --release || ./build.sh
 ```
 
 ---
