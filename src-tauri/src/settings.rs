@@ -162,7 +162,7 @@ pub struct LlmSettings {
 }
 
 fn default_llm_model() -> String {
-    "qwen3:4b".to_string()
+    "qwen3:1.7b".to_string()
 }
 
 impl Default for LlmSettings {

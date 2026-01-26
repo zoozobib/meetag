@@ -30,11 +30,12 @@
 
 ## 🛠️ 本地部署与开发
 
-> ⚠️ **注意**: 本项目目前 **仅支持 Apple Silicon (M1/M2/M3)** 架构的 macOS 设备。
+> ⚠️ **注意**: 本项目目前 **仅支持 Apple Silicon (M1/M2/M3/M4)** 架构的 macOS 设备。
 
 ### 1. 环境准备
 *   Rust (最新的 stable 版本)
 *   Tauri CLI (`cargo install tauri-cli`)
+*   Ollama (https://ollama.com/)
 
 ### 2. 克隆项目
 ```bash
@@ -108,8 +109,8 @@ cargo tauri build --release || ./build.sh
   "llm": {
       // Ollama 的 API 地址
       "host": "http://localhost:11434",
-      // 使用的模型名称
-      "model": "qwen2.5:7b"
+      // 使用的模型名称,默认1.7b
+      "model": "qwen3:1.7b"
   }
 }
 ```
