@@ -87,7 +87,6 @@ fn load_runtime_config(filename: &str) -> PromptConfig {
 
 const OLLAMA_API_URL: &str = "http://localhost:11434/api/generate";
 // Default model, can be made configurable later
-const DEFAULT_MODEL: &str = "qwen3:4b";
 
 fn build_prompt(transcript_text: &str) -> String {
     // 1. Get Instructions
@@ -190,7 +189,7 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
     let prompt = build_prompt(&full_text);
 
     let request_body = OllamaRequest {
-        model: DEFAULT_MODEL.to_string(),
+        model: crate::settings::get_llm_settings().model,
         stream: false,
         options: OllamaOptions {
             num_ctx: 4096,

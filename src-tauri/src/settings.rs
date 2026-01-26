@@ -153,6 +153,26 @@ impl Default for AsrSettings {
     }
 }
 
+/// LLM-related settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmSettings {
+    /// Model name for summarization (e.g., "qwen3:4b")
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+}
+
+fn default_llm_model() -> String {
+    "qwen3:4b".to_string()
+}
+
+impl Default for LlmSettings {
+    fn default() -> Self {
+        Self {
+            model: default_llm_model(),
+        }
+    }
+}
+
 /// Root settings structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -163,6 +183,10 @@ pub struct Settings {
     /// ASR settings
     #[serde(default)]
     pub asr: AsrSettings,
+
+    /// LLM settings
+    #[serde(default)]
+    pub llm: LlmSettings,
 }
 
 impl Settings {
@@ -298,6 +322,11 @@ where
     let mut settings = SETTINGS.write().unwrap();
     updater(&mut settings);
     settings.save()
+}
+
+/// Get LLM settings
+pub fn get_llm_settings() -> LlmSettings {
+    SETTINGS.read().unwrap().llm.clone()
 }
 
 #[cfg(test)]
