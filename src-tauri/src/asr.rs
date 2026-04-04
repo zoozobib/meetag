@@ -1,7 +1,6 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use tauri::Emitter;
-use webrtc_vad::{Vad, VadMode};
 
 use crate::text_filter;
 
@@ -235,9 +234,25 @@ pub fn realtime_inference_worker(
 fn send_audio_to_asr(
     app: &tauri::AppHandle,
     samples: &[i16],
-    source: &str,
+    _source: &str,
     transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
 ) {
+    // 1. SPEAKER DIARIZATION
+    // Extract speaker identity before noise reduction or after?
+    // Usually, embedding models are trained on cleaner audio, but some are robust.
+    // We'll extract it from the original samples to avoid artifacts from RNNoise.
+    let speaker_label = match crate::diarization::SpeakerExtractor::get().extract_embedding(samples)
+    {
+        Ok(emb) => {
+            let label = crate::diarization::DiarizationEngine::get().label_embedding(&emb, 0.75);
+            format!("Speaker {}", label + 1)
+        }
+        Err(e) => {
+            eprintln!("⚠️ [DIARIZATION] Embedding extraction failed: {}", e);
+            "Unknown".to_string()
+        }
+    };
+
     // Add 300ms silence padding to end (Post-roll) to help ASR complete the last word
     let mut padded = Vec::with_capacity(samples.len() + 4800);
     padded.extend_from_slice(samples);
@@ -285,7 +300,7 @@ fn send_audio_to_asr(
                         } else {
                             let payload = serde_json::json!({
                                 "text": t,
-                                "source": source
+                                "source": speaker_label,
                             });
                             let _ = app.emit("asr_final", payload.to_string());
 
@@ -295,7 +310,7 @@ fn send_audio_to_asr(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
                                     .as_millis(),
-                                "speaker": source,
+                                "speaker": speaker_label,
                                 "text": t,
                                 "inference_time_ms": result.inference_time_ms,
                                 "backend": "funasr"
@@ -345,7 +360,7 @@ fn send_audio_to_asr(
                             } else {
                                 let payload = serde_json::json!({
                                     "text": t,
-                                    "source": source
+                                    "source": speaker_label,
                                 });
                                 let _ = app.emit("asr_final", payload.to_string());
 
@@ -355,7 +370,7 @@ fn send_audio_to_asr(
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap()
                                         .as_millis(),
-                                    "speaker": source,
+                                    "speaker": speaker_label,
                                     "text": t,
                                     "inference_time_ms": result.inference_time_ms,
                                     "backend": "whisper"

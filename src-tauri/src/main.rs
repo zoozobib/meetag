@@ -22,6 +22,7 @@ mod vad;
 mod wav;
 mod whisper;
 mod funasr;
+mod diarization;
 
 use crate::wav::WavWriter;
 use tauri::{Listener, Manager};
@@ -788,12 +789,19 @@ fn main() {
                      .resolve("resources", tauri::path::BaseDirectory::Resource)
                      .unwrap();
                 
-                println!("🚀 [MAIN] Initializing FunASR...");
+               println!("🚀 [MAIN] Initializing FunASR...");
                 if let Err(e) = crate::funasr::SenseVoiceManager::init(&resource_base) {
                      eprintln!("⚠️ Failed to initialize FunASR: {}", e);
                      eprintln!("   (This is expected if SenseVoice model files are not downloaded)");
                 }
 
+                // Initialize Speaker Embedding model
+                println!("🎙️ [MAIN] Initializing Speaker Embedding model...");
+                let speaker_model_path = resource_base.join("speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx");
+                if let Err(e) = crate::diarization::SpeakerExtractor::init(&speaker_model_path) {
+                    eprintln!("⚠️ Failed to initialize SpeakerExtractor: {}", e);
+                    eprintln!("   (Check if model exists at: {})", speaker_model_path.display());
+                }
             });
             Ok(())
         })

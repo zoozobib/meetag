@@ -1,6 +1,22 @@
 #!/bin/bash
 set -e
 
+# ==============================================================================
+# Environment Fix: Ensure correct libclang for Apple Silicon (arm64)
+# ==============================================================================
+if [[ "$(uname)" == "Darwin" ]]; then
+    # Check if we are on Apple Silicon
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        # Prefer Homebrew's arm64 LLVM path over the Intel /usr/local path
+        if [ -d "/opt/homebrew/opt/llvm/lib" ]; then
+            export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
+            echo "🛠️  Set LIBCLANG_PATH to /opt/homebrew/opt/llvm/lib (Apple Silicon)"
+        elif [ -z "$LIBCLANG_PATH" ]; then
+            echo "⚠️  Warning: libclang not found in /opt/homebrew. Please run 'brew install llvm'"
+        fi
+    fi
+fi
+
 # Default to release mode
 BUILD_MODE="release"
 TAURI_FLAG=""
