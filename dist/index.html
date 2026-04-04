@@ -1117,7 +1117,7 @@
 
             const isUser = source === 'user';
             const alignClass = isUser ? 'user' : 'system';
-            const label = isUser ? 'Me' : 'Speaker';
+            const label = isUser ? 'Me' : source;
 
             const html = `
                 <div class="log-entry ${alignClass}">
