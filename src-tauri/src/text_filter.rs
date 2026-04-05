@@ -485,8 +485,8 @@ fn has_excessive_repetition(text: &str) -> bool {
             }
         }
 
-        // Threshold: 3 repeats for longer patterns, 4 for single chars
-        let threshold = if pat_len == 1 { 4 } else { 3 };
+        // Threshold: 6 repeats for single chars, 4 for longer patterns
+        let threshold = if pat_len == 1 { 6 } else { 4 };
 
         if max_count >= threshold {
             return true;

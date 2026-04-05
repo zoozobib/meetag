@@ -244,7 +244,7 @@ fn send_audio_to_asr(
     let speaker_label = match crate::diarization::SpeakerExtractor::get().extract_embedding(samples)
     {
         Ok(emb) => {
-            let label = crate::diarization::DiarizationEngine::get().label_embedding(&emb, 0.75);
+            let label = crate::diarization::DiarizationEngine::get().label_embedding(&emb, 0.65);
             format!("Speaker {}", label + 1)
         }
         Err(e) => {

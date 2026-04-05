@@ -253,7 +253,7 @@ impl DiarizationEngine {
 
         if let Some(speaker_id) = best_speaker {
             if max_sim > threshold {
-                let learning_rate = 0.1f32;
+                let learning_rate = 0.05f32;
                 let centroid = &mut centroids[speaker_id];
                 for i in 0..centroid.len() {
                     centroid[i] =
