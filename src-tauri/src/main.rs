@@ -84,6 +84,12 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
         std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
 
+        // Clear speaker profiles from previous recording
+        // (EmbeddingManager accumulates state, so we reset between sessions)
+        if let Some(pipeline) = crate::diarization::DiarizationPipeline::try_get() {
+            pipeline.clear();
+        }
+
         let system_path = session_dir.join("system.wav");
         let mic_path = session_dir.join("mic.wav");
         let mic_asr_path = session_dir.join("mic_asr_16k_mono.wav");
@@ -795,12 +801,12 @@ fn main() {
                      eprintln!("   (This is expected if SenseVoice model files are not downloaded)");
                 }
 
-                // Initialize Speaker Embedding model
-                println!("🎙️ [MAIN] Initializing Speaker Embedding model...");
-                let speaker_model_path = resource_base.join("speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx");
-                if let Err(e) = crate::diarization::SpeakerExtractor::init(&speaker_model_path) {
-                    eprintln!("⚠️ Failed to initialize SpeakerExtractor: {}", e);
-                    eprintln!("   (Check if model exists at: {})", speaker_model_path.display());
+                // Initialize Speaker Diarization pipeline (streaming: EmbeddingExtractor + EmbeddingManager)
+                println!("🎙️ [MAIN] Initializing Speaker Diarization pipeline...");
+                let embedding_model = resource_base.join("speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx");
+                if let Err(e) = crate::diarization::DiarizationPipeline::init(&embedding_model, 0.38) {
+                    eprintln!("⚠️ Failed to initialize DiarizationPipeline: {}", e);
+                    eprintln!("   Embedding model: {}", embedding_model.display());
                 }
             });
             Ok(())

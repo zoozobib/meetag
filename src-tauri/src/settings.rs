@@ -82,10 +82,27 @@ pub struct AudioSettings {
     /// VAD threshold (0.0 - 1.0)
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
+
+    /// Speaker diarization similarity threshold (0.0 - 1.0).
+    /// Higher = more strict (creates more speakers), Lower = more lenient (merges speakers).
+    #[serde(default = "default_diarization_threshold")]
+    pub diarization_threshold: f32,
+
+    /// Maximum number of speakers to detect. Prevents fragmentation.
+    #[serde(default = "default_max_speakers")]
+    pub max_speakers: usize,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_diarization_threshold() -> f32 {
+    0.70
+}
+
+fn default_max_speakers() -> usize {
+    6
 }
 
 /// VAD backend options
@@ -124,6 +141,8 @@ impl Default for AudioSettings {
             allow_fallback: true,
             vad_backend: VadBackend::default(),
             vad_threshold: default_vad_threshold(),
+            diarization_threshold: default_diarization_threshold(),
+            max_speakers: default_max_speakers(),
         }
     }
 }

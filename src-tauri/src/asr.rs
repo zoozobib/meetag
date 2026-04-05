@@ -66,7 +66,8 @@ pub fn realtime_inference_worker(
     let mut silence_frames = 0;
     let mut speech_run_count = 0; // for debounce
     let mut speech_frames_count = 0; // Total speech frames in current buffer
-                                     // frame_accum removed, using vad_accum
+    let mut current_speaker = "Speaker 1".to_string();
+    // frame_accum removed, using vad_accum
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -173,16 +174,30 @@ pub fn realtime_inference_worker(
                             // Filter out low density (e.g. < 15% speech) if buffer is long enough (>2s)
                             if buf.len() > 32000 && density < 0.15 {
                                 println!(
-                                    "⚠️ Low speech density [{}]: {:.1}% (len={}ms) - Sending anyway to preserve latency",
-                                    source,
-                                    density * 100.0,
-                                    buf.len() / 16
+                                     "⚠️ Low speech density [{}]: {:.1}% (len={}ms) - Sending anyway to preserve latency",
+                                     source,
+                                     density * 100.0,
+                                     buf.len() / 16
+                                 );
+                                send_audio_to_asr(
+                                    &app,
+                                    &buf,
+                                    &source,
+                                    &transcript_writer,
+                                    &mut current_speaker,
+                                    density,
                                 );
-                                send_audio_to_asr(&app, &buf, &source, &transcript_writer);
                             } else {
                                 println!("🚀 Sending audio to ASR [{}](Condition 1: Silence Cut), density={:.1}%", source, density * 100.0);
                                 // 1000 samples ~ 60ms
-                                send_audio_to_asr(&app, &buf, &source, &transcript_writer);
+                                send_audio_to_asr(
+                                    &app,
+                                    &buf,
+                                    &source,
+                                    &transcript_writer,
+                                    &mut current_speaker,
+                                    density,
+                                );
                             }
                         }
                         buf.clear();
@@ -196,7 +211,18 @@ pub fn realtime_inference_worker(
                 // 2. Max Length (Force send at 5s)
                 if buf.len() >= max_len_samples {
                     if is_speaking {
-                        send_audio_to_asr(&app, &buf, &source, &transcript_writer);
+                        let total_frames_ml = buf.len() / 320;
+                        let density_ml = if total_frames_ml > 0 {
+                            speech_frames_count as f32 / total_frames_ml as f32
+                        } else { 0.0 };
+                        send_audio_to_asr(
+                            &app,
+                            &buf,
+                            &source,
+                            &transcript_writer,
+                            &mut current_speaker,
+                            density_ml,
+                        );
                     }
                     buf.clear();
                     is_speaking = false;
@@ -225,7 +251,18 @@ pub fn realtime_inference_worker(
 
     // Final flush
     if !buf.is_empty() && is_speaking {
-        send_audio_to_asr(&app, &buf, &source, &transcript_writer);
+        let total_frames_fl = buf.len() / 320;
+        let density_fl = if total_frames_fl > 0 {
+            speech_frames_count as f32 / total_frames_fl as f32
+        } else { 0.0 };
+        send_audio_to_asr(
+            &app,
+            &buf,
+            &source,
+            &transcript_writer,
+            &mut current_speaker,
+            density_fl,
+        );
     }
 
     Ok(())
@@ -234,22 +271,46 @@ pub fn realtime_inference_worker(
 fn send_audio_to_asr(
     app: &tauri::AppHandle,
     samples: &[i16],
-    _source: &str,
+    source: &str,
     transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    current_speaker: &mut String,
+    speech_density: f32,
 ) {
     // 1. SPEAKER DIARIZATION
-    // Extract speaker identity before noise reduction or after?
-    // Usually, embedding models are trained on cleaner audio, but some are robust.
-    // We'll extract it from the original samples to avoid artifacts from RNNoise.
-    let speaker_label = match crate::diarization::SpeakerExtractor::get().extract_embedding(samples)
-    {
-        Ok(emb) => {
-            let label = crate::diarization::DiarizationEngine::get().label_embedding(&emb, 0.65);
-            format!("Speaker {}", label + 1)
-        }
-        Err(e) => {
-            eprintln!("⚠️ [DIARIZATION] Embedding extraction failed: {}", e);
-            "Unknown".to_string()
+    //
+    // Strategy:
+    // - "user" (mic) channel: Always label as "Me" — the mic only captures the local user.
+    // - "system" channel: Use sherpa-onnx embedding + manager. The pipeline internally
+    //   handles low-density filtering and minimum-speech-for-new-speaker checks.
+    // - Short segments (<1s): Skip diarization, reuse last known speaker label.
+    let speaker_label = if source == "user" {
+        // Mic channel is always the local user
+        let label = "Me".to_string();
+        *current_speaker = label.clone();
+        label
+    } else if samples.len() < 16000 {
+        // Too short for reliable diarization (< 1.0s at 16kHz)
+        println!(
+            "⏩ [DIARIZATION] Segment too short ({:.1}s), reusing: {}",
+            samples.len() as f32 / 16000.0,
+            current_speaker
+        );
+        current_speaker.clone()
+    } else {
+        // System channel: use sherpa-onnx diarization pipeline with speech density info
+        match crate::diarization::DiarizationPipeline::get().identify_speaker_i16(samples, speech_density) {
+            Ok(label) => {
+                println!(
+                    "🎯 [DIARIZATION] {} -> {}",
+                    source, label
+                );
+                *current_speaker = label.clone();
+                label
+            }
+            Err(e) => {
+                eprintln!("⚠️ [DIARIZATION] Pipeline failed: {}, reusing: {}", e, current_speaker);
+                current_speaker.clone()
+            }
         }
     };
 
