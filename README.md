@@ -111,7 +111,9 @@ cargo tauri build --release || ./build.sh
     // 音频捕获后端: "sck" (ScreenCaptureKit) 或 "core_audio"
     "preferred_backend": "sck",
     // 允许自动降级
-    "allow_fallback": true
+    "allow_fallback": true,
+    // 说话人识别相似度阈值 (0.0 - 1.0)。越高越严格（产生更多说话人），越低越宽松（合并说话人）。
+    "diarization_threshold": 0.5
   },
   "asr": {
     // 识别语言
