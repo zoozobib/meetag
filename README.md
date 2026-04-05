@@ -59,10 +59,18 @@ cd rec
     *   下载地址: [HuggingFace ggml-base](https://huggingface.co/ggerganov/whisper.cpp)
     *   路径: `src-tauri/resources/ggml-small.bin` (或其他规格)
 
-#### B. 说话人识别模型 (Diarization)
-实现多说话人区分功能，需下载 CAM++ 模型：
-*   下载地址: [CAM++ ONNX Model](https://github.com/alibaba-damo-academy/3D-Speaker) (推荐使用 `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`)
-*   路径: `src-tauri/resources/speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`
+#### B. 说话人识别与分段模型 (Diarization & Segmentation)
+实现多说话人区分与精准分段功能，需下载以下模型：
+
+1.  **说话人特征提取 (CAM++)**
+    *   作用: 提取说话人唯一的身份特征向量（Embedding）。
+    *   下载地址: [CAM++ ONNX Model](https://github.com/alibaba-damo-academy/3D-Speaker) (推荐使用 `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`)
+    *   路径: `src-tauri/resources/speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`
+
+2.  **语音分段模型 (Pyannote Segmentation)**
+    *   作用: 精准检测说话人切换点，优化识别边界。
+    *   下载地址: [Pyannote Segmentation Model](https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.int8.onnx)
+    *   路径: `src-tauri/resources/segmentation/model.int8.onnx`
 
 #### C. 动态库 (Dependencies)
 确保 `src-tauri/` 根目录下存在以下库文件（已通过脚本自动处理，但手动开发需注意）：
