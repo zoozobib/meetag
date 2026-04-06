@@ -1263,15 +1263,13 @@
 
         // Helper to format transcript items for Detail View
         function renderTranscriptItem(item) {
+            if (!item) return '';
             let text = item.text || "";
-            let source = item.source || 'system';
-            const isUser = source === 'user';
+            // Use 'speaker' for history files, 'source' for real-time events
+            let source = item.speaker || item.source || 'system';
+            const isUser = source === 'user' || source === 'Me';
             const alignClass = isUser ? 'user' : 'system';
-            const label = isUser ? 'Me' : 'Speaker';
-
-            // We don't have exact timestamp in transcript unless saved. 
-            // The JSONL currently saves {text, source}. 
-            // We can fake it or omit it. Let's omit or generic.
+            const label = isUser ? 'Me' : (typeof source === 'string' ? source : 'Speaker');
 
             return `
                 <div class="log-entry ${alignClass}">

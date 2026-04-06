@@ -181,13 +181,17 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
     use std::io::BufRead;
 
     let mut full_text = String::new();
-    for line in reader.lines() {
+   for line in reader.lines() {
         let line = line?;
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
+            // Extract both speaker and text
+            if let (Some(spk), Some(text)) = (
+                val.get("speaker").and_then(|v| v.as_str()),
+                val.get("text").and_then(|v| v.as_str()),
+            ) {
                 if !text.trim().is_empty() {
-                    full_text.push_str(text);
-                    full_text.push('\n');
+                    // Format as "[Speaker]: Text" so the LLM can distinguish participants
+                    full_text.push_str(&format!("{}: {}\n", spk, text));
                 }
             }
         }
