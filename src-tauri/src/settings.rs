@@ -172,12 +172,53 @@ impl Default for AsrSettings {
     }
 }
 
+/// LLM backend options
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmBackend {
+    /// Local Ollama instance
+    Ollama,
+    /// OpenAI-compatible cloud API
+    OpenAi,
+}
+
+impl Default for LlmBackend {
+    fn default() -> Self {
+        LlmBackend::Ollama
+    }
+}
+
+impl std::fmt::Display for LlmBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmBackend::Ollama => write!(f, "Ollama"),
+            LlmBackend::OpenAi => write!(f, "OpenAI"),
+        }
+    }
+}
+
 /// LLM-related settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSettings {
-    /// Model name for summarization (e.g., "qwen3:4b")
+    /// Selected LLM backend
+    #[serde(default)]
+    pub backend: LlmBackend,
+
+    /// Model name for summarization (e.g., "qwen3:4b" or "gpt-4o")
     #[serde(default = "default_llm_model")]
     pub model: String,
+
+    /// API key for cloud LLMs (OpenAI compatible)
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Custom API base URL for cloud LLMs (e.g., "https://api.openai.com/v1")
+    #[serde(default = "default_api_base")]
+    pub api_base: String,
+}
+
+fn default_api_base() -> String {
+    "https://api.openai.com/v1".to_string()
 }
 
 fn default_llm_model() -> String {
@@ -187,7 +228,10 @@ fn default_llm_model() -> String {
 impl Default for LlmSettings {
     fn default() -> Self {
         Self {
+            backend: LlmBackend::default(),
             model: default_llm_model(),
+            api_key: "".to_string(),
+            api_base: default_api_base(),
         }
     }
 }

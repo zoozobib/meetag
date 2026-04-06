@@ -17,7 +17,6 @@ struct OllamaOptions {
     presence_penalty: f64,
     top_k: i32,
     top_p: f64,
-    // num_predict: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,7 +30,28 @@ struct OllamaRequest {
 #[derive(Debug, Deserialize)]
 struct OllamaResponse {
     response: String,
-    // we ignore other fields like done, context, etc.
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OpenAiMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,7 +171,6 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
     }
 
     // 2. Load transcript
-    // We reuse logic similar to history::get_session_detail, but we just want raw text for LLM
     let transcript_path = session_dir.join("transcript.jsonl");
     if !transcript_path.exists() {
         anyhow::bail!("Transcript file not found");
@@ -165,14 +184,8 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
     for line in reader.lines() {
         let line = line?;
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            // Assume format: {"text": "...", "speaker": "...", "timestamp": ...}
-            // We'll format it as "[Speaker] Text"
             if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
                 if !text.trim().is_empty() {
-                    // Optional: timestamp
-                    // let ts = val.get("timestamp_start").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    // let spk = val.get("speaker").and_then(|v| v.as_str()).unwrap_or("Unknown");
-                    // full_text.push_str(&format!("[{:.1}s] {}: {}\n", ts, spk, text));
                     full_text.push_str(text);
                     full_text.push('\n');
                 }
@@ -184,42 +197,93 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
         anyhow::bail!("Transcript is empty");
     }
 
-    // 3. Call Ollama
+    // 3. Call LLM
+    let settings = crate::settings::get_llm_settings();
     let client = reqwest::Client::new();
     let prompt = build_prompt(&full_text);
 
-    let request_body = OllamaRequest {
-        model: crate::settings::get_llm_settings().model,
-        stream: false,
-        options: OllamaOptions {
-            num_ctx: 4096,
-            // num_predict: 256,
-            temperature: 0.7,
-            top_p: 0.8,
-            top_k: 20,
-            presence_penalty: 1.5,
-        },
-        prompt,
-    };
+    println!("🔍 [LLM Debug] Backend: {}, Model: {}", settings.backend, settings.model);
 
-    let res = client
-        .post(OLLAMA_API_URL)
-        .json(&request_body)
-        .send()
-        .await
-        .context("Failed to connect to Ollama. Is it running at localhost:11434?")?;
+    match settings.backend {
+        crate::settings::LlmBackend::OpenAi => {
+            let url = format!("{}/chat/completions", settings.api_base.trim_end_matches('/'));
+            println!("🌐 [LLM Debug] Requesting OpenAI-compatible API at: {}", url);
+            
+            let request_body = OpenAiRequest {
+                model: settings.model.clone(),
+                messages: vec![OpenAiMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                }],
+            };
 
-    if !res.status().is_success() {
-        anyhow::bail!("Ollama API error: {}", res.status());
+            let res = client
+                .post(&url)
+                .bearer_auth(&settings.api_key)
+                .json(&request_body)
+                .send()
+                .await
+                .context("Failed to connect to OpenAI-compatible API")?;
+
+            if !res.status().is_success() {
+                println!("❌ [LLM Debug] API returned error status: {}", res.status());
+                anyhow::bail!("OpenAI API error: {}", res.status());
+            }
+
+            let open_ai_res: OpenAiResponse = res
+                .json()
+                .await
+                .context("Failed to parse OpenAI response")?;
+            
+            let summary = open_ai_res
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .ok_or_else(|| anyhow::anyhow!("No response choices returned from OpenAI"))?;
+            
+            save_summary_to_file(&session_dir, &summary).await?;
+            Ok(summary)
+        }
+        crate::settings::LlmBackend::Ollama => {
+            println!("🏠 [LLM Debug] Requesting local Ollama at: {}", OLLAMA_API_URL);
+            let request_body = OllamaRequest {
+                model: settings.model,
+                stream: false,
+                options: OllamaOptions {
+                    num_ctx: 4096,
+                    temperature: 0.7,
+                    top_p: 0.8,
+                    top_k: 20,
+                    presence_penalty: 1.5,
+                },
+                prompt,
+            };
+
+            let res = client
+                .post(OLLAMA_API_URL)
+                .json(&request_body)
+                .send()
+                .await
+                .context("Failed to connect to Ollama. Is it running at localhost:11434?")?;
+
+            if !res.status().is_success() {
+                println!("❌ [LLM Debug] Ollama API returned error status: {}", res.status());
+                anyhow::bail!("Ollama API error: {}", res.status());
+            }
+
+            let ollama_res: OllamaResponse = res
+                .json()
+                .await
+                .context("Failed to parse Ollama response")?;
+            let summary = ollama_res.response;
+
+            save_summary_to_file(&session_dir, &summary).await?;
+            Ok(summary)
+        }
     }
+}
 
-    let ollama_res: OllamaResponse = res
-        .json()
-        .await
-        .context("Failed to parse Ollama response")?;
-    let summary = ollama_res.response;
-
-    // 4. Save to summary.md
+async fn save_summary_to_file(session_dir: &std::path::PathBuf, summary: &str) -> Result<()> {
     let summary_path = session_dir.join("summary.md");
     let mut f = OpenOptions::new()
         .write(true)
@@ -229,8 +293,7 @@ async fn generate_summary_inner(app: &tauri::AppHandle, session_id: &str) -> Res
         .context("Failed to open summary.md for writing")?;
 
     f.write_all(summary.as_bytes())?;
-
-    Ok(summary)
+    Ok(())
 }
 
 #[tauri::command]
