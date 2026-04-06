@@ -22,7 +22,7 @@
 *   **🤖 双引擎语音识别 (ASR)**:
     *   **SenseVoice (FunASR)**: ⚡️ **极速**、高精度的中文识别，支持 Int8 量化，纯 CPU 推理也如闪电般迅速。
     *   **Whisper**: 经典的 OpenAI 模型支持，适合多语言场景。
-*   **📝 智能摘要**: 集成 **Ollama** 本地大模型，一键生成会议纪要、Action Items。
+*   **📝 智能摘要**: 支持 **Ollama** 本地大模型及 **OpenAI 兼容** 的云端 LLM，一键生成会议纪要、Action Items。
 *   **🧠 智能过滤**: 内置抗幻觉（Anti-Hallucination）过滤器，消除静音段的 "The." 等噪音干扰。
 *   **📦 零配置分发**: 解决了 macOS 严苛的动态库打包问题，下载即用。
 
@@ -112,6 +112,10 @@ cargo tauri build --release || ./build.sh
     "preferred_backend": "sck",
     // 允许自动降级
     "allow_fallback": true,
+    // VAD 后端: "silero" 或 "webrtc"
+    "vad_backend": "silero",
+    // VAD 阈值 (0.0 - 1.0)
+    "vad_threshold": 0.5,
     // 说话人识别相似度阈值 (0.0 - 1.0)。越高越严格（产生更多说话人），越低越宽松（合并说话人）。
     "diarization_threshold": 0.5,
     // 最大检测说话人数。防止过度碎片化。
@@ -124,10 +128,14 @@ cargo tauri build --release || ./build.sh
     "backend": "FunAsr"
   },
   "llm": {
-      // Ollama 的 API 地址
-      "host": "http://localhost:11434",
-      // 使用的模型名称,默认1.7b
-      "model": "qwen3:1.7b"
+    // LLM 后端: "ollama" 或 "openai"
+    "backend": "ollama",
+    // 使用的模型名称 (例如: "qwen3:1.7b" 或 "gpt-4o")
+    "model": "qwen3:1.7b",
+    // [仅 OpenAI] API Key
+    "api_key": "your-api-key",
+    // [仅 OpenAI] API Base URL (例如: "https://api.openai.com/v1")
+    "api_base": "https://api.openai.com/v1"
   }
 }
 ```
