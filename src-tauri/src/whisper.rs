@@ -111,7 +111,7 @@ impl WhisperManager {
         let samples_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
 
         // Configure parameters
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
 
         // Language settings
         if language != "auto" {
@@ -167,14 +167,160 @@ impl WhisperManager {
                 .full_get_segment_t1(i)
                 .map_err(|e| anyhow::anyhow!("Failed to get segment end: {}", e))?;
 
-            // Note: whisper-rs doesn't expose avg_logprob directly through public API
-            // We set a default value; confidence filtering can be done at higher level if needed
-            let avg_logprob = -0.5; // Default moderate confidence
+            // Compute real avg_logprob from per-token probabilities
+            let avg_logprob = {
+                let n_tokens = state
+                    .full_n_tokens(i)
+                    .unwrap_or(0);
+                let mut sum_logprob = 0.0f32;
+                let mut token_count = 0;
+                for t in 0..n_tokens {
+                    if let Ok(prob) = state.full_get_token_prob(i, t) {
+                        if prob > 0.0 {
+                            sum_logprob += prob.ln();
+                            token_count += 1;
+                        }
+                    }
+                }
+                if token_count > 0 {
+                    sum_logprob / token_count as f32
+                } else {
+                    -1.0 // Default to low confidence if no tokens
+                }
+            };
 
             full_text.push_str(&text);
             segments.push(TranscriptionSegment {
                 text,
                 start_ms: (start_t * 10) as i64, // whisper timestamps are in 10ms units
+                end_ms: (end_t * 10) as i64,
+                avg_logprob,
+            });
+        }
+
+        let inference_time = start.elapsed();
+        let inference_time_ms = inference_time.as_millis() as u64;
+
+        println!(
+            "✅ [WHISPER] Transcription complete: {} segments, {:.2}s inference ({:.1}x realtime)",
+            segments.len(),
+            inference_time.as_secs_f32(),
+            duration_s / inference_time.as_secs_f32()
+        );
+
+        if !full_text.trim().is_empty() {
+            println!("📝 [WHISPER] Result: \"{}\"", full_text.trim());
+        }
+
+        Ok(TranscriptionResult {
+            text: full_text.trim().to_string(),
+            segments,
+            inference_time_ms,
+        })
+    }
+
+    /// Transcribe pre-normalized f32 audio samples directly.
+    /// This avoids the redundant i16 → f32 conversion when audio has already
+    /// been processed (e.g. after denoising) in f32 format.
+    ///
+    /// # Arguments
+    /// * `samples_f32` - Normalized f32 audio samples at 16kHz, range [-1.0, 1.0]
+    /// * `language` - Language code (e.g., "zh", "en", "auto")
+    /// * `initial_prompt` - Optional prompt to guide transcription
+    pub fn transcribe_f32(
+        &self,
+        samples_f32: &[f32],
+        language: &str,
+        initial_prompt: Option<&str>,
+    ) -> Result<TranscriptionResult> {
+        let start = Instant::now();
+        let duration_s = samples_f32.len() as f32 / 16000.0;
+
+        println!(
+            "🎙️ [WHISPER] Starting transcription (f32): {:.2}s of audio, lang={}",
+            duration_s, language
+        );
+
+        // Configure parameters
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
+
+        // Language settings
+        if language != "auto" {
+            params.set_language(Some(language));
+        }
+        params.set_translate(false);
+
+        // Set prompt if provided
+        if let Some(prompt) = initial_prompt {
+            params.set_initial_prompt(prompt);
+        }
+
+        // Performance settings
+        params.set_n_threads(4);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_print_special(false);
+
+        // Acquire lock and run inference
+        let ctx = self
+            .ctx
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        let mut state = ctx
+            .create_state()
+            .map_err(|e| anyhow::anyhow!("Failed to create state: {}", e))?;
+
+        // Run inference directly with f32 samples
+        state
+            .full(params, samples_f32)
+            .map_err(|e| anyhow::anyhow!("Whisper inference failed: {}", e))?;
+
+        // Extract results
+        let num_segments = state
+            .full_n_segments()
+            .map_err(|e| anyhow::anyhow!("Failed to get segment count: {}", e))?;
+
+        let mut segments = Vec::with_capacity(num_segments as usize);
+        let mut full_text = String::new();
+
+        for i in 0..num_segments {
+            let text = state
+                .full_get_segment_text(i)
+                .map_err(|e| anyhow::anyhow!("Failed to get segment text: {}", e))?;
+
+            let start_t = state
+                .full_get_segment_t0(i)
+                .map_err(|e| anyhow::anyhow!("Failed to get segment start: {}", e))?;
+            let end_t = state
+                .full_get_segment_t1(i)
+                .map_err(|e| anyhow::anyhow!("Failed to get segment end: {}", e))?;
+
+            // Compute real avg_logprob from per-token probabilities
+            let avg_logprob = {
+                let n_tokens = state.full_n_tokens(i).unwrap_or(0);
+                let mut sum_logprob = 0.0f32;
+                let mut token_count = 0;
+                for t in 0..n_tokens {
+                    if let Ok(prob) = state.full_get_token_prob(i, t) {
+                        if prob > 0.0 {
+                            sum_logprob += prob.ln();
+                            token_count += 1;
+                        }
+                    }
+                }
+                if token_count > 0 {
+                    sum_logprob / token_count as f32
+                } else {
+                    -1.0
+                }
+            };
+
+            full_text.push_str(&text);
+            segments.push(TranscriptionSegment {
+                text,
+                start_ms: (start_t * 10) as i64,
                 end_ms: (end_t * 10) as i64,
                 avg_logprob,
             });

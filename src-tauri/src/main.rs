@@ -776,7 +776,7 @@ fn main() {
                 let resource_path = handle
                     .path()
                     .resolve(
-                        "resources/ggml-small.bin",
+                        "resources/ggml-large-v3-turbo-q8_0.bin",
                         tauri::path::BaseDirectory::Resource,
                     )
                     .unwrap();

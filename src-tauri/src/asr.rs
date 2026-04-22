@@ -67,6 +67,7 @@ pub fn realtime_inference_worker(
     let mut speech_run_count = 0; // for debounce
     let mut speech_frames_count = 0; // Total speech frames in current buffer
     let mut current_speaker = "Speaker 1".to_string();
+    let mut last_transcript = String::new(); // Context for Whisper prompt
     // frame_accum removed, using vad_accum
 
     while !stop.load(Ordering::Relaxed) {
@@ -186,6 +187,7 @@ pub fn realtime_inference_worker(
                                     &transcript_writer,
                                     &mut current_speaker,
                                     density,
+                                    &mut last_transcript,
                                 );
                             } else {
                                 println!("🚀 Sending audio to ASR [{}](Condition 1: Silence Cut), density={:.1}%", source, density * 100.0);
@@ -197,6 +199,7 @@ pub fn realtime_inference_worker(
                                     &transcript_writer,
                                     &mut current_speaker,
                                     density,
+                                    &mut last_transcript,
                                 );
                             }
                         }
@@ -222,6 +225,7 @@ pub fn realtime_inference_worker(
                             &transcript_writer,
                             &mut current_speaker,
                             density_ml,
+                            &mut last_transcript,
                         );
                     }
                     buf.clear();
@@ -262,6 +266,7 @@ pub fn realtime_inference_worker(
             &transcript_writer,
             &mut current_speaker,
             density_fl,
+            &mut last_transcript,
         );
     }
 
@@ -275,6 +280,7 @@ fn send_audio_to_asr(
     transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     current_speaker: &mut String,
     speech_density: f32,
+    last_transcript: &mut String,
 ) {
     // 1. SPEAKER DIARIZATION
     //
@@ -315,25 +321,19 @@ fn send_audio_to_asr(
     };
 
     // Add 300ms silence padding to end (Post-roll) to help ASR complete the last word
-    let mut padded = Vec::with_capacity(samples.len() + 4800);
-    padded.extend_from_slice(samples);
-    padded.resize(padded.len() + 4800, 0);
+    // Convert to f32 upfront — all subsequent processing stays in f32
+    let mut padded_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+    padded_f32.resize(padded_f32.len() + 4800, 0.0); // 300ms silence padding
 
     // === NOISE REDUCTION ===
     // Apply RNNoise neural network denoising before transcription
     let audio_processor =
         AUDIO_PROCESSOR.get_or_init(|| crate::audio_processor::AudioProcessor::new(16000));
 
-    // Convert i16 to f32 for denoising
-    let samples_f32: Vec<f32> = padded.iter().map(|&s| s as f32 / 32768.0).collect();
-    let denoise_result = audio_processor.denoise(&samples_f32);
+    let denoise_result = audio_processor.denoise(&padded_f32);
 
-    // Convert denoised f32 back to i16 for whisper
-    let denoised_i16: Vec<i16> = denoise_result
-        .samples
-        .iter()
-        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
-        .collect();
+    // Keep denoised samples as f32 — no unnecessary f32→i16→f32 round-trips
+    let denoised_f32: &[f32] = &denoise_result.samples;
 
     println!(
         "🔇 [ASR] Noise reduction applied: RMS {:.4} -> {:.4} ({:.1} dB reduction)",
@@ -351,6 +351,11 @@ fn send_audio_to_asr(
                 return;
             }
             let funasr = crate::funasr::SenseVoiceManager::get();
+            // FunASR expects i16, convert from denoised f32
+            let denoised_i16: Vec<i16> = denoised_f32
+                .iter()
+                .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                .collect();
             match funasr.transcribe(&denoised_i16) {
                 Ok(result) => {
                     let t = result.text.trim();
@@ -364,6 +369,9 @@ fn send_audio_to_asr(
                                 "source": speaker_label,
                             });
                             let _ = app.emit("asr_final", payload.to_string());
+
+                            // Update context for next inference
+                            *last_transcript = t.to_string();
 
                             // LOGGING: Append to transcript.jsonl
                             let entry = serde_json::json!({
@@ -391,13 +399,22 @@ fn send_audio_to_asr(
             }
         }
         crate::settings::AsrBackend::Whisper => {
-            // Use whisper-rs directly instead of HTTP call
+            // Use whisper-rs with f32 path (no redundant i16 conversion)
             let whisper = crate::whisper::WhisperManager::get();
 
-            // Transcribe with Chinese language and meeting context prompt
-            let initial_prompt = "这是一段会议记录，请使用规范的书面语进行转写。";
+            // Build dynamic initial_prompt with previous context
+            let initial_prompt = if last_transcript.is_empty() {
+                "这是一段会议记录。".to_string()
+            } else {
+                // Use last ~100 characters as context for continuity
+                let ctx: String = last_transcript.chars()
+                    .rev().take(100).collect::<Vec<_>>()
+                    .into_iter().rev().collect();
+                ctx
+            };
 
-            match whisper.transcribe(&denoised_i16, "zh", Some(initial_prompt)) {
+            // Use transcribe_f32 to avoid redundant f32→i16→f32 conversion
+            match whisper.transcribe_f32(denoised_f32, "zh", Some(&initial_prompt)) {
                 Ok(result) => {
                     // Check if any segment has low confidence (avg_logprob < -1.0)
                     let is_reliable = result.segments.iter().all(|seg| {
@@ -424,6 +441,9 @@ fn send_audio_to_asr(
                                     "source": speaker_label,
                                 });
                                 let _ = app.emit("asr_final", payload.to_string());
+
+                                // Update context for next inference
+                                *last_transcript = t.to_string();
 
                                 // LOGGING: Append to transcript.jsonl
                                 let entry = serde_json::json!({

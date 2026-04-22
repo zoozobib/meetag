@@ -65,7 +65,7 @@ impl AudioProcessor {
     /// Apply RNNoise neural network noise reduction to audio samples.
     ///
     /// Note: RNNoise expects 48kHz audio. This function handles resampling internally
-    /// for 16kHz input, but for simplicity we assume input is already normalized f32.
+    /// using high-quality sinc interpolation (via rubato) for 16kHz input.
     ///
     /// # Arguments
     /// * `samples_f32` - Normalized f32 samples in range [-1.0, 1.0]
@@ -74,43 +74,56 @@ impl AudioProcessor {
     /// * `DenoiseResult` with processed samples and metrics
     pub fn denoise(&self, samples_f32: &[f32]) -> DenoiseResult {
         let rms_before = Self::calculate_rms(samples_f32);
-        println!(
-            "🔇 [AUDIO_PROCESSOR] Denoise START: {} samples, RMS={:.4}",
-            samples_f32.len(),
-            rms_before
-        );
-
-        // RNNoise processes in frames of 480 samples (10ms at 48kHz)
-        // For 16kHz input, we need to process in chunks of 160 samples (10ms at 16kHz)
-        // and the denoiser will handle the internal 3x upsampling
 
         let frame_size = DenoiseState::FRAME_SIZE; // 480 samples for 48kHz
         let mut denoiser = self.denoiser.lock().unwrap();
 
-        // For 16kHz audio, we work in 160-sample chunks and let RNNoise handle it
-        // Actually nnnoiseless expects 480 samples at 48kHz, so we need to resample
-        // For simplicity, we'll process what we have and pad if needed
-
-        let mut output = Vec::with_capacity(samples_f32.len());
-        let mut input_buffer = Vec::with_capacity(frame_size);
-        let mut output_buffer = vec![0.0f32; frame_size];
-
-        // Simple 3x upsampling for 16kHz -> 48kHz (linear interpolation)
+        // === High-quality resampling with rubato ===
         let upsampled: Vec<f32> = if self.sample_rate == 16000 {
-            samples_f32
-                .windows(2)
-                .flat_map(|w| {
-                    let a = w[0];
-                    let b = w[1];
-                    [a, a + (b - a) / 3.0, a + 2.0 * (b - a) / 3.0]
-                })
-                .chain(std::iter::once(*samples_f32.last().unwrap_or(&0.0)))
-                .collect()
+            // Use rubato SincFixedIn for 16kHz → 48kHz upsampling
+            use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+
+            let sinc_params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 256,
+                window: WindowFunction::BlackmanHarris2,
+            };
+
+            // chunk_size must divide evenly into input; use input length
+            let chunk_size = samples_f32.len().max(1);
+            match SincFixedIn::<f32>::new(
+                48000.0 / 16000.0,  // ratio: output / input
+                2.0,
+                sinc_params,
+                chunk_size,
+                1,  // mono
+            ) {
+                Ok(mut resampler) => {
+                    let input = vec![samples_f32.to_vec()];
+                    match resampler.process(&input, None) {
+                        Ok(output) => output.into_iter().next().unwrap_or_default(),
+                        Err(_) => {
+                            // Fallback to simple 3x repeat if rubato fails
+                            samples_f32.iter().flat_map(|&s| [s, s, s]).collect()
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Fallback to simple 3x repeat
+                    samples_f32.iter().flat_map(|&s| [s, s, s]).collect()
+                }
+            }
         } else {
             samples_f32.to_vec()
         };
 
-        // Process in 480-sample frames
+        // Process in 480-sample frames through RNNoise
+        let mut output = Vec::with_capacity(upsampled.len());
+        let mut input_buffer = Vec::with_capacity(frame_size);
+        let mut output_buffer = vec![0.0f32; frame_size];
+
         for chunk in upsampled.chunks(frame_size) {
             input_buffer.clear();
             input_buffer.extend_from_slice(chunk);
@@ -127,7 +140,33 @@ impl AudioProcessor {
 
         // Downsample back to 16kHz if we upsampled
         let final_output: Vec<f32> = if self.sample_rate == 16000 {
-            output.iter().step_by(3).copied().collect()
+            use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+
+            let sinc_params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 256,
+                window: WindowFunction::BlackmanHarris2,
+            };
+
+            let chunk_size = output.len().max(1);
+            match SincFixedIn::<f32>::new(
+                16000.0 / 48000.0,  // ratio: output / input
+                2.0,
+                sinc_params,
+                chunk_size,
+                1,  // mono
+            ) {
+                Ok(mut resampler) => {
+                    let input = vec![output.clone()];
+                    match resampler.process(&input, None) {
+                        Ok(result) => result.into_iter().next().unwrap_or_default(),
+                        Err(_) => output.iter().step_by(3).copied().collect(),
+                    }
+                }
+                Err(_) => output.iter().step_by(3).copied().collect(),
+            }
         } else {
             output
         };
@@ -144,11 +183,6 @@ impl AudioProcessor {
         } else {
             0.0
         };
-
-        println!(
-            "✅ [AUDIO_PROCESSOR] Denoise COMPLETE: RMS {:.4} -> {:.4} (reduction: {:.1} dB)",
-            rms_before, rms_after, noise_reduction_db
-        );
 
         DenoiseResult {
             samples: result,
