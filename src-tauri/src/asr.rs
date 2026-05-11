@@ -290,12 +290,58 @@ fn send_audio_to_asr(
     //   handles low-density filtering and minimum-speech-for-new-speaker checks.
     // - Short segments (<1s): Skip diarization, reuse last known speaker label.
     let speaker_label = if source == "user" {
-        // Mic channel is always the local user
-        let label = "Me".to_string();
-        *current_speaker = label.clone();
-        label
-    } else if samples.len() < 16000 {
-        // Too short for reliable diarization (< 1.0s at 16kHz)
+        // Mic channel: verify voice matches "Me" anchor to detect echo leakage
+        match crate::diarization::DiarizationPipeline::try_get() {
+            Some(pipeline) => {
+                if !pipeline.has_me_anchor() {
+                    // No anchor yet — register first good mic segment as Me anchor
+                    if let Err(e) = pipeline.register_me_anchor(samples, speech_density) {
+                        eprintln!("⚠️ [DIARIZATION] Failed to register Me anchor: {}", e);
+                    }
+                    let label = "Me".to_string();
+                    *current_speaker = label.clone();
+                    label
+                } else {
+                    // Verify this sounds like Me
+                    match pipeline.verify_is_me(samples, speech_density) {
+                        Ok(Some(true)) => {
+                            // Confirmed as Me — reinforce anchor
+                            let _ = pipeline.register_me_anchor(samples, speech_density);
+                            let label = "Me".to_string();
+                            *current_speaker = label.clone();
+                            label
+                        }
+                        Ok(Some(false)) => {
+                            // Doesn't sound like Me — echo leakage, discard
+                            println!(
+                                "🔇 [ASR] Mic audio doesn't match Me anchor (echo leakage?), discarding segment"
+                            );
+                            return;
+                        }
+                        Ok(None) => {
+                            // Too short/low-quality to verify, default to Me
+                            let label = "Me".to_string();
+                            *current_speaker = label.clone();
+                            label
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️ [DIARIZATION] Me verify error: {}, defaulting to Me", e);
+                            let label = "Me".to_string();
+                            *current_speaker = label.clone();
+                            label
+                        }
+                    }
+                }
+            }
+            None => {
+                // Diarization not initialized, fallback to Me
+                let label = "Me".to_string();
+                *current_speaker = label.clone();
+                label
+            }
+        }
+    } else if samples.len() < 8000 {
+        // Too short for reliable diarization (< 0.5s at 16kHz)
         println!(
             "⏩ [DIARIZATION] Segment too short ({:.1}s), reusing: {}",
             samples.len() as f32 / 16000.0,
