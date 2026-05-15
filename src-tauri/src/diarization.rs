@@ -1,14 +1,15 @@
-//! Speaker Diarization v3.3 — Fast speaker switching with strong-mismatch bypass.
+//! Speaker Diarization v4.0 — Bayesian evidence accumulation.
 //!
 //! Key design:
-//!   - Single threshold (0.45): match or no-match, no gray zone
-//!   - Anti-proliferation via GUARDS, not via over-broad score ranges:
-//!     1. Density gating (skip < 25% speech density)
-//!     2. Confirmation (require 2 cumulative unmatched segments — counter, not consecutive)
-//!        BUT: if best score < 0.20 (strong mismatch), skip confirmation entirely
-//!     3. Conservative reinforcement (only from score ≥ 0.60)
-//!     4. Max speaker cap (8)
-//!     5. Minimum speech duration for new speaker (0.5s)
+//!   - Replaces rule-based mismatch counter with continuous evidence accumulator
+//!   - Density → confidence weighting (no hard gate, low density = low weight)
+//!   - Evidence decays over time (old mismatches fade naturally)
+//!   - A match reduces evidence proportionally, NOT resets it to zero
+//!   - Anti-proliferation guards:
+//!     1. Minimum embedding density (10%) — below this, embedding is garbage
+//!     2. Conservative reinforcement (only from score ≥ 0.60)
+//!     3. Max speaker cap (8)
+//!     4. Minimum speech for registration (0.3s)
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
@@ -22,15 +23,16 @@ static DIARIZATION_PIPELINE: OnceCell<DiarizationPipeline> = OnceCell::new();
 const MATCH_THRESHOLD: f32 = 0.45;
 /// Score at or above which we also strengthen the speaker profile.
 const REINFORCE_THRESHOLD: f32 = 0.60;
-/// Skip diarization when speech density is below this.
-const MIN_SPEECH_DENSITY: f32 = 0.25;
-/// Minimum seconds of actual speech content before registering a new speaker.
-const MIN_NEW_SPEAKER_SPEECH_SECS: f32 = 0.5;
+/// Minimum density to extract embedding at all (below this, embedding is garbage).
+const MIN_EMBEDDING_DENSITY: f32 = 0.10;
+/// Minimum speech seconds for registering a new speaker.
+const MIN_REGISTER_SPEECH_SECS: f32 = 0.3;
 /// Maximum number of speakers we'll track.
 const MAX_SPEAKERS: usize = 8;
-/// When the best speaker score is below this, it's a strong mismatch.
-/// Skip pending confirmation and create a new speaker immediately.
-const STRONG_MISMATCH_THRESHOLD: f32 = 0.20;
+/// Evidence threshold for creating a new speaker.
+const EVIDENCE_THRESHOLD: f32 = 1.5;
+/// Time decay factor applied to evidence each segment.
+const EVIDENCE_DECAY: f32 = 0.9;
 
 /// Cosine similarity threshold for "Me" voice verification.
 /// Below this, mic audio is considered echo leakage from speaker.
@@ -56,11 +58,11 @@ pub struct DiarizationPipeline {
     manager: Mutex<EmbeddingManager>,
     speaker_count: Mutex<usize>,
     last_speaker: Mutex<String>,
-    /// Cumulative count of unmatched segments (not necessarily consecutive).
-    /// New speakers require 2+ mismatches before creation.
-    /// A successful match resets this to 0.
-    pending_mismatch_count: Mutex<u8>,
-    /// Stored embedding from the last unmatched segment (candidate for new speaker).
+    /// Bayesian evidence accumulator for new speaker detection.
+    /// Positive evidence = likely a new speaker. Decays over time.
+    /// When this exceeds EVIDENCE_THRESHOLD, a new speaker is created.
+    pending_evidence: Mutex<f32>,
+    /// Stored embedding from the best unmatched segment (candidate for new speaker).
     pending_embedding: Mutex<Option<Vec<f32>>>,
     /// Stored embedding anchor for the local user's voice ("Me").
     me_anchor: Mutex<Option<Vec<f32>>>,
@@ -70,11 +72,11 @@ pub struct DiarizationPipeline {
 
 impl DiarizationPipeline {
     pub fn init(embedding_model: &std::path::Path, _threshold: f32) -> Result<()> {
-        println!("🚀 [DIARIZATION] Initializing v3.3...");
+        println!("🚀 [DIARIZATION] Initializing v4.0 (Bayesian)...");
         println!("📂 [DIARIZATION] Model: {}", embedding_model.display());
         println!(
-            "📂 [DIARIZATION] match≥{:.2}, reinforce≥{:.2}, density≥{:.0}%, max_speakers={}",
-            MATCH_THRESHOLD, REINFORCE_THRESHOLD, MIN_SPEECH_DENSITY * 100.0, MAX_SPEAKERS
+            "📂 [DIARIZATION] match≥{:.2}, reinforce≥{:.2}, min_density≥{:.0}%, evidence_threshold={:.1}, decay={:.1}",
+            MATCH_THRESHOLD, REINFORCE_THRESHOLD, MIN_EMBEDDING_DENSITY * 100.0, EVIDENCE_THRESHOLD, EVIDENCE_DECAY
         );
 
         let config = ExtractorConfig {
@@ -96,7 +98,7 @@ impl DiarizationPipeline {
                 manager: Mutex::new(EmbeddingManager::new(dim)),
                 speaker_count: Mutex::new(0),
                 last_speaker: Mutex::new("Speaker 1".to_string()),
-                pending_mismatch_count: Mutex::new(0),
+                pending_evidence: Mutex::new(0.0),
                 pending_embedding: Mutex::new(None),
                 me_anchor: Mutex::new(None),
                 me_anchor_count: Mutex::new(0),
@@ -118,15 +120,19 @@ impl DiarizationPipeline {
     }
 
     pub fn identify_speaker_i16(&self, samples: &[i16], speech_density: f32) -> Result<String> {
-        // ── Guard: low density → unreliable, skip ───────────────────────
-        if speech_density < MIN_SPEECH_DENSITY {
+        // ── Guard: extremely low density → embedding is garbage ──────────
+        if speech_density < MIN_EMBEDDING_DENSITY {
             let last = self.get_last();
             println!(
-                "⏩ [DIARIZATION] Low density ({:.0}%), reusing: {}",
+                "⏩ [DIARIZATION] Density too low ({:.0}%), reusing: {}",
                 speech_density * 100.0, last
             );
             return Ok(last);
         }
+
+        // ── Confidence from density (replaces hard gate) ────────────────
+        // density=50%+ → confidence=1.0, density=10% → confidence=0.2
+        let confidence = (speech_density / 0.5).clamp(0.1, 1.0);
 
         let total_secs = samples.len() as f32 / 16000.0;
         let speech_secs = total_secs * speech_density;
@@ -149,23 +155,21 @@ impl DiarizationPipeline {
         let n_speakers = *cnt;
         let best = mgr.get_best_matches(&embedding, MATCH_THRESHOLD, 3);
 
-        // Debug: always log scores
-        // Also retrieve ALL scores (including below-threshold) for strong-mismatch detection
+        // Get the raw best score (including below-threshold) for evidence calculation
         let best_raw_score: f32;
         if !best.is_empty() {
             let strs: Vec<String> = best.iter()
                 .map(|m| format!("{}={:.3}", m.name, m.score))
                 .collect();
-            println!("📊 [DIARIZATION] Matches(≥{:.2}): [{}]", MATCH_THRESHOLD, strs.join(", "));
+            println!("📊 [DIARIZATION] Matches(≥{:.2}): [{}] conf={:.2}", MATCH_THRESHOLD, strs.join(", "), confidence);
             best_raw_score = best[0].score;
         } else if n_speakers > 0 {
-            // Also show what the best score WAS (below threshold) for debugging
             let all = mgr.get_best_matches(&embedding, 0.0, 3);
             if !all.is_empty() {
                 let strs: Vec<String> = all.iter()
                     .map(|m| format!("{}={:.3}", m.name, m.score))
                     .collect();
-                println!("📊 [DIARIZATION] No match (all below {:.2}): [{}]", MATCH_THRESHOLD, strs.join(", "));
+                println!("📊 [DIARIZATION] No match (all below {:.2}): [{}] conf={:.2}", MATCH_THRESHOLD, strs.join(", "), confidence);
                 best_raw_score = all[0].score;
             } else {
                 best_raw_score = 0.0;
@@ -184,14 +188,17 @@ impl DiarizationPipeline {
                 let _ = mgr.add(name.clone(), &mut embedding);
             }
 
-            // A match resets the mismatch counter
-            self.reset_mismatch_counter();
+            // Decay evidence proportionally (NOT reset to zero)
+            // A strong match (0.70) decays more than a weak match (0.46)
+            let decay_amount = (score - MATCH_THRESHOLD) * confidence * 0.5;
+            let evidence = self.decay_evidence(decay_amount);
+
             self.set_last(&name);
-            println!("🔊 [DIARIZATION] ✓ {} (score={:.3})", name, score);
+            println!("🔊 [DIARIZATION] ✓ {} (score={:.3}, evidence={:.2})", name, score, evidence);
             return Ok(name);
         }
 
-        // ── NO MATCH — new speaker candidate ────────────────────────────
+        // ── NO MATCH — accumulate evidence for new speaker ──────────────
 
         // Guard: max speakers
         if n_speakers >= MAX_SPEAKERS {
@@ -200,47 +207,52 @@ impl DiarizationPipeline {
             return Ok(last);
         }
 
-        // Detect strong mismatch: best score is far below threshold.
-        // e.g., score=0.047 means this is clearly a completely different person.
-        let is_strong_mismatch = n_speakers > 0 && best_raw_score < STRONG_MISMATCH_THRESHOLD;
-
-        // Increment mismatch counter for ANY unmatched segment (even short ones).
-        // This ensures short segments during speaker transitions contribute
-        // to new speaker detection instead of resetting the process.
-        let mismatches = self.increment_mismatch_counter();
+        // Accumulate evidence: lower score = stronger evidence for new speaker
+        // score=0.09 → delta=0.91*conf, score=0.40 → delta=0.60*conf
+        let delta = (1.0 - best_raw_score) * confidence;
+        let evidence = self.accumulate_evidence(delta);
 
         // Store the best embedding we've seen (prefer longer speech segments)
-        if speech_secs >= MIN_NEW_SPEAKER_SPEECH_SECS {
+        if speech_secs >= MIN_REGISTER_SPEECH_SECS {
             self.store_pending_embedding(embedding.clone());
         }
 
-        // Guard: minimum speech content — short segments count toward
-        // mismatch but can't register a new speaker by themselves
-        if speech_secs < MIN_NEW_SPEAKER_SPEECH_SECS {
-            let last = self.get_last();
-            println!(
-                "⏩ [DIARIZATION] Speech too short ({:.1}s < {:.1}s), mismatch {}/2{}, reusing: {}",
-                speech_secs, MIN_NEW_SPEAKER_SPEECH_SECS, mismatches,
-                if is_strong_mismatch { " [STRONG]" } else { "" }, last
-            );
-            return Ok(last);
-        }
+        // ── Decision: create new speaker? ───────────────────────────────
 
-        // Guard: confirmation (skip for the very first speaker)
-        // EXCEPTION: strong mismatch (best score < 0.20) skips confirmation entirely.
-        // When the score is 0.047 it's obviously a completely different person —
-        // waiting for a second mismatch wastes 3-5 seconds.
-        if n_speakers > 0 && mismatches < 2 && !is_strong_mismatch {
-            let last = self.get_last();
-            println!(
-                "⏳ [DIARIZATION] Pending new speaker (mismatch {}/2), reusing: {}",
-                mismatches, last
-            );
-            return Ok(last);
+        // First speaker: always create immediately (no evidence needed)
+        if n_speakers == 0 {
+            if speech_secs < MIN_REGISTER_SPEECH_SECS {
+                let last = self.get_last();
+                println!(
+                    "⏩ [DIARIZATION] First speaker: speech too short ({:.1}s), reusing: {}",
+                    speech_secs, last
+                );
+                return Ok(last);
+            }
+            // Fall through to CREATE below
+        } else {
+            // Subsequent speakers: need sufficient evidence
+            if evidence < EVIDENCE_THRESHOLD {
+                let last = self.get_last();
+                println!(
+                    "📈 [DIARIZATION] Evidence {:.2}/{:.1} (+{:.2}), reusing: {}",
+                    evidence, EVIDENCE_THRESHOLD, delta, last
+                );
+                return Ok(last);
+            }
+
+            // Evidence threshold met — but need a usable embedding to register
+            if speech_secs < MIN_REGISTER_SPEECH_SECS && !self.has_pending_embedding() {
+                let last = self.get_last();
+                println!(
+                    "📈 [DIARIZATION] Evidence {:.2} ✓ but no usable embedding (speech={:.1}s), reusing: {}",
+                    evidence, speech_secs, last
+                );
+                return Ok(last);
+            }
         }
 
         // ── CREATE NEW SPEAKER ──────────────────────────────────────────
-        // Use stored pending embedding if available (may be from a longer segment)
         let register_embedding = self.take_pending_embedding().unwrap_or(embedding);
         *cnt += 1;
         let new_name = format!("Speaker {}", *cnt);
@@ -249,7 +261,7 @@ impl DiarizationPipeline {
         mgr.add(new_name.clone(), &mut reg_emb)
             .map_err(|e| anyhow::anyhow!("Failed to register: {}", e))?;
 
-        self.reset_mismatch_counter();
+        self.reset_evidence();
         self.set_last(&new_name);
 
         if n_speakers == 0 {
@@ -259,8 +271,8 @@ impl DiarizationPipeline {
             );
         } else {
             println!(
-                "🆕 [DIARIZATION] Confirmed: {} (speech={:.1}s, density={:.0}%)",
-                new_name, speech_secs, speech_density * 100.0
+                "🆕 [DIARIZATION] Confirmed: {} (evidence={:.2}, speech={:.1}s, density={:.0}%)",
+                new_name, evidence, speech_secs, speech_density * 100.0
             );
         }
 
@@ -277,18 +289,32 @@ impl DiarizationPipeline {
         }
     }
 
-    fn increment_mismatch_counter(&self) -> u8 {
-        if let Ok(mut c) = self.pending_mismatch_count.lock() {
-            *c = c.saturating_add(1);
-            *c
+    /// Accumulate positive evidence for a new speaker.
+    /// Applies time decay first, then adds new evidence.
+    fn accumulate_evidence(&self, delta: f32) -> f32 {
+        if let Ok(mut e) = self.pending_evidence.lock() {
+            *e = (*e * EVIDENCE_DECAY + delta).max(0.0);
+            *e
         } else {
-            1
+            0.0
         }
     }
 
-    fn reset_mismatch_counter(&self) {
-        if let Ok(mut c) = self.pending_mismatch_count.lock() {
-            *c = 0;
+    /// Decay evidence when a match is found.
+    /// A match provides counter-evidence, reducing the new-speaker signal.
+    fn decay_evidence(&self, amount: f32) -> f32 {
+        if let Ok(mut e) = self.pending_evidence.lock() {
+            *e = (*e * EVIDENCE_DECAY - amount).max(0.0);
+            *e
+        } else {
+            0.0
+        }
+    }
+
+    /// Reset evidence to zero (after creating a new speaker).
+    fn reset_evidence(&self) {
+        if let Ok(mut e) = self.pending_evidence.lock() {
+            *e = 0.0;
         }
         if let Ok(mut e) = self.pending_embedding.lock() {
             *e = None;
@@ -306,6 +332,39 @@ impl DiarizationPipeline {
             e.take()
         } else {
             None
+        }
+    }
+
+    fn has_pending_embedding(&self) -> bool {
+        self.pending_embedding.lock().map(|e| e.is_some()).unwrap_or(false)
+    }
+
+    /// Check if audio matches any registered system speaker (read-only, no side effects).
+    /// Used for echo detection: if mic audio matches a system speaker, it's echo leakage.
+    /// Returns Ok(Some((name, score))) if matches, Ok(None) if no match or no speakers.
+    pub fn matches_any_speaker(&self, samples: &[i16]) -> anyhow::Result<Option<(String, f32)>> {
+        let cnt = self.speaker_count.lock()
+            .map_err(|_| anyhow::anyhow!("Count lock poisoned"))?;
+        if *cnt == 0 {
+            return Ok(None); // No speakers registered yet
+        }
+        drop(cnt);
+
+        let samples_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+        let embedding = {
+            let mut ext = self.extractor.lock()
+                .map_err(|_| anyhow::anyhow!("Extractor lock poisoned"))?;
+            ext.compute_speaker_embedding(samples_f32, 16000)
+                .map_err(|e| anyhow::anyhow!("Embedding failed: {}", e))?
+        };
+
+        let mut mgr = self.manager.lock()
+            .map_err(|_| anyhow::anyhow!("Manager lock poisoned"))?;
+        let best = mgr.get_best_matches(&embedding, MATCH_THRESHOLD, 1);
+        if !best.is_empty() {
+            Ok(Some((best[0].name.clone(), best[0].score)))
+        } else {
+            Ok(None)
         }
     }
 
@@ -408,13 +467,13 @@ impl DiarizationPipeline {
             self.speaker_count.lock(),
             self.extractor.lock(),
             self.last_speaker.lock(),
-            self.pending_mismatch_count.lock(),
+            self.pending_evidence.lock(),
         ) {
             let dim = e.embedding_size as i32;
             *m = EmbeddingManager::new(dim);
             *c = 0;
             *l = "Speaker 1".to_string();
-            *p = 0;
+            *p = 0.0;
             println!("🧹 [DIARIZATION] Reset (dim={})", dim);
         }
         if let Ok(mut e) = self.pending_embedding.lock() {

@@ -294,15 +294,53 @@ fn send_audio_to_asr(
         match crate::diarization::DiarizationPipeline::try_get() {
             Some(pipeline) => {
                 if !pipeline.has_me_anchor() {
-                    // No anchor yet — register first good mic segment as Me anchor
+                    // === PRE-ANCHOR PHASE ===
+                    // Me anchor not yet established. Must be careful:
+                    // mic can pick up system audio echo which should NOT be labeled "Me".
+
+                    // 1. Low density → almost certainly noise/echo, discard silently
+                    if speech_density < 0.25 {
+                        println!(
+                            "🔇 [ASR] Pre-anchor: low density ({:.0}%), discarding mic segment",
+                            speech_density * 100.0
+                        );
+                        return;
+                    }
+
+                    // 2. Cross-check against known system speakers (echo detection)
+                    //    If mic audio matches Speaker 1/2/etc, it's echo leakage.
+                    if samples.len() >= 8000 {
+                        match pipeline.matches_any_speaker(samples) {
+                            Ok(Some((speaker, score))) => {
+                                println!(
+                                    "🔇 [ASR] Pre-anchor: mic matches {} (score={:.3}), echo leakage, discarding",
+                                    speaker, score
+                                );
+                                return;
+                            }
+                            Ok(None) => {} // No match → could be real user speech
+                            Err(e) => eprintln!("⚠️ [DIARIZATION] matches_any_speaker error: {}", e),
+                        }
+                    }
+
+                    // 3. Passed echo checks → try to register as Me anchor
                     if let Err(e) = pipeline.register_me_anchor(samples, speech_density) {
                         eprintln!("⚠️ [DIARIZATION] Failed to register Me anchor: {}", e);
                     }
-                    let label = "Me".to_string();
-                    *current_speaker = label.clone();
-                    label
+
+                    if pipeline.has_me_anchor() {
+                        // Registration succeeded → this is real user speech
+                        let label = "Me".to_string();
+                        *current_speaker = label.clone();
+                        label
+                    } else {
+                        // Registration failed (density/duration too low), discard
+                        println!("🔇 [ASR] Pre-anchor: Me registration failed, discarding mic segment");
+                        return;
+                    }
                 } else {
-                    // Verify this sounds like Me
+                    // === POST-ANCHOR PHASE ===
+                    // Verify this sounds like the registered Me anchor
                     match pipeline.verify_is_me(samples, speech_density) {
                         Ok(Some(true)) => {
                             // Confirmed as Me — reinforce anchor
@@ -319,16 +357,16 @@ fn send_audio_to_asr(
                             return;
                         }
                         Ok(None) => {
-                            // Too short/low-quality to verify, default to Me
-                            let label = "Me".to_string();
-                            *current_speaker = label.clone();
-                            label
+                            // Too short/low-quality to verify — discard to be safe
+                            // (previously defaulted to "Me" which caused false positives)
+                            println!(
+                                "🔇 [ASR] Post-anchor: mic segment too short to verify, discarding"
+                            );
+                            return;
                         }
                         Err(e) => {
-                            eprintln!("⚠️ [DIARIZATION] Me verify error: {}, defaulting to Me", e);
-                            let label = "Me".to_string();
-                            *current_speaker = label.clone();
-                            label
+                            eprintln!("⚠️ [DIARIZATION] Me verify error: {}, discarding", e);
+                            return;
                         }
                     }
                 }
