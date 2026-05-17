@@ -326,40 +326,15 @@ fn send_audio_to_asr(
                 .collect();
             match funasr.transcribe(&denoised_i16) {
                 Ok(result) => {
-                    let t = result.text.trim();
-                    if !t.is_empty() {
-                        // Text Post-processing (Blacklist/Repetition)
-                        if crate::text_filter::is_hallucination(t) {
-                            println!("🗑️ [FunASR] Discarding hallucination: {:?}", t);
-                        } else {
-                            let payload = serde_json::json!({
-                                "text": t,
-                                "source": speaker_label,
-                            });
-                            let _ = app.emit("asr_final", payload.to_string());
-
-                            // Update context for next inference
-                            *last_transcript = t.to_string();
-
-                            // LOGGING: Append to transcript.jsonl
-                            let entry = serde_json::json!({
-                                "timestamp": std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis(),
-                                "speaker": speaker_label,
-                                "text": t,
-                                "inference_time_ms": result.inference_time_ms,
-                                "backend": "funasr"
-                            });
-                            if let Ok(line) = serde_json::to_string(&entry) {
-                                use std::io::Write;
-                                if let Ok(mut w) = transcript_writer.lock() {
-                                    let _ = writeln!(w, "{}", line);
-                                }
-                            }
-                        }
-                    }
+                    emit_and_log(
+                        app,
+                        result.text.trim(),
+                        &speaker_label,
+                        "funasr",
+                        result.inference_time_ms,
+                        transcript_writer,
+                        last_transcript,
+                    );
                 }
                 Err(e) => {
                     eprintln!("❌ [FUNASR] Transcription error: {}", e);
@@ -375,10 +350,9 @@ fn send_audio_to_asr(
                 "这是一段会议记录。".to_string()
             } else {
                 // Use last ~100 characters as context for continuity
-                let ctx: String = last_transcript.chars()
+                last_transcript.chars()
                     .rev().take(100).collect::<Vec<_>>()
-                    .into_iter().rev().collect();
-                ctx
+                    .into_iter().rev().collect()
             };
 
             // Use transcribe_f32 to avoid redundant f32→i16→f32 conversion
@@ -398,40 +372,15 @@ fn send_audio_to_asr(
                     });
 
                     if is_reliable {
-                        let t = result.text.trim();
-                        if !t.is_empty() {
-                            // Text Post-processing (Blacklist/Repetition)
-                            if crate::text_filter::is_hallucination(t) {
-                                println!("🗑️ [Whisper] Discarding hallucination: {:?}", t);
-                            } else {
-                                let payload = serde_json::json!({
-                                    "text": t,
-                                    "source": speaker_label,
-                                });
-                                let _ = app.emit("asr_final", payload.to_string());
-
-                                // Update context for next inference
-                                *last_transcript = t.to_string();
-
-                                // LOGGING: Append to transcript.jsonl
-                                let entry = serde_json::json!({
-                                    "timestamp": std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis(),
-                                    "speaker": speaker_label,
-                                    "text": t,
-                                    "inference_time_ms": result.inference_time_ms,
-                                    "backend": "whisper"
-                                });
-                                if let Ok(line) = serde_json::to_string(&entry) {
-                                    use std::io::Write;
-                                    if let Ok(mut w) = transcript_writer.lock() {
-                                        let _ = writeln!(w, "{}", line);
-                                    }
-                                }
-                            }
-                        }
+                        emit_and_log(
+                            app,
+                            result.text.trim(),
+                            &speaker_label,
+                            "whisper",
+                            result.inference_time_ms,
+                            transcript_writer,
+                            last_transcript,
+                        );
                     }
                 }
                 Err(e) => {
@@ -441,3 +390,54 @@ fn send_audio_to_asr(
         }
     }
 }
+
+/// Common output handler for both ASR backends.
+/// Filters hallucinations, emits to frontend, writes to transcript.jsonl.
+fn emit_and_log(
+    app: &tauri::AppHandle,
+    text: &str,
+    speaker_label: &str,
+    backend: &str,
+    inference_time_ms: u64,
+    transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    last_transcript: &mut String,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    // Text Post-processing (Blacklist/Repetition)
+    if crate::text_filter::is_hallucination(text) {
+        println!("🗑️ [{}] Discarding hallucination: {:?}", backend.to_uppercase(), text);
+        return;
+    }
+
+    // Emit to frontend
+    let payload = serde_json::json!({
+        "text": text,
+        "source": speaker_label,
+    });
+    let _ = app.emit("asr_final", payload.to_string());
+
+    // Update context for next inference
+    *last_transcript = text.to_string();
+
+    // Append to transcript.jsonl
+    let entry = serde_json::json!({
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        "speaker": speaker_label,
+        "text": text,
+        "inference_time_ms": inference_time_ms,
+        "backend": backend
+    });
+    if let Ok(line) = serde_json::to_string(&entry) {
+        use std::io::Write;
+        if let Ok(mut w) = transcript_writer.lock() {
+            let _ = writeln!(w, "{}", line);
+        }
+    }
+}
+
