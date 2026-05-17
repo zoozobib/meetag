@@ -63,7 +63,7 @@ pub fn init(segmentation_model: &Path, embedding_model: &Path) -> Result<()> {
         },
         clustering: FastClusteringConfig {
             num_clusters: -1, // auto-detect number of speakers
-            threshold: 0.5,   // default clustering threshold
+            threshold: 0.80,  // higher = fewer speakers (0.5 was too aggressive, splitting 2 people into dozens)
         },
         min_duration_on: 0.3,  // minimum speech duration (seconds)
         min_duration_off: 0.5, // minimum silence duration (seconds)

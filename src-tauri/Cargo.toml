@@ -26,7 +26,6 @@ futures-channel = "0.3.31"
 ringbuf = "0.4.8"
 once_cell = "1.17.1"
 tempfile = "3.10"
-webrtc-vad = "0.4.0"
 chrono = "0.4"
 lazy_static = "1.4"
 
