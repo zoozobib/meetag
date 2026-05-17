@@ -1,11 +1,11 @@
 //! FunASR (SenseVoice) integration module.
 //!
 //! This module provides a thread-safe singleton (`SenseVoiceManager`) for managing
-//! the SenseVoice model via sherpa-rs.
+//! the SenseVoice model via sherpa-onnx (migrated from sherpa-rs).
 
 use anyhow::{Context, Result};
 use once_cell::sync::OnceCell;
-use sherpa_rs::sense_voice::{SenseVoiceConfig, SenseVoiceRecognizer};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -13,9 +13,9 @@ use std::time::Instant;
 /// Global singleton for SenseVoiceManager
 static SENSE_VOICE_MANAGER: OnceCell<SenseVoiceManager> = OnceCell::new();
 
-/// Thread-safe wrapper around SenseVoiceRecognizer
+/// Thread-safe wrapper around OfflineRecognizer (SenseVoice)
 pub struct SenseVoiceManager {
-    recognizer: Mutex<SenseVoiceRecognizer>,
+    recognizer: Mutex<OfflineRecognizer>,
 }
 
 /// Result of a transcription operation
@@ -32,11 +32,6 @@ impl SenseVoiceManager {
         let start = Instant::now();
 
         // Construct paths relative to resource dir
-        // Expected structure:
-        // resources/
-        //   sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/
-        //     model.onnx
-        //     tokens.txt
         let model_dir =
             base_resource_dir.join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17");
         let model_path = model_dir.join("model.int8.onnx");
@@ -51,18 +46,19 @@ impl SenseVoiceManager {
 
         println!("📂 [FUNASR] Loading model from: {}", model_dir.display());
 
-        let config = SenseVoiceConfig {
-            model: model_path.to_string_lossy().to_string(),
-            tokens: tokens_path.to_string_lossy().to_string(),
-            language: "".to_string(), // Auto-detect
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
+            model: Some(model_path.to_string_lossy().to_string()),
+            language: Some("auto".to_string()),
             use_itn: true,
-            provider: None, // CPU
-            num_threads: Some(4),
-            debug: false,
         };
+        config.model_config.tokens = Some(tokens_path.to_string_lossy().to_string());
+        config.model_config.num_threads = 4;
+        config.model_config.debug = false;
+        config.model_config.provider = Some("cpu".to_string());
 
-        let recognizer = SenseVoiceRecognizer::new(config)
-            .map_err(|e| anyhow::anyhow!("Failed to create SenseVoice recognizer: {}", e))?;
+        let recognizer = OfflineRecognizer::create(&config)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create SenseVoice recognizer. Check model paths."))?;
 
         let load_time = start.elapsed();
         println!(
@@ -104,21 +100,21 @@ impl SenseVoiceManager {
         let start = Instant::now();
         let duration_s = samples.len() as f32 / 16000.0;
 
-        // println!(
-        //     "🚀 [FUNASR] Starting transcription: {:.2}s of audio",
-        //     duration_s
-        // );
-
         // Convert i16 samples to f32 (normalized)
         let samples_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
 
         // Acquire lock and run inference
-        let mut recognizer = self
+        let recognizer = self
             .recognizer
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
-        let result = recognizer.transcribe(16000, &samples_f32);
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(16000, &samples_f32);
+        recognizer.decode(&stream);
+
+        let result = stream.get_result()
+            .ok_or_else(|| anyhow::anyhow!("SenseVoice returned no result"))?;
 
         let inference_time = start.elapsed();
         let inference_time_ms = inference_time.as_millis() as u64;

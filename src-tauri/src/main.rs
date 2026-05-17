@@ -41,6 +41,8 @@ struct RecorderHandle {
     mix_path: PathBuf,
     mix_asr_path: PathBuf,
     transcript_writer: Arc<Mutex<std::fs::File>>,
+    transcript_path: PathBuf,
+    recording_start_ms: u128,
 }
 
 // Global PCM channels for real-time mixer
@@ -84,11 +86,7 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
 
         std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
 
-        // Clear speaker profiles from previous recording
-        // (EmbeddingManager accumulates state, so we reset between sessions)
-        if let Some(pipeline) = crate::diarization::DiarizationPipeline::try_get() {
-            pipeline.clear();
-        }
+        // v8.0: No per-session speaker state to clear — offline diarization is stateless.
 
         let system_path = session_dir.join("system.wav");
         let mic_path = session_dir.join("mic.wav");
@@ -188,12 +186,19 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
         let system_path_t = system_path.clone();
         let mix_path_t = mix_path.clone();
         let mix_asr_path_t = mix_asr_path.clone();
+        let transcript_path_t = transcript_path.clone();
 
         // Use mic_pcm_tx.clone() to pass to valid stream
         let mic_tx_for_capture = mic_pcm_tx.clone();
 
         // Shared Atomic Gate for AEC (Energy Interlock)
         let system_speaking = Arc::new(AtomicBool::new(false));
+
+        // Record the start timestamp for post-processing alignment
+        let recording_start_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
 
         // Spawn recording thread
         let sys_speaking_mic = system_speaking.clone();
@@ -447,10 +452,11 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             // and was dropped when that block returned. The SystemAudioStream::drop
             // should have sent a signal to the tokio forwarding task.
 
-            // 5) Mix (Background Thread)
+            // 5) Mix + Offline Diarization (Background Thread)
             // We spawn a new thread so the join handle returns immediately,
             // allowing stop_recording to return to UI without waiting for mix.
             let mix_app = rec_app.clone();
+            let transcript_path_bg = transcript_path_t;
             std::thread::spawn(move || {
                 use tauri::Emitter;
                 // Notify start of mixing (optional, mainly for debug logs)
@@ -481,10 +487,33 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
                                 .emit("tray-log", format!("❌ Convert mix_asr failed: {}", e));
                         }
                     }
+
+                    // ── v8.0: Post-recording offline diarization ──────────────
+                    if crate::diarization::is_initialized() {
+                        println!("🔄 [DIARIZATION] Starting offline post-processing...");
+                        match crate::diarization::process_wav(&mix_path_t) {
+                            Ok(segments) => {
+                                println!("✅ [DIARIZATION] Got {} segments, relabeling transcript...", segments.len());
+                                match crate::diarization::relabel_transcript(
+                                    &transcript_path_bg,
+                                    &segments,
+                                    recording_start_ms,
+                                ) {
+                                    Ok(n) => {
+                                        println!("✅ [DIARIZATION] Relabeled {} entries", n);
+                                        let _ = mix_app.emit("tray-log", format!("✅ Speaker diarization complete: {} entries relabeled", n));
+                                    }
+                                    Err(e) => eprintln!("⚠️ [DIARIZATION] Relabel failed: {}", e),
+                                }
+                            }
+                            Err(e) => eprintln!("⚠️ [DIARIZATION] Offline processing failed: {}", e),
+                        }
+                    }
                 }
             });
             println!("🔄 [LIFECYCLE: rec_join thread EXIT] Recording thread ending");
         });
+
 
         *guard = Some(RecorderHandle {
             stop,
@@ -498,6 +527,8 @@ fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String> {
             mix_path: mix_path.clone(),
             mix_asr_path: mix_asr_path.clone(),
             transcript_writer: transcript_writer.clone(),
+            transcript_path: transcript_path.clone(),
+            recording_start_ms,
         });
 
         Ok((
@@ -550,6 +581,8 @@ async fn stop_recording(app: tauri::AppHandle) -> Result<(String, String, String
         let system_path = handle.system_path.clone();
         let mic_path = handle.mic_path.clone();
         let mix_path = handle.mix_path.clone();
+        let transcript_path = handle.transcript_path.clone();
+        let recording_start_ms = handle.recording_start_ms;
 
         println!("🔄 [LIFECYCLE: stop_recording] Spawning blocking task for thread joins...");
         tauri::async_runtime::spawn_blocking(move || {
@@ -592,6 +625,7 @@ async fn stop_recording(app: tauri::AppHandle) -> Result<(String, String, String
             );
 
             println!("🔄 [LIFECYCLE: spawn_blocking EXIT] All threads joined!");
+
             (system_path, mic_path, mix_path)
         })
         .await
@@ -801,11 +835,13 @@ fn main() {
                      eprintln!("   (This is expected if SenseVoice model files are not downloaded)");
                 }
 
-                // Initialize Speaker Diarization pipeline (streaming: EmbeddingExtractor + EmbeddingManager)
+                // Initialize Speaker Diarization pipeline (v8.0: Offline Post-Processing)
                 println!("🎙️ [MAIN] Initializing Speaker Diarization pipeline...");
+                let segmentation_model = resource_base.join("sherpa-onnx-pyannote-segmentation-3-0/model.onnx");
                 let embedding_model = resource_base.join("speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx");
-                if let Err(e) = crate::diarization::DiarizationPipeline::init(&embedding_model, 0.38) {
+                if let Err(e) = crate::diarization::init(&segmentation_model, &embedding_model) {
                     eprintln!("⚠️ Failed to initialize DiarizationPipeline: {}", e);
+                    eprintln!("   Segmentation model: {}", segmentation_model.display());
                     eprintln!("   Embedding model: {}", embedding_model.display());
                 }
             });
