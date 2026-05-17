@@ -1,4 +1,5 @@
 src-tauri/bin/whisper-server-aarch64-apple-darwin
 src-tauri/resources/
+!src-tauri/resources/hallucination_filter.json
 src-tauri/target/
 src-tauri/examples/

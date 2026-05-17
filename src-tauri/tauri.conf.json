@@ -28,7 +28,9 @@
      "resources": [
         "resources/ggml-large-v3-turbo-q8_0.bin",
         "resources/silero_vad.onnx",
+        "resources/hallucination_filter.json",
         "resources/speaker_embedding/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        "resources/sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
         "resources/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx",
         "resources/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt",
         "libonnxruntime.1.17.1.dylib",
