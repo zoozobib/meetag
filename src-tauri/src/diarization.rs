@@ -429,6 +429,9 @@ pub fn transcribe_segments(
     // Overwrite the transcript file with diarization-based results
     let mut file = std::fs::File::create(transcript_path)?;
 
+    // Collect all entries (both new system segments and existing mic entries)
+    let mut final_entries: Vec<serde_json::Value> = realtime_mic_entries;
+
     for (i, seg) in segments.iter().enumerate() {
         // Extract audio slice for this segment
         let start_sample = (seg.start * sr as f32) as usize;
@@ -507,54 +510,34 @@ pub fn transcribe_segments(
                 crate::settings::AsrBackend::Whisper => "whisper",
             }
         });
-        if let Ok(line) = serde_json::to_string(&entry) {
-            writeln!(file, "{}", line)?;
-        }
 
         // Emit to frontend for display
         let payload = serde_json::json!({
             "text": text,
             "source": seg.speaker,
+            "is_final": true
         });
         let _ = app.emit("asr_final", payload.to_string());
 
+        final_entries.push(entry);
         transcribed += 1;
     }
 
-    // ── Add user ("me") entries from real-time mic transcript ────────────
-    // Read the pre-diarization transcript.jsonl (saved before overwrite) for mic entries.
-    // Only include entries with RMS > 0.06 (genuine user speech, not echo).
+    // Sort all entries chronologically by start time
+    final_entries.sort_by(|a, b| {
+        let a_start = a.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let b_start = b.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        a_start.partial_cmp(&b_start).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Write the perfectly sorted timeline to transcript.jsonl
     let mut user_entries = 0;
-    for entry in &realtime_mic_entries {
-        let rms = entry.get("rms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if rms <= 0.06 {
-            continue; // echo — skip
-        }
-        if let Some(text) = entry.get("text").and_then(|t| t.as_str()) {
-            if text.is_empty() {
-                continue;
-            }
-            let ts_ms = entry.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-            let backend_name = entry.get("backend").and_then(|b| b.as_str()).unwrap_or("unknown");
-
-            let me_entry = serde_json::json!({
-                "start": 0.0, // real-time entries don't have WAV-relative timestamps
-                "end": 0.0,
-                "speaker": "me",
-                "text": text,
-                "timestamp": ts_ms,
-                "backend": backend_name,
-            });
-            if let Ok(line) = serde_json::to_string(&me_entry) {
-                writeln!(file, "{}", line)?;
-            }
-
-            // Emit to frontend
-            let payload = serde_json::json!({ "text": text, "source": "me" });
-            let _ = app.emit("asr_final", payload.to_string());
-
-            println!("  👤 [me] (RMS={:.4}): {}", rms, text);
+    for entry in final_entries {
+        if entry.get("speaker").and_then(|s| s.as_str()) == Some("user") {
             user_entries += 1;
+        }
+        if let Ok(line) = serde_json::to_string(&entry) {
+            writeln!(file, "{}", line)?;
         }
     }
 

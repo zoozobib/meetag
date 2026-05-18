@@ -4,6 +4,12 @@ use tauri::{Emitter, Manager};
 
 use crate::text_filter;
 
+pub type RecentSystemTexts = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u128, String)>>>;
+
+pub fn new_system_text_buffer() -> RecentSystemTexts {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
 /// Global singleton for AudioProcessor (lazily initialized)
 static AUDIO_PROCESSOR: OnceCell<crate::audio_processor::AudioProcessor> = OnceCell::new();
 
@@ -20,6 +26,8 @@ pub fn realtime_inference_worker(
     mut rx: std::sync::mpsc::Receiver<i16>,
     source: String,
     transcript_writer: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    recording_start_ms: u128,
+    system_texts: RecentSystemTexts,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -35,10 +43,10 @@ pub fn realtime_inference_worker(
         silero_vad: sherpa_onnx::SileroVadModelConfig {
             model: Some(model_path.to_string_lossy().to_string()),
             threshold: 0.5,
-            min_silence_duration: 0.5,
+            min_silence_duration: 1.0,
             min_speech_duration: 0.25,
             window_size: 512,
-            max_speech_duration: 10.0,
+            max_speech_duration: 30.0,
         },
         sample_rate: 16000,
         num_threads: 1,
@@ -55,8 +63,11 @@ pub fn realtime_inference_worker(
     // ── State ────────────────────────────────────────────────────────────
     let mut last_transcript = String::new();
     let mut sample_buf: Vec<f32> = Vec::with_capacity(16000);
+    let mut interim_buf: Vec<f32> = Vec::with_capacity(16000 * 30);
     let mut segment_count: u64 = 0;
     let is_system = source == "system";
+    let mut last_interim_samples = 0;
+    let mut current_interim_interval = 1.5;
 
     // ── Main loop ────────────────────────────────────────────────────────
     while !stop.load(Ordering::Relaxed) {
@@ -64,6 +75,27 @@ pub fn realtime_inference_worker(
             Ok(s) => {
                 let f32_sample = s as f32 / 32768.0;
                 sample_buf.push(f32_sample);
+                interim_buf.push(f32_sample);
+
+                // Check interim conditions (simulated streaming)
+                let elapsed_since_last = interim_buf.len() as f32 / 16000.0 - last_interim_samples as f32 / 16000.0;
+                if elapsed_since_last >= current_interim_interval {
+                    let latest_chunk = &interim_buf[last_interim_samples..];
+                    let mut sum_sq = 0.0;
+                    for &x in latest_chunk { sum_sq += x * x; }
+                    let rms = (sum_sq / latest_chunk.len() as f32).sqrt();
+
+                    if rms > 0.01 {
+                        // Has energy, emit interim
+                        process_segment(
+                            &app, &interim_buf, &source, &transcript_writer,
+                            &mut last_transcript, is_system, false, recording_start_ms, &system_texts
+                        );
+                        last_interim_samples = interim_buf.len();
+                        current_interim_interval += 0.5; // slow down updates as buffer grows
+                        if current_interim_interval > 3.0 { current_interim_interval = 3.0; }
+                    }
+                }
 
                 if sample_buf.len() >= 512 {
                     vad.accept_waveform(&sample_buf);
@@ -72,18 +104,21 @@ pub fn realtime_inference_worker(
                     while !vad.is_empty() {
                         if let Some(segment) = vad.front() {
                             let samples = segment.samples();
-                            let duration_s = samples.len() as f32 / 16000.0;
                             segment_count += 1;
-
                             println!(
                                 "🎤 [VAD/{}] Segment #{}: {:.2}s ({} samples)",
-                                source, segment_count, duration_s, samples.len()
+                                source, segment_count, samples.len() as f32 / 16000.0, samples.len()
                             );
-
+                            
+                            // Emit final
                             process_segment(
                                 &app, samples, &source, &transcript_writer,
-                                &mut last_transcript, is_system,
+                                &mut last_transcript, is_system, true, recording_start_ms, &system_texts
                             );
+
+                            interim_buf.clear();
+                            last_interim_samples = 0;
+                            current_interim_interval = 1.5;
                         }
                         vad.pop();
                     }
@@ -109,13 +144,9 @@ pub fn realtime_inference_worker(
         if let Some(segment) = vad.front() {
             let samples = segment.samples();
             segment_count += 1;
-            println!(
-                "🎤 [VAD/{}] Final segment #{}: {:.2}s",
-                source, segment_count, samples.len() as f32 / 16000.0
-            );
             process_segment(
                 &app, samples, &source, &transcript_writer,
-                &mut last_transcript, is_system,
+                &mut last_transcript, is_system, true, recording_start_ms, &system_texts
             );
         }
         vad.pop();
@@ -125,6 +156,27 @@ pub fn realtime_inference_worker(
     Ok(())
 }
 
+fn longest_common_substring(s1: &str, s2: &str) -> String {
+    let c1: Vec<char> = s1.chars().collect();
+    let c2: Vec<char> = s2.chars().collect();
+    if c1.is_empty() || c2.is_empty() { return String::new(); }
+    let mut m = vec![vec![0; c2.len() + 1]; c1.len() + 1];
+    let mut max_len = 0;
+    let mut end_pos = 0;
+    for i in 1..=c1.len() {
+        for j in 1..=c2.len() {
+            if c1[i - 1] == c2[j - 1] {
+                m[i][j] = m[i - 1][j - 1] + 1;
+                if m[i][j] > max_len {
+                    max_len = m[i][j];
+                    end_pos = i;
+                }
+            }
+        }
+    }
+    c1[end_pos - max_len..end_pos].iter().collect()
+}
+
 /// Process a single VAD segment: denoise → ASR → emit (system only) + log.
 fn process_segment(
     app: &tauri::AppHandle,
@@ -132,7 +184,10 @@ fn process_segment(
     source: &str,
     transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     last_transcript: &mut String,
-    emit_to_frontend: bool,
+    is_system: bool,
+    is_final: bool,
+    recording_start_ms: u128,
+    system_texts: &RecentSystemTexts,
 ) {
     // Add 300ms silence padding
     let mut padded = samples_f32.to_vec();
@@ -195,46 +250,65 @@ fn process_segment(
 
     let segment_rms = result.rms_before;
 
-    // Determine whether to emit to frontend:
-    // - System channel: always emit (real-time display)
-    // - Mic channel: emit ONLY if RMS > 0.06 (user actually speaking into mic)
-    //   Echo through speakers has RMS ~0.04, direct speech has RMS ~0.08-0.12.
-    //   This 2x gap makes the gate robust across hardware configurations.
-    let should_emit = if emit_to_frontend {
-        true // system channel
-    } else {
-        // mic channel: energy gate
-        if segment_rms > 0.06 {
-            println!("🎙️ [ASR/user] User speech detected (RMS={:.4}): {:?}", segment_rms, text);
-            true
-        } else {
-            println!("🔇 [ASR/user] Echo discarded (RMS={:.4}): {:?}", segment_rms, text);
-            false
-        }
-    };
+    // --- 文本级回声消除与状态记录 ---
+    let mut final_text = text.clone();
+    if !is_system {
+        // me channel: textual echo subtraction
+        if let Ok(mut st) = system_texts.lock() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            st.retain(|(ts, _)| now.saturating_sub(*ts) < 15000); // keep last 15s
 
-    if should_emit {
-        let emit_source = if emit_to_frontend { source } else { "me" };
-        let payload = serde_json::json!({ "text": text, "source": emit_source });
-        let _ = app.emit("asr_final", payload.to_string());
+            for (_, sys_txt) in st.iter() {
+                let overlap = longest_common_substring(&final_text, sys_txt);
+                // If overlap is significant (e.g. >= 4 chars), subtract it
+                if overlap.chars().count() >= 4 {
+                    final_text = final_text.replace(&overlap, "").trim().to_string();
+                }
+            }
+        }
+        
+        // Basic RMS gate: If it's too quiet (<0.04), it's likely residual silence/hum, don't emit
+        if segment_rms <= 0.04 || final_text.is_empty() {
+            return;
+        }
+    } else if is_final {
+        // system channel: save to shared buffer for me-channel cancellation
+        if let Ok(mut st) = system_texts.lock() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            st.push_back((now, final_text.clone()));
+        }
     }
 
-    // Write to transcript.jsonl (always, with RMS for diarization filtering)
-    let entry = serde_json::json!({
-        "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-        "speaker": source,
-        "text": text,
-        "rms": segment_rms,
-        "inference_time_ms": inference_time_ms,
-        "backend": backend_name
+    // --- 前端发送 ---
+    let emit_source = if is_system { source } else { "me" };
+    let payload = serde_json::json!({ 
+        "text": final_text, 
+        "source": emit_source,
+        "is_final": is_final
     });
-    if let Ok(line) = serde_json::to_string(&entry) {
-        use std::io::Write;
-        if let Ok(mut w) = transcript_writer.lock() {
-            let _ = writeln!(w, "{}", line);
+    let _ = app.emit("asr_final", payload.to_string());
+
+    // --- 写入日志 (ONLY FINAL) ---
+    if is_final {
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let relative_end = (now_ms - recording_start_ms) as f32 / 1000.0;
+        let duration_s = samples_f32.len() as f32 / 16000.0;
+        let relative_start = (relative_end - duration_s).max(0.0);
+
+        let entry = serde_json::json!({
+            "start": relative_start,
+            "end": relative_end,
+            "speaker": source,
+            "text": final_text,
+            "rms": segment_rms,
+            "inference_time_ms": inference_time_ms,
+            "backend": backend_name
+        });
+        if let Ok(line) = serde_json::to_string(&entry) {
+            use std::io::Write;
+            if let Ok(mut w) = transcript_writer.lock() {
+                let _ = writeln!(w, "{}", line);
+            }
         }
     }
 }

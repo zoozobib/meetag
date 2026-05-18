@@ -140,6 +140,13 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
             }
         });
 
+        let system_texts = asr::new_system_text_buffer();
+
+    let recording_start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
         // ASR worker thread 1: User (Mic)
         // Mic ASR writes to transcript only — no frontend emission.
         // Echo is handled at the capture layer (raw signal routing).
@@ -147,6 +154,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         let asr_app_1 = app.clone();
         let stop_asr_1 = stop.clone();
         let tw_1 = transcript_writer.clone();
+        let st_1 = system_texts.clone();
         let asr_user_join = std::thread::spawn(move || {
             let _ = asr::realtime_inference_worker(
                 asr_app_1,
@@ -154,6 +162,8 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                 asr_mic_rx,
                 "user".to_string(),
                 tw_1,
+                recording_start_ms,
+                st_1,
             );
         });
 
@@ -162,6 +172,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         let asr_app_2 = app.clone();
         let stop_asr_2 = stop.clone();
         let tw_2 = transcript_writer.clone();
+        let st_2 = system_texts.clone();
         let asr_system_join = std::thread::spawn(move || {
             let _ = asr::realtime_inference_worker(
                 asr_app_2,
@@ -169,6 +180,8 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                 asr_sys_rx,
                 "system".to_string(),
                 tw_2,
+                recording_start_ms,
+                st_2,
             );
         });
 
@@ -184,11 +197,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
 
         // system_speaking already created above (before ASR workers)
 
-        // Record the start timestamp for post-processing alignment
-        let recording_start_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        // Record the start timestamp for post-processing alignment (moved up)
 
         // Spawn recording thread
         let sys_speaking_mic = system_speaking.clone();
