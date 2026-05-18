@@ -1103,6 +1103,7 @@
         function appendTranscript(payload) {
             let text = payload;
             let source = 'system'; // Default
+            let isFinal = true;
 
             // Try to parse JSON
             try {
@@ -1110,6 +1111,7 @@
                 if (obj.text) {
                     text = obj.text;
                     if (obj.source) source = obj.source;
+                    if (obj.is_final !== undefined) isFinal = obj.is_final;
                 }
             } catch (e) {
                 // Not JSON, assume generic text (legacy)
@@ -1118,19 +1120,46 @@
             const isUser = source === 'user';
             const alignClass = isUser ? 'user' : 'system';
             const label = isUser ? 'Me' : source;
+            const safeSourceId = String(source).replace(/\s+/g, '-');
+            const activeId = `active-msg-${safeSourceId}`;
 
-            const html = `
-                <div class="log-entry ${alignClass}">
-                    <div class="log-meta">
-                        <span style="font-weight:600;">${label}</span>
-                        <span>${getTimeStr()}</span>
+            let existingNode = document.getElementById(activeId);
+            
+            // If the message is empty and it's an interim, just ignore it
+            if (!text && !isFinal) return;
+
+            if (existingNode) {
+                // Update existing bubble
+                const bubble = existingNode.querySelector('.log-bubble');
+                if (bubble) bubble.innerHTML = text;
+                
+                // If it's finalized, remove the ID so it's locked
+                if (isFinal) {
+                    existingNode.removeAttribute('id');
+                    if (bubble) {
+                        bubble.style.opacity = '1';
+                        bubble.style.fontStyle = 'normal';
+                    }
+                }
+                logEl.scrollTop = logEl.scrollHeight;
+            } else {
+                // Create a new bubble
+                const idAttr = isFinal ? '' : `id="${activeId}"`;
+                const styleAttr = isFinal ? '' : 'opacity: 0.8; font-style: italic; transition: opacity 0.3s;';
+                
+                const html = `
+                    <div class="log-entry ${alignClass}" ${idAttr}>
+                        <div class="log-meta">
+                            <span style="font-weight:600;">${label}</span>
+                            <span>${getTimeStr()}</span>
+                        </div>
+                        <div class="log-bubble" style="${styleAttr}">
+                            ${text}
+                        </div>
                     </div>
-                    <div class="log-bubble">
-                        ${text}
-                    </div>
-                </div>
-            `;
-            appendHtml(html);
+                `;
+                appendHtml(html);
+            }
         }
 
         async function setupListeners() {

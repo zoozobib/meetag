@@ -4,10 +4,11 @@ use tauri::{Emitter, Manager};
 
 use crate::text_filter;
 
-pub type RecentSystemTexts = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u128, String)>>>;
+pub type RecentSystemTexts =
+    std::sync::Arc<std::sync::Mutex<(std::collections::VecDeque<(u128, String)>, String)>>;
 
 pub fn new_system_text_buffer() -> RecentSystemTexts {
-    std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+    std::sync::Arc::new(std::sync::Mutex::new((std::collections::VecDeque::new(), String::new())))
 }
 
 /// Global singleton for AudioProcessor (lazily initialized)
@@ -58,7 +59,10 @@ pub fn realtime_inference_worker(
     let vad = sherpa_onnx::VoiceActivityDetector::create(&vad_config, 60.0)
         .ok_or_else(|| "Failed to create Sherpa VAD".to_string())?;
 
-    println!("✅ [ASR/{}] Sherpa Silero VAD initialized (streaming mode)", source);
+    println!(
+        "✅ [ASR/{}] Sherpa Silero VAD initialized (streaming mode)",
+        source
+    );
 
     // ── State ────────────────────────────────────────────────────────────
     let mut last_transcript = String::new();
@@ -78,22 +82,43 @@ pub fn realtime_inference_worker(
                 interim_buf.push(f32_sample);
 
                 // Check interim conditions (simulated streaming)
-                let elapsed_since_last = interim_buf.len() as f32 / 16000.0 - last_interim_samples as f32 / 16000.0;
+                let elapsed_since_last =
+                    interim_buf.len() as f32 / 16000.0 - last_interim_samples as f32 / 16000.0;
                 if elapsed_since_last >= current_interim_interval {
                     let latest_chunk = &interim_buf[last_interim_samples..];
                     let mut sum_sq = 0.0;
-                    for &x in latest_chunk { sum_sq += x * x; }
+                    for &x in latest_chunk {
+                        sum_sq += x * x;
+                    }
                     let rms = (sum_sq / latest_chunk.len() as f32).sqrt();
 
                     if rms > 0.01 {
                         // Has energy, emit interim
-                        process_segment(
-                            &app, &interim_buf, &source, &transcript_writer,
-                            &mut last_transcript, is_system, false, recording_start_ms, &system_texts
+                        let was_finalized = process_segment(
+                            &app,
+                            &interim_buf,
+                            &source,
+                            &transcript_writer,
+                            &mut last_transcript,
+                            is_system,
+                            false,
+                            recording_start_ms,
+                            &system_texts,
                         );
-                        last_interim_samples = interim_buf.len();
-                        current_interim_interval += 0.5; // slow down updates as buffer grows
-                        if current_interim_interval > 3.0 { current_interim_interval = 3.0; }
+                        
+                        if was_finalized {
+                            // Semantic chunking triggered! Flush this segment
+                            interim_buf.clear();
+                            last_interim_samples = 0;
+                            current_interim_interval = 1.5;
+                            vad.clear(); // Reset VAD state so it starts fresh
+                        } else {
+                            last_interim_samples = interim_buf.len();
+                            current_interim_interval += 0.5; // slow down updates as buffer grows
+                            if current_interim_interval > 3.0 {
+                                current_interim_interval = 3.0;
+                            }
+                        }
                     }
                 }
 
@@ -107,13 +132,23 @@ pub fn realtime_inference_worker(
                             segment_count += 1;
                             println!(
                                 "🎤 [VAD/{}] Segment #{}: {:.2}s ({} samples)",
-                                source, segment_count, samples.len() as f32 / 16000.0, samples.len()
+                                source,
+                                segment_count,
+                                samples.len() as f32 / 16000.0,
+                                samples.len()
                             );
-                            
+
                             // Emit final
                             process_segment(
-                                &app, samples, &source, &transcript_writer,
-                                &mut last_transcript, is_system, true, recording_start_ms, &system_texts
+                                &app,
+                                samples,
+                                &source,
+                                &transcript_writer,
+                                &mut last_transcript,
+                                is_system,
+                                true,
+                                recording_start_ms,
+                                &system_texts,
                             );
 
                             interim_buf.clear();
@@ -145,21 +180,33 @@ pub fn realtime_inference_worker(
             let samples = segment.samples();
             segment_count += 1;
             process_segment(
-                &app, samples, &source, &transcript_writer,
-                &mut last_transcript, is_system, true, recording_start_ms, &system_texts
+                &app,
+                samples,
+                &source,
+                &transcript_writer,
+                &mut last_transcript,
+                is_system,
+                true,
+                recording_start_ms,
+                &system_texts,
             );
         }
         vad.pop();
     }
 
-    println!("✅ [ASR/{}] Worker stopped. {} segments processed.", source, segment_count);
+    println!(
+        "✅ [ASR/{}] Worker stopped. {} segments processed.",
+        source, segment_count
+    );
     Ok(())
 }
 
 fn longest_common_substring(s1: &str, s2: &str) -> String {
     let c1: Vec<char> = s1.chars().collect();
     let c2: Vec<char> = s2.chars().collect();
-    if c1.is_empty() || c2.is_empty() { return String::new(); }
+    if c1.is_empty() || c2.is_empty() {
+        return String::new();
+    }
     let mut m = vec![vec![0; c2.len() + 1]; c1.len() + 1];
     let mut max_len = 0;
     let mut end_pos = 0;
@@ -178,6 +225,7 @@ fn longest_common_substring(s1: &str, s2: &str) -> String {
 }
 
 /// Process a single VAD segment: denoise → ASR → emit (system only) + log.
+/// Returns true if the segment was finalized (either explicitly or via semantic chunking).
 fn process_segment(
     app: &tauri::AppHandle,
     samples_f32: &[f32],
@@ -188,7 +236,7 @@ fn process_segment(
     is_final: bool,
     recording_start_ms: u128,
     system_texts: &RecentSystemTexts,
-) {
+) -> bool {
     // Add 300ms silence padding
     let mut padded = samples_f32.to_vec();
     padded.resize(padded.len() + 4800, 0.0);
@@ -210,7 +258,7 @@ fn process_segment(
         crate::settings::AsrBackend::FunAsr => {
             if !crate::funasr::SenseVoiceManager::is_initialized() {
                 eprintln!("❌ [ASR] FunASR not initialized!");
-                return;
+                return false;
             }
             let funasr = crate::funasr::SenseVoiceManager::get();
             let i16_samples: Vec<i16> = denoised
@@ -219,7 +267,10 @@ fn process_segment(
                 .collect();
             match funasr.transcribe(&i16_samples) {
                 Ok(r) => (r.text.trim().to_string(), "funasr", r.inference_time_ms),
-                Err(e) => { eprintln!("❌ [FUNASR] Error: {}", e); return; }
+                Err(e) => {
+                    eprintln!("❌ [FUNASR] Error: {}", e);
+                    return false;
+                }
             }
         }
         crate::settings::AsrBackend::Whisper => {
@@ -227,23 +278,41 @@ fn process_segment(
             let prompt = if last_transcript.is_empty() {
                 "这是一段会议记录。".to_string()
             } else {
-                last_transcript.chars().rev().take(100).collect::<Vec<_>>().into_iter().rev().collect()
+                last_transcript
+                    .chars()
+                    .rev()
+                    .take(100)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
             };
             match whisper.transcribe_f32(denoised, "zh", Some(&prompt)) {
                 Ok(r) => {
-                    if r.segments.iter().any(|s| s.avg_logprob < -1.0) { return; }
+                    if r.segments.iter().any(|s| s.avg_logprob < -1.0) {
+                        return false;
+                    }
                     (r.text.trim().to_string(), "whisper", r.inference_time_ms)
                 }
-                Err(e) => { eprintln!("❌ [WHISPER] Error: {}", e); return; }
+                Err(e) => {
+                    eprintln!("❌ [WHISPER] Error: {}", e);
+                    return false;
+                }
             }
         }
     };
 
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return false;
+    }
 
     if crate::text_filter::is_hallucination(&text) {
-        println!("🗑️ [{}] Discarding hallucination: {:?}", backend_name.to_uppercase(), text);
-        return;
+        println!(
+            "🗑️ [{}] Discarding hallucination: {:?}",
+            backend_name.to_uppercase(),
+            text
+        );
+        return false;
     }
 
     *last_transcript = text.clone();
@@ -252,45 +321,74 @@ fn process_segment(
 
     // --- 文本级回声消除与状态记录 ---
     let mut final_text = text.clone();
+    
+    // Semantic Chunking: If it's a long enough sentence ending with strong punctuation, force final
+    let is_semantic_final = !is_final 
+        && final_text.chars().count() >= 8 
+        && (final_text.ends_with('。') || final_text.ends_with('？') || final_text.ends_with('！'));
+        
+    let effective_final = is_final || is_semantic_final;
+
     if !is_system {
         // me channel: textual echo subtraction
         if let Ok(mut st) = system_texts.lock() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-            st.retain(|(ts, _)| now.saturating_sub(*ts) < 15000); // keep last 15s
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            st.0.retain(|(ts, _)| now.saturating_sub(*ts) < 15000); // keep last 15s
 
-            for (_, sys_txt) in st.iter() {
+            // Subtract from finalized texts
+            for (_, sys_txt) in st.0.iter() {
                 let overlap = longest_common_substring(&final_text, sys_txt);
                 // If overlap is significant (e.g. >= 4 chars), subtract it
                 if overlap.chars().count() >= 4 {
                     final_text = final_text.replace(&overlap, "").trim().to_string();
                 }
             }
+
+            // Subtract from current interim text
+            let overlap = longest_common_substring(&final_text, &st.1);
+            if overlap.chars().count() >= 4 {
+                final_text = final_text.replace(&overlap, "").trim().to_string();
+            }
         }
-        
+
         // Basic RMS gate: If it's too quiet (<0.04), it's likely residual silence/hum, don't emit
         if segment_rms <= 0.04 || final_text.is_empty() {
-            return;
+            return false;
         }
-    } else if is_final {
+    } else {
         // system channel: save to shared buffer for me-channel cancellation
         if let Ok(mut st) = system_texts.lock() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-            st.push_back((now, final_text.clone()));
+            if effective_final {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                st.0.push_back((now, final_text.clone()));
+                st.1.clear();
+            } else {
+                st.1 = final_text.clone();
+            }
         }
     }
 
     // --- 前端发送 ---
     let emit_source = if is_system { source } else { "me" };
-    let payload = serde_json::json!({ 
-        "text": final_text, 
+    let payload = serde_json::json!({
+        "text": final_text,
         "source": emit_source,
-        "is_final": is_final
+        "is_final": effective_final
     });
     let _ = app.emit("asr_final", payload.to_string());
 
     // --- 写入日志 (ONLY FINAL) ---
-    if is_final {
-        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    if effective_final {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let relative_end = (now_ms - recording_start_ms) as f32 / 1000.0;
         let duration_s = samples_f32.len() as f32 / 16000.0;
         let relative_start = (relative_end - duration_s).max(0.0);
@@ -311,4 +409,5 @@ fn process_segment(
             }
         }
     }
+    effective_final
 }
