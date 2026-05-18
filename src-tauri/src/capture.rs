@@ -204,8 +204,6 @@ pub fn start_mic_stream(
                     for frame in processed.chunks_mut(ch) {
                         for (i, sample) in frame.iter_mut().enumerate() {
                             if i < agcs.len() {
-                                // Apply AGC to this sample
-                                // We make a tiny slice for the API
                                 let mut s_slice = [*sample];
                                 agcs[i].process(&mut s_slice);
                                 *sample = s_slice[0];
@@ -232,18 +230,36 @@ pub fn start_mic_stream(
                     w.lock().unwrap().write_data(&bytes);
 
                     // 3. ASR Path (Downmix -> Resample -> Send)
-                    let is_echo_active = sys_speak_f32.load(Ordering::Relaxed);
+                    // When system audio is playing, send RAW (pre-DAGC) audio to ASR.
+                    // This way the Silero VAD sees echo at its natural ~0.01 RMS and won't trigger.
+                    // When system is silent, send DAGC audio to help capture quiet in-room speakers.
+                    let use_raw_for_asr = sys_speak_f32.load(Ordering::Relaxed);
 
                     let mut asr_bytes = Vec::new();
-                    // Iterate frames
-                    for frame in processed.chunks(ch) {
-                        let mut mono = 0.0f32;
-                        for &s in frame {
-                            mono += s;
-                        }
-                        mono /= ch as f32;
+                    let mut raw_idx = 0usize; // tracks position in original `data`
 
-                        // Linear resample
+                    // Iterate frames from DAGC-processed audio
+                    for frame in processed.chunks(ch) {
+                        // DAGC mono
+                        let mut mono_dagc = 0.0f32;
+                        for &s in frame {
+                            mono_dagc += s;
+                        }
+                        mono_dagc /= ch as f32;
+
+                        // Raw mono (from original `data`, same frame layout)
+                        let mut mono_raw = 0.0f32;
+                        let end = (raw_idx + ch).min(data.len());
+                        for i in raw_idx..end {
+                            mono_raw += data[i];
+                        }
+                        mono_raw /= ch as f32;
+                        raw_idx += ch;
+
+                        // Choose source based on system audio state
+                        let mono = if use_raw_for_asr { mono_raw } else { mono_dagc };
+
+                        // Linear resample to 16kHz
                         rs_phase += 1.0 / ratio;
                         while rs_phase >= 1.0 {
                             let t = 1.0 - (rs_phase - 1.0);
@@ -258,17 +274,11 @@ pub fn start_mic_stream(
                     if !asr_bytes.is_empty() {
                         w_asr.lock().unwrap().write_data(&asr_bytes);
 
-                        // Send 16k mono ASR samples
+                        // Send 16k mono ASR samples to mixer and ASR worker
                         for ch_bytes in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch_bytes[0], ch_bytes[1]]);
                             let _ = tx_mix.send(v);
-
-                            // AEC Gate
-                            if is_echo_active {
-                                let _ = tx_asr.send(0);
-                            } else {
-                                let _ = tx_asr.send(v);
-                            }
+                            let _ = tx_asr.send(v);
                         }
                     }
                 },
@@ -346,16 +356,28 @@ pub fn start_mic_stream(
                     }
                     w.lock().unwrap().write_data(&bytes);
 
-                    // ASR Path
-                    let is_echo_active = sys_speak.load(Ordering::Relaxed);
+                    // ASR Path: raw when system active, DAGC when silent
+                    let use_raw_for_asr = sys_speak.load(Ordering::Relaxed);
                     let mut asr_bytes = Vec::new();
+                    let mut raw_idx = 0usize;
 
                     for frame in processed_f32.chunks(ch) {
-                        let mut mono = 0.0f32;
+                        let mut mono_dagc = 0.0f32;
                         for &s in frame {
-                            mono += s;
+                            mono_dagc += s;
                         }
-                        mono /= ch as f32;
+                        mono_dagc /= ch as f32;
+
+                        // Raw mono from original i16 data
+                        let mut mono_raw = 0.0f32;
+                        let end = (raw_idx + ch).min(data.len());
+                        for i in raw_idx..end {
+                            mono_raw += data[i] as f32 / i16::MAX as f32;
+                        }
+                        mono_raw /= ch as f32;
+                        raw_idx += ch;
+
+                        let mono = if use_raw_for_asr { mono_raw } else { mono_dagc };
 
                         rs_phase += 1.0 / ratio;
                         while rs_phase >= 1.0 {
@@ -373,11 +395,7 @@ pub fn start_mic_stream(
                         for ch_bytes in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch_bytes[0], ch_bytes[1]]);
                             let _ = tx_mix.send(v);
-                            if is_echo_active {
-                                let _ = tx_asr.send(0);
-                            } else {
-                                let _ = tx_asr.send(v);
-                            }
+                            let _ = tx_asr.send(v);
                         }
                     }
                 },
@@ -450,15 +468,28 @@ pub fn start_mic_stream(
                     }
                     w.lock().unwrap().write_data(&bytes);
 
-                    // ASR Path
-                    let is_echo_active = sys_speak.load(Ordering::Relaxed);
+                    // ASR Path: raw when system active, DAGC when silent
+                    let use_raw_for_asr = sys_speak.load(Ordering::Relaxed);
                     let mut asr_bytes = Vec::new();
+                    let mut raw_idx = 0usize;
+
                     for frame in processed_f32.chunks(ch) {
-                        let mut mono = 0.0f32;
+                        let mut mono_dagc = 0.0f32;
                         for &s in frame {
-                            mono += s;
+                            mono_dagc += s;
                         }
-                        mono /= ch as f32;
+                        mono_dagc /= ch as f32;
+
+                        let mut mono_raw = 0.0f32;
+                        let end = (raw_idx + ch).min(data.len());
+                        for i in raw_idx..end {
+                            mono_raw += (data[i] as f32 / u16::MAX as f32) * 2.0 - 1.0;
+                        }
+                        mono_raw /= ch as f32;
+                        raw_idx += ch;
+
+                        let mono = if use_raw_for_asr { mono_raw } else { mono_dagc };
+
                         rs_phase += 1.0 / ratio;
                         while rs_phase >= 1.0 {
                             let t = 1.0 - (rs_phase - 1.0);
@@ -474,11 +505,7 @@ pub fn start_mic_stream(
                         for ch_bytes in asr_bytes.chunks_exact(2) {
                             let v = i16::from_le_bytes([ch_bytes[0], ch_bytes[1]]);
                             let _ = tx_mix.send(v);
-                            if is_echo_active {
-                                let _ = tx_asr.send(0);
-                            } else {
-                                let _ = tx_asr.send(v);
-                            }
+                            let _ = tx_asr.send(v);
                         }
                     }
                 },

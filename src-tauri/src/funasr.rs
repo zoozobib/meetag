@@ -49,7 +49,7 @@ impl SenseVoiceManager {
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
             model: Some(model_path.to_string_lossy().to_string()),
-            language: Some("auto".to_string()),
+            language: Some("zh".to_string()),
             use_itn: true,
         };
         config.model_config.tokens = Some(tokens_path.to_string_lossy().to_string());

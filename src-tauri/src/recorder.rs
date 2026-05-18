@@ -104,6 +104,9 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
 
         // Stop flag
         let stop = Arc::new(AtomicBool::new(false));
+        // Shared Atomic Gate for AEC (Energy Interlock)
+        let system_speaking = Arc::new(AtomicBool::new(false));
+
         // Realtime PCM channels
         let (mic_pcm_tx, mic_pcm_rx) = std::sync::mpsc::channel::<i16>();
         let (sys_pcm_tx, sys_pcm_rx) = std::sync::mpsc::channel::<i16>();
@@ -120,7 +123,6 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         let stop_mix = stop.clone();
         let mixer_join = std::thread::spawn(move || {
             let mut s_last: i16 = 0;
-            // Synchronize on Mic stream (16kHz clock)
             while let Ok(mic_sample) = mic_pcm_rx.recv() {
                 if stop_mix.load(Ordering::Acquire) {
                     break;
@@ -128,13 +130,10 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                 if let Ok(v) = sys_pcm_rx.try_recv() {
                     s_last = v;
                 } else {
-                    // If system stream is slower/empty
                     if s_last != 0 {
                         s_last = 0;
                     }
                 }
-
-                // Saturation mix
                 let sum = mic_sample as i32 + s_last as i32;
                 let mixed = sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                 let _ = mix_pcm_tx.send(mixed);
@@ -142,6 +141,9 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         });
 
         // ASR worker thread 1: User (Mic)
+        // Mic ASR writes to transcript only — no frontend emission.
+        // Echo is handled at the capture layer (raw signal routing).
+        // Offline diarization produces the final speaker-attributed result.
         let asr_app_1 = app.clone();
         let stop_asr_1 = stop.clone();
         let tw_1 = transcript_writer.clone();
@@ -156,6 +158,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         });
 
         // ASR worker thread 2: System (Speaker)
+        // System ASR emits to frontend immediately for real-time display.
         let asr_app_2 = app.clone();
         let stop_asr_2 = stop.clone();
         let tw_2 = transcript_writer.clone();
@@ -179,8 +182,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         // Use mic_pcm_tx.clone() to pass to valid stream
         let mic_tx_for_capture = mic_pcm_tx.clone();
 
-        // Shared Atomic Gate for AEC (Energy Interlock)
-        let system_speaking = Arc::new(AtomicBool::new(false));
+        // system_speaking already created above (before ASR workers)
 
         // Record the start timestamp for post-processing alignment
         let recording_start_ms = std::time::SystemTime::now()
@@ -476,22 +478,23 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                         }
                     }
 
-                    // ── v8.0: Post-recording offline diarization ──────────────
+                    // ── v10.0: Diarize system.wav (clean, no echo) + merge user entries ──
                     if crate::diarization::is_initialized() {
-                        println!("🔄 [DIARIZATION] Starting offline post-processing...");
-                        match crate::diarization::process_wav(&mix_path_t) {
+                        println!("🔄 [DIARIZATION] Starting offline post-processing on system.wav...");
+                        match crate::diarization::process_wav(&system_path_t) {
                             Ok(segments) => {
-                                println!("✅ [DIARIZATION] Got {} segments, relabeling transcript...", segments.len());
-                                match crate::diarization::relabel_transcript(
-                                    &transcript_path_bg,
+                                println!("✅ [DIARIZATION] Got {} segments, transcribing each...", segments.len());
+                                match crate::diarization::transcribe_segments(
+                                    &system_path_t,
                                     &segments,
-                                    recording_start_ms,
+                                    &transcript_path_bg,
+                                    &mix_app,
                                 ) {
                                     Ok(n) => {
-                                        println!("✅ [DIARIZATION] Relabeled {} entries", n);
-                                        let _ = mix_app.emit("tray-log", format!("✅ Speaker diarization complete: {} entries relabeled", n));
+                                        println!("✅ [DIARIZATION] Transcribed {} segments", n);
+                                        let _ = mix_app.emit("tray-log", format!("✅ Speaker diarization complete: {} segments transcribed", n));
                                     }
-                                    Err(e) => eprintln!("⚠️ [DIARIZATION] Relabel failed: {}", e),
+                                    Err(e) => eprintln!("⚠️ [DIARIZATION] Transcription failed: {}", e),
                                 }
                             }
                             Err(e) => eprintln!("⚠️ [DIARIZATION] Offline processing failed: {}", e),

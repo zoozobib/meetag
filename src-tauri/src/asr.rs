@@ -7,14 +7,13 @@ use crate::text_filter;
 /// Global singleton for AudioProcessor (lazily initialized)
 static AUDIO_PROCESSOR: OnceCell<crate::audio_processor::AudioProcessor> = OnceCell::new();
 
-/// Realtime ASR worker — powered by Sherpa-ONNX Silero VAD for intelligent segmentation.
+/// Realtime ASR worker — powered by Sherpa-ONNX Silero VAD.
 ///
-/// The VAD model handles all speech boundary detection internally:
-///   - Speech/silence classification (neural network, not energy-based rules)
-///   - Minimum speech/silence duration filtering
-///   - Automatic segment boundary detection
-///
-/// No hand-written debounce, no adaptive thresholds, no RMS gates, no density filters.
+/// Architecture:
+/// - System channel ("system"): results are emitted to frontend immediately for real-time display.
+/// - Mic channel ("user"): results are written to transcript.jsonl ONLY.
+///   No frontend emission — echo is handled at the capture layer (raw signal routing).
+///   The offline diarization produces the final speaker-attributed result.
 pub fn realtime_inference_worker(
     app: tauri::AppHandle,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -28,27 +27,18 @@ pub fn realtime_inference_worker(
     // ── Initialize Sherpa VAD (streaming mode) ──────────────────────────
     let model_path = app
         .path()
-        .resolve(
-            "resources/silero_vad.onnx",
-            tauri::path::BaseDirectory::Resource,
-        )
-        .map_err(|e| format!("Failed to resolve VAD model: {}", e))?;
-
-    if !model_path.exists() {
-        return Err(format!(
-            "Silero VAD model not found: {}",
-            model_path.display()
-        ));
-    }
+        .resource_dir()
+        .map_err(|e| format!("Failed to get resource dir: {}", e))?
+        .join("resources/silero_vad.onnx");
 
     let vad_config = sherpa_onnx::VadModelConfig {
         silero_vad: sherpa_onnx::SileroVadModelConfig {
-            model: Some(model_path.to_string_lossy().into_owned()),
-            threshold: 0.5,              // speech probability threshold (model default)
-            min_silence_duration: 0.5,   // 500ms silence = sentence boundary
-            min_speech_duration: 0.25,   // ignore speech shorter than 250ms
-            window_size: 512,            // Silero model window size
-            max_speech_duration: 30.0,   // force-cut at 30s (safety limit)
+            model: Some(model_path.to_string_lossy().to_string()),
+            threshold: 0.5,
+            min_silence_duration: 0.5,
+            min_speech_duration: 0.25,
+            window_size: 512,
+            max_speech_duration: 10.0,
         },
         sample_rate: 16000,
         num_threads: 1,
@@ -63,25 +53,22 @@ pub fn realtime_inference_worker(
     println!("✅ [ASR/{}] Sherpa Silero VAD initialized (streaming mode)", source);
 
     // ── State ────────────────────────────────────────────────────────────
-    let mut current_speaker = source.clone();
     let mut last_transcript = String::new();
-    let mut sample_buf: Vec<f32> = Vec::with_capacity(16000); // 1s accumulator
+    let mut sample_buf: Vec<f32> = Vec::with_capacity(16000);
     let mut segment_count: u64 = 0;
+    let is_system = source == "system";
 
     // ── Main loop ────────────────────────────────────────────────────────
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(s) => {
-                // Convert i16 → f32 and feed to VAD
                 let f32_sample = s as f32 / 32768.0;
                 sample_buf.push(f32_sample);
 
-                // Feed in chunks (VAD window_size = 512 samples = 32ms)
                 if sample_buf.len() >= 512 {
                     vad.accept_waveform(&sample_buf);
                     sample_buf.clear();
 
-                    // Check if VAD has produced any complete speech segments
                     while !vad.is_empty() {
                         if let Some(segment) = vad.front() {
                             let samples = segment.samples();
@@ -93,14 +80,9 @@ pub fn realtime_inference_worker(
                                 source, segment_count, duration_s, samples.len()
                             );
 
-                            // Send to ASR (the segment is already clean speech)
-                            send_audio_to_asr(
-                                &app,
-                                samples,
-                                &source,
-                                &transcript_writer,
-                                &mut current_speaker,
-                                &mut last_transcript,
+                            process_segment(
+                                &app, samples, &source, &transcript_writer,
+                                &mut last_transcript, is_system,
                             );
                         }
                         vad.pop();
@@ -108,7 +90,6 @@ pub fn realtime_inference_worker(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Feed any remaining samples on timeout
                 if !sample_buf.is_empty() {
                     vad.accept_waveform(&sample_buf);
                     sample_buf.clear();
@@ -132,13 +113,9 @@ pub fn realtime_inference_worker(
                 "🎤 [VAD/{}] Final segment #{}: {:.2}s",
                 source, segment_count, samples.len() as f32 / 16000.0
             );
-            send_audio_to_asr(
-                &app,
-                samples,
-                &source,
-                &transcript_writer,
-                &mut current_speaker,
-                &mut last_transcript,
+            process_segment(
+                &app, samples, &source, &transcript_writer,
+                &mut last_transcript, is_system,
             );
         }
         vad.pop();
@@ -148,160 +125,111 @@ pub fn realtime_inference_worker(
     Ok(())
 }
 
-fn send_audio_to_asr(
+/// Process a single VAD segment: denoise → ASR → emit (system only) + log.
+fn process_segment(
     app: &tauri::AppHandle,
     samples_f32: &[f32],
     source: &str,
     transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
-    current_speaker: &mut String,
     last_transcript: &mut String,
+    emit_to_frontend: bool,
 ) {
-    // Speaker label = audio source (post-recording diarization will relabel)
-    let speaker_label = source.to_string();
-    *current_speaker = speaker_label.clone();
+    // Add 300ms silence padding
+    let mut padded = samples_f32.to_vec();
+    padded.resize(padded.len() + 4800, 0.0);
 
-    // Add 300ms silence padding to help ASR complete the last word
-    let mut padded_f32 = samples_f32.to_vec();
-    padded_f32.resize(padded_f32.len() + 4800, 0.0);
-
-    // === NOISE REDUCTION ===
+    // Noise reduction
     let audio_processor =
         AUDIO_PROCESSOR.get_or_init(|| crate::audio_processor::AudioProcessor::new(16000));
-
-    let denoise_result = audio_processor.denoise(&padded_f32);
-    let denoised_f32: &[f32] = &denoise_result.samples;
+    let result = audio_processor.denoise(&padded);
+    let denoised = &result.samples;
 
     println!(
         "🔇 [ASR] Noise reduction: RMS {:.4} → {:.4} ({:.1} dB)",
-        denoise_result.rms_before, denoise_result.rms_after, denoise_result.noise_reduction_db
+        result.rms_before, result.rms_after, result.noise_reduction_db
     );
 
-    // Check backend setting
     let backend = crate::settings::SETTINGS.read().unwrap().asr.backend;
 
-    match backend {
+    let (text, backend_name, inference_time_ms) = match backend {
         crate::settings::AsrBackend::FunAsr => {
             if !crate::funasr::SenseVoiceManager::is_initialized() {
-                eprintln!("❌ [ASR] FunASR selected but not initialized!");
+                eprintln!("❌ [ASR] FunASR not initialized!");
                 return;
             }
             let funasr = crate::funasr::SenseVoiceManager::get();
-            let denoised_i16: Vec<i16> = denoised_f32
+            let i16_samples: Vec<i16> = denoised
                 .iter()
                 .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
                 .collect();
-            match funasr.transcribe(&denoised_i16) {
-                Ok(result) => {
-                    emit_and_log(
-                        app,
-                        result.text.trim(),
-                        &speaker_label,
-                        "funasr",
-                        result.inference_time_ms,
-                        transcript_writer,
-                        last_transcript,
-                    );
-                }
-                Err(e) => {
-                    eprintln!("❌ [FUNASR] Transcription error: {}", e);
-                }
+            match funasr.transcribe(&i16_samples) {
+                Ok(r) => (r.text.trim().to_string(), "funasr", r.inference_time_ms),
+                Err(e) => { eprintln!("❌ [FUNASR] Error: {}", e); return; }
             }
         }
         crate::settings::AsrBackend::Whisper => {
             let whisper = crate::whisper::WhisperManager::get();
-
-            let initial_prompt = if last_transcript.is_empty() {
+            let prompt = if last_transcript.is_empty() {
                 "这是一段会议记录。".to_string()
             } else {
-                last_transcript
-                    .chars()
-                    .rev()
-                    .take(100)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect()
+                last_transcript.chars().rev().take(100).collect::<Vec<_>>().into_iter().rev().collect()
             };
-
-            match whisper.transcribe_f32(denoised_f32, "zh", Some(&initial_prompt)) {
-                Ok(result) => {
-                    let is_reliable = result.segments.iter().all(|seg| {
-                        if seg.avg_logprob < -1.0 {
-                            eprintln!(
-                                "⚠️ ASR Low Confidence: logprob={:.3} < -1.0, text={:?}",
-                                seg.avg_logprob, seg.text
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    });
-
-                    if is_reliable {
-                        emit_and_log(
-                            app,
-                            result.text.trim(),
-                            &speaker_label,
-                            "whisper",
-                            result.inference_time_ms,
-                            transcript_writer,
-                            last_transcript,
-                        );
-                    }
+            match whisper.transcribe_f32(denoised, "zh", Some(&prompt)) {
+                Ok(r) => {
+                    if r.segments.iter().any(|s| s.avg_logprob < -1.0) { return; }
+                    (r.text.trim().to_string(), "whisper", r.inference_time_ms)
                 }
-                Err(e) => {
-                    eprintln!("❌ [WHISPER] Transcription error: {}", e);
-                }
+                Err(e) => { eprintln!("❌ [WHISPER] Error: {}", e); return; }
             }
         }
-    }
-}
+    };
 
-/// Common output handler for both ASR backends.
-/// Filters hallucinations, emits to frontend, writes to transcript.jsonl.
-fn emit_and_log(
-    app: &tauri::AppHandle,
-    text: &str,
-    speaker_label: &str,
-    backend: &str,
-    inference_time_ms: u64,
-    transcript_writer: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
-    last_transcript: &mut String,
-) {
-    if text.is_empty() {
+    if text.is_empty() { return; }
+
+    if crate::text_filter::is_hallucination(&text) {
+        println!("🗑️ [{}] Discarding hallucination: {:?}", backend_name.to_uppercase(), text);
         return;
     }
 
-    // Text Post-processing (Blacklist/Repetition)
-    if crate::text_filter::is_hallucination(text) {
-        println!(
-            "🗑️ [{}] Discarding hallucination: {:?}",
-            backend.to_uppercase(),
-            text
-        );
-        return;
+    *last_transcript = text.clone();
+
+    let segment_rms = result.rms_before;
+
+    // Determine whether to emit to frontend:
+    // - System channel: always emit (real-time display)
+    // - Mic channel: emit ONLY if RMS > 0.06 (user actually speaking into mic)
+    //   Echo through speakers has RMS ~0.04, direct speech has RMS ~0.08-0.12.
+    //   This 2x gap makes the gate robust across hardware configurations.
+    let should_emit = if emit_to_frontend {
+        true // system channel
+    } else {
+        // mic channel: energy gate
+        if segment_rms > 0.06 {
+            println!("🎙️ [ASR/user] User speech detected (RMS={:.4}): {:?}", segment_rms, text);
+            true
+        } else {
+            println!("🔇 [ASR/user] Echo discarded (RMS={:.4}): {:?}", segment_rms, text);
+            false
+        }
+    };
+
+    if should_emit {
+        let emit_source = if emit_to_frontend { source } else { "me" };
+        let payload = serde_json::json!({ "text": text, "source": emit_source });
+        let _ = app.emit("asr_final", payload.to_string());
     }
 
-    // Emit to frontend
-    let payload = serde_json::json!({
-        "text": text,
-        "source": speaker_label,
-    });
-    let _ = app.emit("asr_final", payload.to_string());
-
-    // Update context for next inference
-    *last_transcript = text.to_string();
-
-    // Append to transcript.jsonl
+    // Write to transcript.jsonl (always, with RMS for diarization filtering)
     let entry = serde_json::json!({
         "timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis(),
-        "speaker": speaker_label,
+        "speaker": source,
         "text": text,
+        "rms": segment_rms,
         "inference_time_ms": inference_time_ms,
-        "backend": backend
+        "backend": backend_name
     });
     if let Ok(line) = serde_json::to_string(&entry) {
         use std::io::Write;
