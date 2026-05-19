@@ -137,12 +137,18 @@ pub fn realtime_inference_worker(
                             Ok(was_finalized) => {
                                 if was_finalized || is_window_full {
                                     if is_window_full {
-                                        // Overlap-Save for Sliding Window
+                                        segment_count += 1;
+                                        println!(
+                                            "[WINDOW/{}] Slide #{}: {:.2}s -> keep {:.2}s overlap",
+                                            source,
+                                            segment_count,
+                                            interim_buf.len() as f32 / 16000.0,
+                                            overlap_samples as f32 / 16000.0
+                                        );
                                         let keep = std::cmp::min(interim_buf.len(), overlap_samples);
                                         let tail = interim_buf[interim_buf.len() - keep..].to_vec();
                                         interim_buf = tail;
                                     } else {
-                                        // Should not happen naturally without VAD, but fallback
                                         interim_buf.clear();
                                         last_committed_text.clear();
                                     }
@@ -396,9 +402,8 @@ fn process_segment(
     // 移除破损的、基于结尾标点的语义断句规则。现在完全依赖上层的强制滑动窗口或真正的 VAD 静音。
     let effective_final = is_final;
 
-    // --- 同源通道内的滑动窗口差异拼接 (Diff-Stitching) ---
-    // 为了防止滑动窗口重叠部分产生重复输出文字，我们将上一次 commit 的文本与当前转录文本进行重叠消去
-    if !last_committed_text.is_empty() {
+    // --- Diff-Stitching: only on final, not interim ---
+    if is_final && !last_committed_text.is_empty() {
         final_text = overlapping_stitch(last_committed_text, &final_text);
     }
 
@@ -457,7 +462,8 @@ fn process_segment(
     let _ = app.emit("asr_final", payload.to_string());
 
     if effective_final {
-        *last_committed_text = final_text.clone();
+        // Store FULL original transcription (pre-stitch) so next stitch has correct comparison base
+        *last_committed_text = text.trim().to_string();
     }
 
     // --- 写入日志 (ONLY FINAL) ---
