@@ -142,8 +142,11 @@ fn has_excessive_repetition(text: &str) -> bool {
             }
         }
 
+        let repeated_chars = max_count * pat_len;
+        let proportion = repeated_chars as f32 / n as f32;
+        
         let threshold = if pat_len == 1 { 6 } else { 4 };
-        if max_count >= threshold {
+        if max_count >= threshold && proportion > 0.8 {
             return true;
         }
     }

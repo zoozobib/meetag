@@ -8,7 +8,10 @@ pub type RecentSystemTexts =
     std::sync::Arc<std::sync::Mutex<(std::collections::VecDeque<(u128, String)>, String)>>;
 
 pub fn new_system_text_buffer() -> RecentSystemTexts {
-    std::sync::Arc::new(std::sync::Mutex::new((std::collections::VecDeque::new(), String::new())))
+    std::sync::Arc::new(std::sync::Mutex::new((
+        std::collections::VecDeque::new(),
+        String::new(),
+    )))
 }
 
 /// Global singleton for AudioProcessor (lazily initialized)
@@ -66,6 +69,7 @@ pub fn realtime_inference_worker(
 
     // ── State ────────────────────────────────────────────────────────────
     let mut last_transcript = String::new();
+    let mut last_committed_text = String::new();
     let mut sample_buf: Vec<f32> = Vec::with_capacity(16000);
     let mut interim_buf: Vec<f32> = Vec::with_capacity(16000 * 30);
     let mut segment_count: u64 = 0;
@@ -81,42 +85,76 @@ pub fn realtime_inference_worker(
                 sample_buf.push(f32_sample);
                 interim_buf.push(f32_sample);
 
+                // Drain all available samples from the channel to catch up!
+                while let Ok(extra_s) = rx.try_recv() {
+                    let f32_sample = extra_s as f32 / 32768.0;
+                    sample_buf.push(f32_sample);
+                    interim_buf.push(f32_sample);
+                }
+
+                // Sliding Window Bounds
+                let max_window_samples = 8 * 16000;
+                let overlap_samples = 3 * 16000;
+                let is_window_full = interim_buf.len() >= max_window_samples;
+
                 // Check interim conditions (simulated streaming)
                 let elapsed_since_last =
                     interim_buf.len() as f32 / 16000.0 - last_interim_samples as f32 / 16000.0;
-                if elapsed_since_last >= current_interim_interval {
+                
+                if is_window_full || elapsed_since_last >= current_interim_interval {
                     let latest_chunk = &interim_buf[last_interim_samples..];
                     let mut sum_sq = 0.0;
-                    for &x in latest_chunk {
-                        sum_sq += x * x;
+                    if !latest_chunk.is_empty() {
+                        for &x in latest_chunk {
+                            sum_sq += x * x;
+                        }
                     }
-                    let rms = (sum_sq / latest_chunk.len() as f32).sqrt();
+                    let rms = if latest_chunk.is_empty() { 0.0 } else { (sum_sq / latest_chunk.len() as f32).sqrt() };
 
-                    if rms > 0.01 {
-                        // Has energy, emit interim
-                        let was_finalized = process_segment(
+                    if rms > 0.01 || is_window_full {
+                        // Has energy or forced by sliding window
+                        let result = process_segment(
                             &app,
                             &interim_buf,
                             &source,
                             &transcript_writer,
                             &mut last_transcript,
                             is_system,
-                            false,
+                            is_window_full,
                             recording_start_ms,
                             &system_texts,
+                            &mut last_committed_text,
                         );
-                        
-                        if was_finalized {
-                            // Semantic chunking triggered! Flush this segment
-                            interim_buf.clear();
-                            last_interim_samples = 0;
-                            current_interim_interval = 1.5;
-                            vad.clear(); // Reset VAD state so it starts fresh
-                        } else {
-                            last_interim_samples = interim_buf.len();
-                            current_interim_interval += 0.5; // slow down updates as buffer grows
-                            if current_interim_interval > 3.0 {
-                                current_interim_interval = 3.0;
+
+                        match result {
+                            Err(_) => {
+                                // Hallucination triggered: clear everything
+                                interim_buf.clear();
+                                last_committed_text.clear();
+                                last_interim_samples = 0;
+                                current_interim_interval = 1.5;
+                            }
+                            Ok(was_finalized) => {
+                                if was_finalized || is_window_full {
+                                    if is_window_full {
+                                        // Overlap-Save for Sliding Window
+                                        let keep = std::cmp::min(interim_buf.len(), overlap_samples);
+                                        let tail = interim_buf[interim_buf.len() - keep..].to_vec();
+                                        interim_buf = tail;
+                                    } else {
+                                        // Should not happen naturally without VAD, but fallback
+                                        interim_buf.clear();
+                                        last_committed_text.clear();
+                                    }
+                                    last_interim_samples = 0;
+                                    current_interim_interval = 1.5;
+                                } else {
+                                    last_interim_samples = interim_buf.len();
+                                    current_interim_interval += 0.5;
+                                    if current_interim_interval > 3.0 {
+                                        current_interim_interval = 3.0;
+                                    }
+                                }
                             }
                         }
                     }
@@ -126,36 +164,40 @@ pub fn realtime_inference_worker(
                     vad.accept_waveform(&sample_buf);
                     sample_buf.clear();
 
+                    let mut vad_triggered = false;
                     while !vad.is_empty() {
-                        if let Some(segment) = vad.front() {
-                            let samples = segment.samples();
-                            segment_count += 1;
-                            println!(
-                                "🎤 [VAD/{}] Segment #{}: {:.2}s ({} samples)",
-                                source,
-                                segment_count,
-                                samples.len() as f32 / 16000.0,
-                                samples.len()
-                            );
-
-                            // Emit final
-                            process_segment(
-                                &app,
-                                samples,
-                                &source,
-                                &transcript_writer,
-                                &mut last_transcript,
-                                is_system,
-                                true,
-                                recording_start_ms,
-                                &system_texts,
-                            );
-
-                            interim_buf.clear();
-                            last_interim_samples = 0;
-                            current_interim_interval = 1.5;
-                        }
+                        vad_triggered = true;
                         vad.pop();
+                    }
+
+                    if vad_triggered && !interim_buf.is_empty() {
+                        segment_count += 1;
+                        println!(
+                            "🎤 [VAD/{}] Segment #{}: {:.2}s ({} samples) - Silence detected",
+                            source,
+                            segment_count,
+                            interim_buf.len() as f32 / 16000.0,
+                            interim_buf.len()
+                        );
+
+                        // Unified transcription: always use interim_buf for finalization to keep diff-stitching consistent
+                        let _ = process_segment(
+                            &app,
+                            &interim_buf,
+                            &source,
+                            &transcript_writer,
+                            &mut last_transcript,
+                            is_system,
+                            true,
+                            recording_start_ms,
+                            &system_texts,
+                            &mut last_committed_text,
+                        );
+
+                        interim_buf.clear();
+                        last_committed_text.clear();
+                        last_interim_samples = 0;
+                        current_interim_interval = 1.5;
                     }
                 }
             }
@@ -170,28 +212,20 @@ pub fn realtime_inference_worker(
     }
 
     // ── Final flush ──────────────────────────────────────────────────────
-    if !sample_buf.is_empty() {
-        vad.accept_waveform(&sample_buf);
-    }
-    vad.flush();
-
-    while !vad.is_empty() {
-        if let Some(segment) = vad.front() {
-            let samples = segment.samples();
-            segment_count += 1;
-            process_segment(
-                &app,
-                samples,
-                &source,
-                &transcript_writer,
-                &mut last_transcript,
-                is_system,
-                true,
-                recording_start_ms,
-                &system_texts,
-            );
-        }
-        vad.pop();
+    if !interim_buf.is_empty() {
+        segment_count += 1;
+        let _ = process_segment(
+            &app,
+            &interim_buf,
+            &source,
+            &transcript_writer,
+            &mut last_transcript,
+            is_system,
+            true,
+            recording_start_ms,
+            &system_texts,
+            &mut last_committed_text,
+        );
     }
 
     println!(
@@ -224,6 +258,34 @@ fn longest_common_substring(s1: &str, s2: &str) -> String {
     c1[end_pos - max_len..end_pos].iter().collect()
 }
 
+fn overlapping_stitch(s1: &str, s2: &str) -> String {
+    let c1: Vec<char> = s1.chars().collect();
+    let c2: Vec<char> = s2.chars().collect();
+    
+    if c1.is_empty() || c2.is_empty() {
+        return s2.to_string();
+    }
+    
+    let look_len = 25; // Look at up to 25 chars
+    let s1_tail_start = c1.len().saturating_sub(look_len);
+    let s1_tail: String = c1[s1_tail_start..].iter().collect();
+    
+    let s2_head_end = std::cmp::min(c2.len(), look_len);
+    let s2_head: String = c2[0..s2_head_end].iter().collect();
+    
+    let overlap = longest_common_substring(&s1_tail, &s2_head);
+    
+    // If overlap is significant (>= 3 chars), strip it and any preceding noise
+    if overlap.chars().count() >= 3 {
+        if let Some(idx) = s2.find(&overlap) {
+            let remain = &s2[idx + overlap.len()..];
+            return remain.trim_start().to_string();
+        }
+    }
+    
+    s2.to_string()
+}
+
 /// Process a single VAD segment: denoise → ASR → emit (system only) + log.
 /// Returns true if the segment was finalized (either explicitly or via semantic chunking).
 fn process_segment(
@@ -236,7 +298,8 @@ fn process_segment(
     is_final: bool,
     recording_start_ms: u128,
     system_texts: &RecentSystemTexts,
-) -> bool {
+    last_committed_text: &mut String,
+) -> Result<bool, ()> {
     // Add 300ms silence padding
     let mut padded = samples_f32.to_vec();
     padded.resize(padded.len() + 4800, 0.0);
@@ -258,7 +321,7 @@ fn process_segment(
         crate::settings::AsrBackend::FunAsr => {
             if !crate::funasr::SenseVoiceManager::is_initialized() {
                 eprintln!("❌ [ASR] FunASR not initialized!");
-                return false;
+                return Ok(false);
             }
             let funasr = crate::funasr::SenseVoiceManager::get();
             let i16_samples: Vec<i16> = denoised
@@ -269,7 +332,7 @@ fn process_segment(
                 Ok(r) => (r.text.trim().to_string(), "funasr", r.inference_time_ms),
                 Err(e) => {
                     eprintln!("❌ [FUNASR] Error: {}", e);
-                    return false;
+                    return Ok(false);
                 }
             }
         }
@@ -290,20 +353,20 @@ fn process_segment(
             match whisper.transcribe_f32(denoised, "zh", Some(&prompt)) {
                 Ok(r) => {
                     if r.segments.iter().any(|s| s.avg_logprob < -1.0) {
-                        return false;
+                        return Ok(false);
                     }
                     (r.text.trim().to_string(), "whisper", r.inference_time_ms)
                 }
                 Err(e) => {
                     eprintln!("❌ [WHISPER] Error: {}", e);
-                    return false;
+                    return Ok(false);
                 }
             }
         }
     };
 
     if text.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     if crate::text_filter::is_hallucination(&text) {
@@ -312,7 +375,15 @@ fn process_segment(
             backend_name.to_uppercase(),
             text
         );
-        return false;
+        // Clear frontend interim bubble to avoid stuck text
+        let emit_source = if is_system { source } else { "me" };
+        let payload = serde_json::json!({
+            "text": "",
+            "source": emit_source,
+            "is_final": false
+        });
+        let _ = app.emit("asr_final", payload.to_string());
+        return Err(()); // Force clear interim_buf and VAD to break the poisoned buffer deadlock
     }
 
     *last_transcript = text.clone();
@@ -320,14 +391,16 @@ fn process_segment(
     let segment_rms = result.rms_before;
 
     // --- 文本级回声消除与状态记录 ---
-    let mut final_text = text.clone();
-    
-    // Semantic Chunking: If it's a long enough sentence ending with strong punctuation, force final
-    let is_semantic_final = !is_final 
-        && final_text.chars().count() >= 8 
-        && (final_text.ends_with('。') || final_text.ends_with('？') || final_text.ends_with('！'));
-        
-    let effective_final = is_final || is_semantic_final;
+    let mut final_text = text.trim().to_string();
+
+    // 移除破损的、基于结尾标点的语义断句规则。现在完全依赖上层的强制滑动窗口或真正的 VAD 静音。
+    let effective_final = is_final;
+
+    // --- 同源通道内的滑动窗口差异拼接 (Diff-Stitching) ---
+    // 为了防止滑动窗口重叠部分产生重复输出文字，我们将上一次 commit 的文本与当前转录文本进行重叠消去
+    if !last_committed_text.is_empty() {
+        final_text = overlapping_stitch(last_committed_text, &final_text);
+    }
 
     if !is_system {
         // me channel: textual echo subtraction
@@ -356,7 +429,7 @@ fn process_segment(
 
         // Basic RMS gate: If it's too quiet (<0.04), it's likely residual silence/hum, don't emit
         if segment_rms <= 0.04 || final_text.is_empty() {
-            return false;
+            return Ok(false);
         }
     } else {
         // system channel: save to shared buffer for me-channel cancellation
@@ -382,6 +455,10 @@ fn process_segment(
         "is_final": effective_final
     });
     let _ = app.emit("asr_final", payload.to_string());
+
+    if effective_final {
+        *last_committed_text = final_text.clone();
+    }
 
     // --- 写入日志 (ONLY FINAL) ---
     if effective_final {
@@ -409,5 +486,5 @@ fn process_segment(
             }
         }
     }
-    effective_final
+    Ok(effective_final)
 }
