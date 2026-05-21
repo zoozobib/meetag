@@ -624,50 +624,8 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Dual-Channel Post-Processing (v9.0)
+// Dual-Channel Post-Processing (v9.1 — Gap-based approach)
 // ══════════════════════════════════════════════════════════════════════════
-
-/// Compute RMS energy of a sample slice.
-fn compute_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
-}
-
-/// Simple edit-distance-based text similarity (0.0 to 1.0).
-/// Returns 1.0 for identical strings, 0.0 for completely different strings.
-fn text_similarity(a: &str, b: &str) -> f32 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let m = a_chars.len();
-    let n = b_chars.len();
-
-    // Use two-row DP for memory efficiency
-    let mut prev = (0..=n).collect::<Vec<usize>>();
-    let mut curr = vec![0usize; n + 1];
-
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)           // deletion
-                .min(curr[j - 1] + 1)          // insertion
-                .min(prev[j - 1] + cost);      // substitution
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    let max_len = m.max(n);
-    1.0 - (prev[n] as f32 / max_len as f32)
-}
 
 /// Run Silero VAD on a complete audio buffer (16kHz mono).
 /// Returns a list of (start_sec, end_sec) speech segments.
@@ -690,7 +648,7 @@ fn run_vad_offline(
             min_silence_duration: 0.8,
             min_speech_duration: 0.3,
             window_size: 512,
-            max_speech_duration: 30.0,
+            max_speech_duration: 15.0, // shorter max to avoid overly long segments
         },
         sample_rate: 16000,
         num_threads: 1,
@@ -727,11 +685,14 @@ fn run_vad_offline(
     Ok(segments)
 }
 
-/// Main dual-channel post-processing function.
+/// Main dual-channel post-processing function (v9.1 — Gap-based approach).
 ///
-/// 1. Processes system.wav through existing diarization pipeline (for remote speakers)
-/// 2. Processes mic.wav through Silero VAD + echo filtering (for local user)
-/// 3. Merges both channels by timestamp into transcript.jsonl
+/// Strategy:
+///   - Preserve real-time user entries (they used raw audio switch, already quality-filtered)
+///   - Run diarization + ASR on system.wav (for remote speakers)
+///   - Find silence gaps in system timeline (no remote speaker active)
+///   - Only process mic.wav during these gaps (zero echo risk)
+///   - De-duplicate + merge + write transcript.jsonl
 pub fn process_dual_channel(
     system_wav: &Path,
     mic_wav: &Path,
@@ -741,33 +702,67 @@ pub fn process_dual_channel(
     use std::io::Write;
     use tauri::Emitter;
 
-    println!("🔄 [DUAL-CHANNEL] Starting dual-channel post-processing...");
+    println!("🔄 [DUAL-CHANNEL v9.1] Starting gap-based post-processing...");
     println!("  system.wav: {}", system_wav.display());
     println!("  mic.wav: {}", mic_wav.display());
 
     let backend = crate::settings::SETTINGS.read().unwrap().asr.backend;
-    let mut final_entries: Vec<serde_json::Value> = Vec::new();
 
     // ═══════════════════════════════════════════════════════════════════════
-    // PHASE 1: Process system.wav through existing diarization pipeline
+    // PHASE 0: Read real-time user entries from existing transcript.jsonl
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═══ PHASE 0: Reading real-time user entries ═══");
+    let realtime_user_entries: Vec<serde_json::Value> = if transcript_path.exists() {
+        use std::io::BufRead;
+        std::fs::File::open(transcript_path)
+            .ok()
+            .map(|f| {
+                std::io::BufReader::new(f)
+                    .lines()
+                    .filter_map(|line| line.ok())
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+                    .filter(|e| e.get("speaker").and_then(|s| s.as_str()) == Some("user"))
+                    .filter(|e| e.get("rms").is_some()) // only real-time entries have RMS field
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    println!("📋 [DUAL-CHANNEL] Found {} real-time user entries to preserve", realtime_user_entries.len());
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 1: Process system.wav through diarization pipeline
     // ═══════════════════════════════════════════════════════════════════════
     println!("═══ PHASE 1: System audio diarization ═══");
     let system_entries = process_system_channel(system_wav, backend, app)?;
     println!("✅ [DUAL-CHANNEL] System channel: {} entries", system_entries.len());
 
     // ═══════════════════════════════════════════════════════════════════════
-    // PHASE 2: Process mic.wav through VAD + echo filtering
+    // PHASE 2: Find silence gaps in system timeline
     // ═══════════════════════════════════════════════════════════════════════
-    println!("═══ PHASE 2: Mic audio processing ═══");
-    let mic_entries = process_mic_channel(mic_wav, system_wav, &system_entries, backend, app)?;
-    println!("✅ [DUAL-CHANNEL] Mic channel: {} entries (after echo filtering)", mic_entries.len());
+    println!("═══ PHASE 2: Computing silence gaps ═══");
+    let gaps = find_system_gaps(&system_entries, mic_wav)?;
+    println!("📊 [DUAL-CHANNEL] Found {} silence gaps (system inactive)", gaps.len());
+    for (i, &(gs, ge)) in gaps.iter().enumerate() {
+        println!("  Gap {}: {:.1}s - {:.1}s ({:.1}s)", i + 1, gs, ge, ge - gs);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // PHASE 3: Merge and write
+    // PHASE 3: Process mic.wav ONLY during silence gaps
     // ═══════════════════════════════════════════════════════════════════════
-    println!("═══ PHASE 3: Merging channels ═══");
+    println!("═══ PHASE 3: Gap-based mic processing ═══");
+    let gap_entries = process_mic_gaps(mic_wav, &gaps, &realtime_user_entries, backend, app)?;
+    println!("✅ [DUAL-CHANNEL] Gap processing: {} new user entries", gap_entries.len());
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 4: Merge all + write
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═══ PHASE 4: Merging and writing ═══");
+    let mut final_entries: Vec<serde_json::Value> = Vec::new();
+    final_entries.extend(realtime_user_entries);
     final_entries.extend(system_entries);
-    final_entries.extend(mic_entries);
+    final_entries.extend(gap_entries);
 
     // Sort by start time
     final_entries.sort_by(|a, b| {
@@ -805,11 +800,198 @@ pub fn process_dual_channel(
     }
 
     println!(
-        "✅ [DUAL-CHANNEL] Complete: {} user + {} system = {} total entries",
+        "✅ [DUAL-CHANNEL v9.1] Complete: {} user (realtime+gap) + {} system = {} total",
         user_count, system_count, final_entries.len()
     );
 
     Ok(final_entries.len())
+}
+
+/// Find silence gaps in the system timeline.
+/// Returns a list of (start_sec, end_sec) intervals where NO system speaker is active.
+fn find_system_gaps(
+    system_entries: &[serde_json::Value],
+    mic_wav: &Path,
+) -> Result<Vec<(f32, f32)>> {
+    // Get total audio duration from mic.wav
+    let (mic_samples, mic_sr) = read_wav_f32(mic_wav)?;
+    let total_duration = mic_samples.len() as f32 / mic_sr as f32;
+
+    if system_entries.is_empty() {
+        // No system speech at all → entire recording is a gap
+        return Ok(vec![(0.0, total_duration)]);
+    }
+
+    // Extract system active intervals
+    let mut active_intervals: Vec<(f32, f32)> = system_entries
+        .iter()
+        .filter_map(|e| {
+            let start = e.get("start").and_then(|v| v.as_f64())? as f32;
+            let end = e.get("end").and_then(|v| v.as_f64())? as f32;
+            Some((start, end))
+        })
+        .collect();
+
+    // Sort by start time
+    active_intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Merge overlapping intervals
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for (start, end) in active_intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 + 0.5 {
+                // Allow 0.5s tolerance for near-continuous speech
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    // Compute gaps (intervals between merged active intervals)
+    let mut gaps: Vec<(f32, f32)> = Vec::new();
+
+    // Gap before first active interval
+    if let Some(&(first_start, _)) = merged.first() {
+        if first_start > 0.5 {
+            gaps.push((0.0, first_start));
+        }
+    }
+
+    // Gaps between active intervals
+    for window in merged.windows(2) {
+        let gap_start = window[0].1;
+        let gap_end = window[1].0;
+        if gap_end - gap_start > 0.5 {
+            gaps.push((gap_start, gap_end));
+        }
+    }
+
+    // Gap after last active interval
+    if let Some(&(_, last_end)) = merged.last() {
+        if total_duration - last_end > 0.5 {
+            gaps.push((last_end, total_duration));
+        }
+    }
+
+    Ok(gaps)
+}
+
+/// Process mic.wav ONLY during silence gaps.
+/// Since system is silent during these gaps, there's zero echo — mic audio is pure user speech.
+fn process_mic_gaps(
+    mic_wav: &Path,
+    gaps: &[(f32, f32)],
+    realtime_entries: &[serde_json::Value],
+    backend: crate::settings::AsrBackend,
+    app: &tauri::AppHandle,
+) -> Result<Vec<serde_json::Value>> {
+    let mut entries = Vec::new();
+
+    if gaps.is_empty() {
+        println!("  ℹ️ No silence gaps found — system spoke continuously");
+        return Ok(entries);
+    }
+
+    // Read and resample mic audio
+    let (mic_raw, mic_sr) = read_wav_f32(mic_wav)?;
+    let mic_16k = if mic_sr != 16000 {
+        resample(&mic_raw, mic_sr, 16000)
+    } else {
+        mic_raw
+    };
+    let mic_total = mic_16k.len();
+
+    println!("  🎤 Mic audio: {:.1}s, processing {} gaps", mic_total as f32 / 16000.0, gaps.len());
+
+    for (gap_idx, &(gap_start, gap_end)) in gaps.iter().enumerate() {
+        let start_sample = (gap_start * 16000.0) as usize;
+        let end_sample = ((gap_end * 16000.0) as usize).min(mic_total);
+
+        if start_sample >= end_sample || start_sample >= mic_total {
+            continue;
+        }
+
+        let gap_audio = &mic_16k[start_sample..end_sample];
+        let gap_duration = gap_audio.len() as f32 / 16000.0;
+
+        if gap_duration < 0.5 {
+            continue;
+        }
+
+        // Run VAD on this gap's audio
+        let vad_segments = run_vad_offline(gap_audio, app)?;
+
+        for (seg_idx, &(vad_start, vad_end)) in vad_segments.iter().enumerate() {
+            // Convert VAD-relative times to absolute times
+            let abs_start = gap_start + vad_start;
+            let abs_end = gap_start + vad_end;
+            let seg_duration = abs_end - abs_start;
+
+            if seg_duration < 0.3 {
+                continue;
+            }
+
+            // De-duplicate: check if a real-time entry already covers this time
+            let already_covered = realtime_entries.iter().any(|e| {
+                let rt_start = e.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let rt_end = e.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                // Overlap check
+                let overlap_start = abs_start.max(rt_start);
+                let overlap_end = abs_end.min(rt_end);
+                let overlap = (overlap_end - overlap_start).max(0.0);
+                overlap / seg_duration > 0.5
+            });
+
+            if already_covered {
+                println!("  ⏭️ Gap {} seg {}: already covered by real-time entry", gap_idx + 1, seg_idx + 1);
+                continue;
+            }
+
+            // Extract audio for this VAD segment (relative to gap audio)
+            let seg_start_sample = (vad_start * 16000.0) as usize;
+            let seg_end_sample = ((vad_end * 16000.0) as usize).min(gap_audio.len());
+            if seg_start_sample >= seg_end_sample {
+                continue;
+            }
+            let seg_audio = &gap_audio[seg_start_sample..seg_end_sample];
+
+            // Run ASR
+            let text = match run_asr_on_segment(seg_audio, backend, seg_idx) {
+                Ok(t) => t.trim().to_string(),
+                Err(_) => continue,
+            };
+
+            if text.is_empty() || crate::text_filter::is_hallucination(&text) {
+                continue;
+            }
+
+            // Skip non-Chinese output
+            let chinese_chars = text.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c)).count();
+            let total_chars = text.chars().filter(|c| !c.is_ascii_punctuation() && !c.is_whitespace()).count();
+            if total_chars > 0 && (chinese_chars as f32 / total_chars as f32) < 0.5 {
+                continue;
+            }
+
+            let display_text: String = text.chars().take(30).collect();
+            println!("  📝 GAP {:.1}s-{:.1}s [user]: {}", abs_start, abs_end, display_text);
+
+            entries.push(serde_json::json!({
+                "start": abs_start,
+                "end": abs_end,
+                "speaker": "user",
+                "text": text,
+                "source": "gap_supplement",
+                "backend": match backend {
+                    crate::settings::AsrBackend::FunAsr => "funasr",
+                    crate::settings::AsrBackend::Whisper => "whisper",
+                }
+            }));
+        }
+    }
+
+    println!("  📊 Gap processing: {} entries found in {} gaps", entries.len(), gaps.len());
+    Ok(entries)
 }
 
 /// Process system.wav: diarization + per-segment ASR.
@@ -876,172 +1058,6 @@ fn process_system_channel(
             }
         }));
     }
-
-    Ok(entries)
-}
-
-/// Process mic.wav: Silero VAD + two-level echo filtering + ASR.
-fn process_mic_channel(
-    mic_wav: &Path,
-    system_wav: &Path,
-    system_entries: &[serde_json::Value],
-    backend: crate::settings::AsrBackend,
-    app: &tauri::AppHandle,
-) -> Result<Vec<serde_json::Value>> {
-    let mut entries = Vec::new();
-
-    // Read mic audio
-    let (mic_raw, mic_sr) = read_wav_f32(mic_wav)?;
-    let mic_16k = if mic_sr != 16000 {
-        resample(&mic_raw, mic_sr, 16000)
-    } else {
-        mic_raw
-    };
-
-    // Read system audio (for energy comparison)
-    let (sys_raw, sys_sr) = read_wav_f32(system_wav)?;
-    let sys_16k = if sys_sr != 16000 {
-        resample(&sys_raw, sys_sr, 16000)
-    } else {
-        sys_raw
-    };
-
-    println!("  🎤 Mic audio: {:.1}s", mic_16k.len() as f32 / 16000.0);
-    println!("  🔊 Sys audio: {:.1}s", sys_16k.len() as f32 / 16000.0);
-
-    // Run Silero VAD on mic audio (fast, no embedding/clustering)
-    let start_time = std::time::Instant::now();
-    let vad_segments = run_vad_offline(&mic_16k, app)?;
-    println!(
-        "  🔍 VAD detected {} speech segments in {:.1}s",
-        vad_segments.len(),
-        start_time.elapsed().as_secs_f32()
-    );
-
-    let mic_total = mic_16k.len();
-    let sys_total = sys_16k.len();
-    let mut echo_filtered = 0;
-    let mut text_filtered = 0;
-
-    for (i, &(start_sec, end_sec)) in vad_segments.iter().enumerate() {
-        let start_sample = (start_sec * 16000.0) as usize;
-        let end_sample = ((end_sec * 16000.0) as usize).min(mic_total);
-
-        if start_sample >= end_sample || start_sample >= mic_total {
-            continue;
-        }
-
-        let mic_segment = &mic_16k[start_sample..end_sample];
-        let duration_s = mic_segment.len() as f32 / 16000.0;
-        if duration_s < 0.3 {
-            continue;
-        }
-
-        // ── Level 1: Energy-based echo filter (fast) ──
-
-        // Compute system energy at the same time range
-        let sys_start = start_sample.min(sys_total);
-        let sys_end = end_sample.min(sys_total);
-        let sys_rms = if sys_start < sys_end {
-            compute_rms(&sys_16k[sys_start..sys_end])
-        } else {
-            0.0
-        };
-
-        let mic_rms = compute_rms(mic_segment);
-
-        if sys_rms < 0.005 {
-            // System is silent → definitely user speech, keep it
-            // (no echo possible)
-        } else if mic_rms < 0.02 {
-            // System is active AND mic energy is very low → likely just echo
-            echo_filtered += 1;
-            println!(
-                "  🔇 Mic seg {}: echo filtered (mic_rms={:.4}, sys_rms={:.4})",
-                i + 1, mic_rms, sys_rms
-            );
-            continue;
-        }
-        // else: System is active AND mic has significant energy → proceed to Level 2
-
-        // ── Level 2: Text similarity echo filter (slower but precise) ──
-        // Only triggered when system is active AND mic has energy (possible real speech OR loud echo)
-
-        // Run ASR on the mic segment
-        let mic_text = match run_asr_on_segment(mic_segment, backend, i) {
-            Ok(t) => t.trim().to_string(),
-            Err(_) => continue,
-        };
-
-        if mic_text.is_empty() || crate::text_filter::is_hallucination(&mic_text) {
-            continue;
-        }
-
-        // Skip non-Chinese output
-        let chinese_chars = mic_text.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c)).count();
-        let total_chars = mic_text.chars().filter(|c| !c.is_ascii_punctuation() && !c.is_whitespace()).count();
-        if total_chars > 0 && (chinese_chars as f32 / total_chars as f32) < 0.5 {
-            continue;
-        }
-
-        // If system was active, compare text with overlapping system entries
-        if sys_rms >= 0.005 {
-            let mut is_echo = false;
-            for sys_entry in system_entries {
-                let sys_start_t = sys_entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                let sys_end_t = sys_entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                let sys_text = sys_entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
-
-                // Check temporal overlap (> 50% of mic segment)
-                let overlap_start = start_sec.max(sys_start_t);
-                let overlap_end = end_sec.min(sys_end_t);
-                let overlap_duration = (overlap_end - overlap_start).max(0.0);
-                let overlap_ratio = overlap_duration / duration_s;
-
-                if overlap_ratio > 0.5 && !sys_text.is_empty() {
-                    let similarity = text_similarity(&mic_text, sys_text);
-                    if similarity > 0.7 {
-                        println!(
-                            "  🔇 Mic seg {}: text echo filtered (sim={:.2}, mic='{}', sys='{}')",
-                            i + 1,
-                            similarity,
-                            mic_text.chars().take(20).collect::<String>(),
-                            sys_text.chars().take(20).collect::<String>()
-                        );
-                        is_echo = true;
-                        text_filtered += 1;
-                        break;
-                    }
-                }
-            }
-            if is_echo {
-                continue;
-            }
-        }
-
-        // Passed both echo filters → real user speech
-        let display_text: String = mic_text.chars().take(30).collect();
-        println!("  📝 MIC {:.1}s-{:.1}s [user]: {}", start_sec, end_sec, display_text);
-
-        entries.push(serde_json::json!({
-            "start": start_sec,
-            "end": end_sec,
-            "speaker": "user",
-            "text": mic_text,
-            "backend": match backend {
-                crate::settings::AsrBackend::FunAsr => "funasr",
-                crate::settings::AsrBackend::Whisper => "whisper",
-            }
-        }));
-    }
-
-    println!(
-        "  📊 Mic processing: {} segments → {} kept, {} energy-filtered, {} text-filtered",
-        vad_segments.len(),
-        entries.len(),
-        echo_filtered,
-        text_filtered
-    );
 
     Ok(entries)
 }

@@ -82,6 +82,7 @@ fn find_best_input_device(host: &cpal::Host) -> Result<cpal::Device> {
 // =====================
 pub fn start_mic_stream(
     writer_raw: Arc<Mutex<WavWriter>>,
+    writer_mic_raw: Arc<Mutex<WavWriter>>,
     writer_asr: Arc<Mutex<WavWriter>>,
     mixer_tx: std::sync::mpsc::Sender<i16>,
     asr_tx: std::sync::mpsc::Sender<i16>,
@@ -105,6 +106,11 @@ pub fn start_mic_stream(
     );
 
     writer_raw
+        .lock()
+        .unwrap()
+        .init_pcm16(sample_rate, channels)?;
+    // Raw mic track: original signal before DAGC (same format as mic.wav)
+    writer_mic_raw
         .lock()
         .unwrap()
         .init_pcm16(sample_rate, channels)?;
@@ -142,6 +148,7 @@ pub fn start_mic_stream(
     match cfg.sample_format() {
         cpal::SampleFormat::F32 => {
             let w = writer_raw.clone();
+            let w_raw = writer_mic_raw.clone();
             let w_asr = writer_asr.clone();
             let mut rs_phase: f32 = 0.0;
             let ratio: f32 = sample_rate as f32 / 16_000.0;
@@ -220,14 +227,21 @@ pub fn start_mic_stream(
                         );
                     }
 
-                    // 2. Write RAW (Processed)
-                    // Convert to PCM16
+                    // 2. Write DAGC-processed to mic.wav
                     let mut bytes = Vec::with_capacity(processed.len() * 2);
                     for &x in &processed {
                         let v = (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     w.lock().unwrap().write_data(&bytes);
+
+                    // 2b. Write raw pre-DAGC to mic_raw.wav
+                    let mut raw_bytes = Vec::with_capacity(data.len() * 2);
+                    for &x in data {
+                        let v = (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        raw_bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    w_raw.lock().unwrap().write_data(&raw_bytes);
 
                     // 3. ASR Path (Downmix -> Resample -> Send)
                     // When system audio is playing, send RAW (pre-DAGC) audio to ASR.
@@ -289,6 +303,7 @@ pub fn start_mic_stream(
         }
         cpal::SampleFormat::I16 => {
             let w = writer_raw.clone();
+            let w_raw = writer_mic_raw.clone();
             let w_asr = writer_asr.clone();
             let mut rs_phase: f32 = 0.0;
             let ratio: f32 = sample_rate as f32 / 16_000.0;
@@ -348,13 +363,20 @@ pub fn start_mic_stream(
                         );
                     }
 
-                    // Write Back to RAW (PCM16)
+                    // Write DAGC-processed to mic.wav
                     let mut bytes = Vec::with_capacity(data.len() * 2);
                     for &x in &processed_f32 {
                         let v = (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     w.lock().unwrap().write_data(&bytes);
+
+                    // Write raw pre-DAGC to mic_raw.wav (original i16 data)
+                    let mut raw_bytes = Vec::with_capacity(data.len() * 2);
+                    for &x in data {
+                        raw_bytes.extend_from_slice(&x.to_le_bytes());
+                    }
+                    w_raw.lock().unwrap().write_data(&raw_bytes);
 
                     // ASR Path: raw when system active, DAGC when silent
                     let use_raw_for_asr = sys_speak.load(Ordering::Relaxed);

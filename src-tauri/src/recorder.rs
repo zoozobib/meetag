@@ -78,6 +78,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
 
         let system_path = session_dir.join("system.wav");
         let mic_path = session_dir.join("mic.wav");
+        let mic_raw_path = session_dir.join("mic_raw.wav");
         let mic_asr_path = session_dir.join("mic_asr_16k_mono.wav");
         let mix_path = session_dir.join("mix.wav");
         let mix_asr_path = session_dir.join("mix_asr_16k_mono.wav");
@@ -97,6 +98,9 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
         ));
         let mic_writer = Arc::new(Mutex::new(
             WavWriter::create(&mic_path).map_err(|e| e.to_string())?,
+        ));
+        let mic_raw_writer = Arc::new(Mutex::new(
+            WavWriter::create(&mic_raw_path).map_err(|e| e.to_string())?,
         ));
         let mic_asr_writer = Arc::new(Mutex::new(
             WavWriter::create(&mic_asr_path).map_err(|e| e.to_string())?,
@@ -209,6 +213,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
             println!("🎤 [LIFECYCLE: rec_join] Creating mic stream...");
             let mic_stream = match capture::start_mic_stream(
                 mic_writer.clone(),
+                mic_raw_writer.clone(),
                 mic_asr_writer.clone(),
                 mic_tx_for_capture,
                 asr_mic_tx, // Send to User ASR
@@ -444,6 +449,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
             println!("💾 [LIFECYCLE: rec_join] Finalizing WAV files...");
             let _ = system_writer.lock().unwrap().finalize();
             let _ = mic_writer.lock().unwrap().finalize();
+            let _ = mic_raw_writer.lock().unwrap().finalize();
             let _ = mic_asr_writer.lock().unwrap().finalize();
             println!("✅ [LIFECYCLE: rec_join] WAV files finalized");
 
@@ -490,8 +496,8 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                     // ── v9.0: Dual-channel processing (system.wav + mic.wav) ──
                     if crate::diarization::is_initialized() {
                         if mic_path_t.exists() {
-                            // Dual-channel: process both WAV files independently with echo filtering
-                            println!("🔄 [DIARIZATION] Starting dual-channel post-processing...");
+                            // Dual-channel: gap-based mic supplement + system diarization
+                            println!("🔄 [DIARIZATION] Starting gap-based dual-channel post-processing...");
                             match crate::diarization::process_dual_channel(
                                 &system_path_t,
                                 &mic_path_t,
