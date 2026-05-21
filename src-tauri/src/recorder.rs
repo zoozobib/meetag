@@ -487,26 +487,44 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                         }
                     }
 
-                    // ── v10.0: Diarize system.wav (clean, no echo) + merge user entries ──
+                    // ── v9.0: Dual-channel processing (system.wav + mic.wav) ──
                     if crate::diarization::is_initialized() {
-                        println!("🔄 [DIARIZATION] Starting offline post-processing on system.wav...");
-                        match crate::diarization::process_wav(&system_path_t) {
-                            Ok(segments) => {
-                                println!("✅ [DIARIZATION] Got {} segments, transcribing each...", segments.len());
-                                match crate::diarization::transcribe_segments(
-                                    &system_path_t,
-                                    &segments,
-                                    &transcript_path_bg,
-                                    &mix_app,
-                                ) {
-                                    Ok(n) => {
-                                        println!("✅ [DIARIZATION] Transcribed {} segments", n);
-                                        let _ = mix_app.emit("tray-log", format!("✅ Speaker diarization complete: {} segments transcribed", n));
-                                    }
-                                    Err(e) => eprintln!("⚠️ [DIARIZATION] Transcription failed: {}", e),
+                        if mic_path_t.exists() {
+                            // Dual-channel: process both WAV files independently with echo filtering
+                            println!("🔄 [DIARIZATION] Starting dual-channel post-processing...");
+                            match crate::diarization::process_dual_channel(
+                                &system_path_t,
+                                &mic_path_t,
+                                &transcript_path_bg,
+                                &mix_app,
+                            ) {
+                                Ok(n) => {
+                                    println!("✅ [DIARIZATION] Dual-channel complete: {} total entries", n);
+                                    let _ = mix_app.emit("tray-log", format!("✅ Dual-channel diarization complete: {} entries", n));
                                 }
+                                Err(e) => eprintln!("⚠️ [DIARIZATION] Dual-channel processing failed: {}", e),
                             }
-                            Err(e) => eprintln!("⚠️ [DIARIZATION] Offline processing failed: {}", e),
+                        } else {
+                            // Fallback: single-channel (legacy, system.wav only)
+                            println!("🔄 [DIARIZATION] mic.wav not found, falling back to single-channel...");
+                            match crate::diarization::process_wav(&system_path_t) {
+                                Ok(segments) => {
+                                    println!("✅ [DIARIZATION] Got {} segments, transcribing each...", segments.len());
+                                    match crate::diarization::transcribe_segments(
+                                        &system_path_t,
+                                        &segments,
+                                        &transcript_path_bg,
+                                        &mix_app,
+                                    ) {
+                                        Ok(n) => {
+                                            println!("✅ [DIARIZATION] Transcribed {} segments", n);
+                                            let _ = mix_app.emit("tray-log", format!("✅ Speaker diarization complete: {} segments transcribed", n));
+                                        }
+                                        Err(e) => eprintln!("⚠️ [DIARIZATION] Transcription failed: {}", e),
+                                    }
+                                }
+                                Err(e) => eprintln!("⚠️ [DIARIZATION] Offline processing failed: {}", e),
+                            }
                         }
                     }
                 }
@@ -713,7 +731,12 @@ pub fn add_manual_transcript(
 
     if handled_active {
         use tauri::Emitter;
-        let _ = app.emit("asr_final", &json_line);
+        let payload = serde_json::json!({
+            "text": text,
+            "source": "user",
+            "is_final": true
+        });
+        let _ = app.emit("asr_final", &payload);
         return Ok(());
     }
 

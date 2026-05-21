@@ -1101,23 +1101,31 @@
         }
 
         function appendTranscript(payload) {
-            let text = payload;
+            let text = '';
             let source = 'system'; // Default
             let isFinal = true;
 
-            // Try to parse JSON
-            try {
-                const obj = JSON.parse(payload);
-                if (obj.text) {
-                    text = obj.text;
-                    if (obj.source) source = obj.source;
-                    if (obj.is_final !== undefined) isFinal = obj.is_final;
+            // Handle both object (new format) and string (legacy format) payloads
+            let obj = payload;
+            if (typeof payload === 'string') {
+                try {
+                    obj = JSON.parse(payload);
+                } catch (e) {
+                    // Not JSON string, treat as plain text
+                    obj = { text: payload, source: 'system', is_final: true };
                 }
-            } catch (e) {
-                // Not JSON, assume generic text (legacy)
             }
 
-            const isUser = source === 'user';
+            // Extract fields from parsed object
+            if (obj && typeof obj === 'object') {
+                text = obj.text || '';
+                if (obj.source) source = obj.source;
+                if (obj.is_final !== undefined) isFinal = obj.is_final;
+            } else {
+                text = String(payload);
+            }
+
+            const isUser = source === 'user' || source === 'me';
             const alignClass = isUser ? 'user' : 'system';
             const label = isUser ? 'Me' : source;
             const safeSourceId = String(source).replace(/\s+/g, '-');

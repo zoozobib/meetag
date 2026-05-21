@@ -1,10 +1,11 @@
-//! Speaker Diarization v8.0 — Offline post-processing via sherpa-onnx OfflineSpeakerDiarization.
+//! Speaker Diarization v9.0 — Offline post-processing via sherpa-onnx OfflineSpeakerDiarization.
 //!
 //! Architecture:
 //!   - During recording: no speaker identification at all. Just transcribe with timestamps.
-//!   - After recording: run OfflineSpeakerDiarization on the complete mix.wav.
-//!     Pyannote segmentation + 3D-Speaker embeddings + clustering on the FULL recording
-//!     gives far better accuracy than per-segment streaming matching.
+//!   - After recording: run dual-channel processing:
+//!     1. system.wav → OfflineSpeakerDiarization (Pyannote + embedding + clustering)
+//!     2. mic.wav → Silero VAD (lightweight) + echo filtering + ASR
+//!     3. Merge both by timestamp into transcript.jsonl
 //!   - Re-label transcript.jsonl entries by aligning timestamps with diarization segments.
 
 use anyhow::Result;
@@ -23,7 +24,7 @@ static DIARIZER: OnceCell<OfflineSpeakerDiarization> = OnceCell::new();
 /// Initialize the offline diarizer with Pyannote segmentation + embedding models.
 /// Call once at startup.
 pub fn init(segmentation_model: &Path, embedding_model: &Path) -> Result<()> {
-    println!("🚀 [DIARIZATION] Initializing v8.0 (Offline Post-Processing)...");
+    println!("🚀 [DIARIZATION] Initializing v9.0 (Dual-Channel Post-Processing)...");
     println!(
         "📂 [DIARIZATION] Segmentation model: {}",
         segmentation_model.display()
@@ -46,18 +47,24 @@ pub fn init(segmentation_model: &Path, embedding_model: &Path) -> Result<()> {
         ));
     }
 
+    // Dynamic thread count based on CPU cores (capped 2-6)
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| (n.get() as i32).min(6).max(2))
+        .unwrap_or(2);
+    println!("🧵 [DIARIZATION] Using {} threads (dynamic)", num_threads);
+
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
             pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
                 model: Some(segmentation_model.to_string_lossy().into_owned()),
             },
-            num_threads: 2,
+            num_threads,
             debug: false,
             provider: Some("cpu".to_string()),
         },
         embedding: SpeakerEmbeddingExtractorConfig {
             model: Some(embedding_model.to_string_lossy().into_owned()),
-            num_threads: 2,
+            num_threads,
             debug: false,
             provider: Some("cpu".to_string()),
         },
@@ -517,7 +524,7 @@ pub fn transcribe_segments(
             "source": seg.speaker,
             "is_final": true
         });
-        let _ = app.emit("asr_final", payload.to_string());
+        let _ = app.emit("asr_final", &payload);
 
         final_entries.push(entry);
         transcribed += 1;
@@ -614,4 +621,461 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         output.push(sample);
     }
     output
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Dual-Channel Post-Processing (v9.0)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Compute RMS energy of a sample slice.
+fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Simple edit-distance-based text similarity (0.0 to 1.0).
+/// Returns 1.0 for identical strings, 0.0 for completely different strings.
+fn text_similarity(a: &str, b: &str) -> f32 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+
+    // Use two-row DP for memory efficiency
+    let mut prev = (0..=n).collect::<Vec<usize>>();
+    let mut curr = vec![0usize; n + 1];
+
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)           // deletion
+                .min(curr[j - 1] + 1)          // insertion
+                .min(prev[j - 1] + cost);      // substitution
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    let max_len = m.max(n);
+    1.0 - (prev[n] as f32 / max_len as f32)
+}
+
+/// Run Silero VAD on a complete audio buffer (16kHz mono).
+/// Returns a list of (start_sec, end_sec) speech segments.
+fn run_vad_offline(
+    samples_16k: &[f32],
+    app: &tauri::AppHandle,
+) -> Result<Vec<(f32, f32)>> {
+    use tauri::Manager;
+
+    let model_path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| anyhow::anyhow!("Failed to get resource dir: {}", e))?
+        .join("resources/silero_vad.onnx");
+
+    let vad_config = sherpa_onnx::VadModelConfig {
+        silero_vad: sherpa_onnx::SileroVadModelConfig {
+            model: Some(model_path.to_string_lossy().to_string()),
+            threshold: 0.5,
+            min_silence_duration: 0.8,
+            min_speech_duration: 0.3,
+            window_size: 512,
+            max_speech_duration: 30.0,
+        },
+        sample_rate: 16000,
+        num_threads: 1,
+        provider: Some("cpu".to_string()),
+        debug: false,
+        ..Default::default()
+    };
+
+    let vad = sherpa_onnx::VoiceActivityDetector::create(&vad_config, 60.0)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create Silero VAD for offline processing"))?;
+
+    // Feed all audio through VAD in chunks of 512 samples (window_size)
+    let window_size = 512;
+    for chunk in samples_16k.chunks(window_size) {
+        if chunk.len() == window_size {
+            vad.accept_waveform(chunk);
+        }
+    }
+    // Flush remaining speech
+    vad.flush();
+
+    // Collect all detected speech segments
+    let mut segments = Vec::new();
+    while !vad.is_empty() {
+        if let Some(seg) = vad.front() {
+            let start_sec = seg.start() as f32 / 16000.0;
+            let duration_sec = seg.samples().len() as f32 / 16000.0;
+            let end_sec = start_sec + duration_sec;
+            segments.push((start_sec, end_sec));
+        }
+        vad.pop();
+    }
+
+    Ok(segments)
+}
+
+/// Main dual-channel post-processing function.
+///
+/// 1. Processes system.wav through existing diarization pipeline (for remote speakers)
+/// 2. Processes mic.wav through Silero VAD + echo filtering (for local user)
+/// 3. Merges both channels by timestamp into transcript.jsonl
+pub fn process_dual_channel(
+    system_wav: &Path,
+    mic_wav: &Path,
+    transcript_path: &Path,
+    app: &tauri::AppHandle,
+) -> Result<usize> {
+    use std::io::Write;
+    use tauri::Emitter;
+
+    println!("🔄 [DUAL-CHANNEL] Starting dual-channel post-processing...");
+    println!("  system.wav: {}", system_wav.display());
+    println!("  mic.wav: {}", mic_wav.display());
+
+    let backend = crate::settings::SETTINGS.read().unwrap().asr.backend;
+    let mut final_entries: Vec<serde_json::Value> = Vec::new();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 1: Process system.wav through existing diarization pipeline
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═══ PHASE 1: System audio diarization ═══");
+    let system_entries = process_system_channel(system_wav, backend, app)?;
+    println!("✅ [DUAL-CHANNEL] System channel: {} entries", system_entries.len());
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 2: Process mic.wav through VAD + echo filtering
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═══ PHASE 2: Mic audio processing ═══");
+    let mic_entries = process_mic_channel(mic_wav, system_wav, &system_entries, backend, app)?;
+    println!("✅ [DUAL-CHANNEL] Mic channel: {} entries (after echo filtering)", mic_entries.len());
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 3: Merge and write
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═══ PHASE 3: Merging channels ═══");
+    final_entries.extend(system_entries);
+    final_entries.extend(mic_entries);
+
+    // Sort by start time
+    final_entries.sort_by(|a, b| {
+        let a_start = a.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let b_start = b.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        a_start.partial_cmp(&b_start).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Write to transcript.jsonl
+    let mut file = std::fs::File::create(transcript_path)?;
+    let mut user_count = 0;
+    let mut system_count = 0;
+    for entry in &final_entries {
+        let speaker = entry.get("speaker").and_then(|s| s.as_str()).unwrap_or("");
+        if speaker == "user" {
+            user_count += 1;
+        } else {
+            system_count += 1;
+        }
+        if let Ok(line) = serde_json::to_string(entry) {
+            writeln!(file, "{}", line)?;
+        }
+    }
+
+    // Emit all entries to frontend for display
+    for entry in &final_entries {
+        let text = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let speaker = entry.get("speaker").and_then(|s| s.as_str()).unwrap_or("system");
+        let payload = serde_json::json!({
+            "text": text,
+            "source": speaker,
+            "is_final": true
+        });
+        let _ = app.emit("asr_final", &payload);
+    }
+
+    println!(
+        "✅ [DUAL-CHANNEL] Complete: {} user + {} system = {} total entries",
+        user_count, system_count, final_entries.len()
+    );
+
+    Ok(final_entries.len())
+}
+
+/// Process system.wav: diarization + per-segment ASR.
+fn process_system_channel(
+    system_wav: &Path,
+    backend: crate::settings::AsrBackend,
+    _app: &tauri::AppHandle,
+) -> Result<Vec<serde_json::Value>> {
+    let mut entries = Vec::new();
+
+    // Run diarization (existing pipeline)
+    let segments = process_wav(system_wav)?;
+
+    // Read and resample audio for ASR
+    let (all_samples, file_sample_rate) = read_wav_f32(system_wav)?;
+    let samples_16k = if file_sample_rate != 16000 {
+        resample(&all_samples, file_sample_rate, 16000)
+    } else {
+        all_samples
+    };
+    let total_samples = samples_16k.len();
+
+    for (i, seg) in segments.iter().enumerate() {
+        let start_sample = (seg.start * 16000.0) as usize;
+        let end_sample = ((seg.end * 16000.0) as usize).min(total_samples);
+
+        if start_sample >= end_sample || start_sample >= total_samples {
+            continue;
+        }
+
+        let segment_audio = &samples_16k[start_sample..end_sample];
+        let duration_s = segment_audio.len() as f32 / 16000.0;
+        if duration_s < 0.3 {
+            continue;
+        }
+
+        // Run ASR
+        let text = run_asr_on_segment(segment_audio, backend, i)?;
+        let text = text.trim().to_string();
+
+        if text.is_empty() || crate::text_filter::is_hallucination(&text) {
+            continue;
+        }
+
+        // Skip non-Chinese output
+        let chinese_chars = text.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c)).count();
+        let total_chars = text.chars().filter(|c| !c.is_ascii_punctuation() && !c.is_whitespace()).count();
+        if total_chars > 0 && (chinese_chars as f32 / total_chars as f32) < 0.5 {
+            println!("  🗑️ Skipping non-Chinese system segment: {:?}", text);
+            continue;
+        }
+
+        let display_text: String = text.chars().take(30).collect();
+        println!("  📝 SYS {:.1}s-{:.1}s [{}]: {}", seg.start, seg.end, seg.speaker, display_text);
+
+        entries.push(serde_json::json!({
+            "start": seg.start,
+            "end": seg.end,
+            "speaker": seg.speaker,
+            "text": text,
+            "backend": match backend {
+                crate::settings::AsrBackend::FunAsr => "funasr",
+                crate::settings::AsrBackend::Whisper => "whisper",
+            }
+        }));
+    }
+
+    Ok(entries)
+}
+
+/// Process mic.wav: Silero VAD + two-level echo filtering + ASR.
+fn process_mic_channel(
+    mic_wav: &Path,
+    system_wav: &Path,
+    system_entries: &[serde_json::Value],
+    backend: crate::settings::AsrBackend,
+    app: &tauri::AppHandle,
+) -> Result<Vec<serde_json::Value>> {
+    let mut entries = Vec::new();
+
+    // Read mic audio
+    let (mic_raw, mic_sr) = read_wav_f32(mic_wav)?;
+    let mic_16k = if mic_sr != 16000 {
+        resample(&mic_raw, mic_sr, 16000)
+    } else {
+        mic_raw
+    };
+
+    // Read system audio (for energy comparison)
+    let (sys_raw, sys_sr) = read_wav_f32(system_wav)?;
+    let sys_16k = if sys_sr != 16000 {
+        resample(&sys_raw, sys_sr, 16000)
+    } else {
+        sys_raw
+    };
+
+    println!("  🎤 Mic audio: {:.1}s", mic_16k.len() as f32 / 16000.0);
+    println!("  🔊 Sys audio: {:.1}s", sys_16k.len() as f32 / 16000.0);
+
+    // Run Silero VAD on mic audio (fast, no embedding/clustering)
+    let start_time = std::time::Instant::now();
+    let vad_segments = run_vad_offline(&mic_16k, app)?;
+    println!(
+        "  🔍 VAD detected {} speech segments in {:.1}s",
+        vad_segments.len(),
+        start_time.elapsed().as_secs_f32()
+    );
+
+    let mic_total = mic_16k.len();
+    let sys_total = sys_16k.len();
+    let mut echo_filtered = 0;
+    let mut text_filtered = 0;
+
+    for (i, &(start_sec, end_sec)) in vad_segments.iter().enumerate() {
+        let start_sample = (start_sec * 16000.0) as usize;
+        let end_sample = ((end_sec * 16000.0) as usize).min(mic_total);
+
+        if start_sample >= end_sample || start_sample >= mic_total {
+            continue;
+        }
+
+        let mic_segment = &mic_16k[start_sample..end_sample];
+        let duration_s = mic_segment.len() as f32 / 16000.0;
+        if duration_s < 0.3 {
+            continue;
+        }
+
+        // ── Level 1: Energy-based echo filter (fast) ──
+
+        // Compute system energy at the same time range
+        let sys_start = start_sample.min(sys_total);
+        let sys_end = end_sample.min(sys_total);
+        let sys_rms = if sys_start < sys_end {
+            compute_rms(&sys_16k[sys_start..sys_end])
+        } else {
+            0.0
+        };
+
+        let mic_rms = compute_rms(mic_segment);
+
+        if sys_rms < 0.005 {
+            // System is silent → definitely user speech, keep it
+            // (no echo possible)
+        } else if mic_rms < 0.02 {
+            // System is active AND mic energy is very low → likely just echo
+            echo_filtered += 1;
+            println!(
+                "  🔇 Mic seg {}: echo filtered (mic_rms={:.4}, sys_rms={:.4})",
+                i + 1, mic_rms, sys_rms
+            );
+            continue;
+        }
+        // else: System is active AND mic has significant energy → proceed to Level 2
+
+        // ── Level 2: Text similarity echo filter (slower but precise) ──
+        // Only triggered when system is active AND mic has energy (possible real speech OR loud echo)
+
+        // Run ASR on the mic segment
+        let mic_text = match run_asr_on_segment(mic_segment, backend, i) {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => continue,
+        };
+
+        if mic_text.is_empty() || crate::text_filter::is_hallucination(&mic_text) {
+            continue;
+        }
+
+        // Skip non-Chinese output
+        let chinese_chars = mic_text.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c) || ('\u{3400}'..='\u{4dbf}').contains(c)).count();
+        let total_chars = mic_text.chars().filter(|c| !c.is_ascii_punctuation() && !c.is_whitespace()).count();
+        if total_chars > 0 && (chinese_chars as f32 / total_chars as f32) < 0.5 {
+            continue;
+        }
+
+        // If system was active, compare text with overlapping system entries
+        if sys_rms >= 0.005 {
+            let mut is_echo = false;
+            for sys_entry in system_entries {
+                let sys_start_t = sys_entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let sys_end_t = sys_entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let sys_text = sys_entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+                // Check temporal overlap (> 50% of mic segment)
+                let overlap_start = start_sec.max(sys_start_t);
+                let overlap_end = end_sec.min(sys_end_t);
+                let overlap_duration = (overlap_end - overlap_start).max(0.0);
+                let overlap_ratio = overlap_duration / duration_s;
+
+                if overlap_ratio > 0.5 && !sys_text.is_empty() {
+                    let similarity = text_similarity(&mic_text, sys_text);
+                    if similarity > 0.7 {
+                        println!(
+                            "  🔇 Mic seg {}: text echo filtered (sim={:.2}, mic='{}', sys='{}')",
+                            i + 1,
+                            similarity,
+                            mic_text.chars().take(20).collect::<String>(),
+                            sys_text.chars().take(20).collect::<String>()
+                        );
+                        is_echo = true;
+                        text_filtered += 1;
+                        break;
+                    }
+                }
+            }
+            if is_echo {
+                continue;
+            }
+        }
+
+        // Passed both echo filters → real user speech
+        let display_text: String = mic_text.chars().take(30).collect();
+        println!("  📝 MIC {:.1}s-{:.1}s [user]: {}", start_sec, end_sec, display_text);
+
+        entries.push(serde_json::json!({
+            "start": start_sec,
+            "end": end_sec,
+            "speaker": "user",
+            "text": mic_text,
+            "backend": match backend {
+                crate::settings::AsrBackend::FunAsr => "funasr",
+                crate::settings::AsrBackend::Whisper => "whisper",
+            }
+        }));
+    }
+
+    println!(
+        "  📊 Mic processing: {} segments → {} kept, {} energy-filtered, {} text-filtered",
+        vad_segments.len(),
+        entries.len(),
+        echo_filtered,
+        text_filtered
+    );
+
+    Ok(entries)
+}
+
+/// Run ASR on a single audio segment (16kHz mono f32).
+fn run_asr_on_segment(
+    segment_audio: &[f32],
+    backend: crate::settings::AsrBackend,
+    seg_index: usize,
+) -> Result<String> {
+    match backend {
+        crate::settings::AsrBackend::FunAsr => {
+            let funasr = crate::funasr::SenseVoiceManager::get();
+            let samples_i16: Vec<i16> = segment_audio
+                .iter()
+                .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                .collect();
+            match funasr.transcribe(&samples_i16) {
+                Ok(result) => Ok(result.text),
+                Err(e) => {
+                    eprintln!("  ⚠️ Segment {}: ASR error: {}", seg_index + 1, e);
+                    Err(anyhow::anyhow!("ASR error: {}", e))
+                }
+            }
+        }
+        crate::settings::AsrBackend::Whisper => {
+            let whisper = crate::whisper::WhisperManager::get();
+            match whisper.transcribe_f32(segment_audio, "zh", None) {
+                Ok(result) => Ok(result.text),
+                Err(e) => {
+                    eprintln!("  ⚠️ Segment {}: ASR error: {}", seg_index + 1, e);
+                    Err(anyhow::anyhow!("ASR error: {}", e))
+                }
+            }
+        }
+    }
 }

@@ -382,13 +382,13 @@ fn process_segment(
             text
         );
         // Clear frontend interim bubble to avoid stuck text
-        let emit_source = if is_system { source } else { "me" };
+        let emit_source = if is_system { source } else { "user" };
         let payload = serde_json::json!({
             "text": "",
             "source": emit_source,
             "is_final": false
         });
-        let _ = app.emit("asr_final", payload.to_string());
+        let _ = app.emit("asr_final", &payload);
         return Err(()); // Force clear interim_buf and VAD to break the poisoned buffer deadlock
     }
 
@@ -419,21 +419,23 @@ fn process_segment(
             // Subtract from finalized texts
             for (_, sys_txt) in st.0.iter() {
                 let overlap = longest_common_substring(&final_text, sys_txt);
-                // If overlap is significant (e.g. >= 4 chars), subtract it
-                if overlap.chars().count() >= 4 {
+                // If overlap is significant (>= 10 chars), subtract it
+                // Raised from 4 to 10 to prevent aggressive false kills on common discussion terms
+                if overlap.chars().count() >= 10 {
                     final_text = final_text.replace(&overlap, "").trim().to_string();
                 }
             }
 
             // Subtract from current interim text
             let overlap = longest_common_substring(&final_text, &st.1);
-            if overlap.chars().count() >= 4 {
+            if overlap.chars().count() >= 10 {
                 final_text = final_text.replace(&overlap, "").trim().to_string();
             }
         }
 
-        // Basic RMS gate: If it's too quiet (<0.04), it's likely residual silence/hum, don't emit
-        if segment_rms <= 0.04 || final_text.is_empty() {
+        // Basic RMS gate: lowered to 0.01 to let raw-signal speech pass while blocking noise floor.
+        // The AEC raw audio switch keeps echo at ~0.005-0.01 RMS; real speech is ~0.01-0.03 on raw signal.
+        if segment_rms <= 0.01 || final_text.is_empty() {
             return Ok(false);
         }
     } else {
@@ -453,13 +455,13 @@ fn process_segment(
     }
 
     // --- 前端发送 ---
-    let emit_source = if is_system { source } else { "me" };
+    let emit_source = if is_system { source } else { "user" };
     let payload = serde_json::json!({
         "text": final_text,
         "source": emit_source,
         "is_final": effective_final
     });
-    let _ = app.emit("asr_final", payload.to_string());
+    let _ = app.emit("asr_final", &payload);
 
     if effective_final {
         // Store FULL original transcription (pre-stitch) so next stitch has correct comparison base
