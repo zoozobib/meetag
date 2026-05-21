@@ -352,26 +352,12 @@
             box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
         }
 
-        /* User (Me) -> Right, Blue */
-        .log-entry.user {
-            align-items: flex-end;
-        }
-
-        .log-entry.user .log-bubble {
-            background-color: #EFF6FF;
-            /* Blue-50 */
-            color: #1E3A8A;
-            /* Blue-900 */
-            border: 1px solid #DBEAFE;
-            border-bottom-right-radius: 2px;
-        }
-
-        /* System (Speaker) -> Left, Gray/White */
-        .log-entry.system {
+        /* All entries — Left, unified style */
+        .log-entry {
             align-items: flex-start;
         }
 
-        .log-entry.system .log-bubble {
+        .log-entry .log-bubble {
             background-color: #FFFFFF;
             color: #1F2937;
             border: 1px solid #E5E7EB;
@@ -1125,9 +1111,6 @@
                 text = String(payload);
             }
 
-            const isUser = source === 'user' || source === 'me';
-            const alignClass = isUser ? 'user' : 'system';
-            const label = isUser ? 'Me' : source;
             const safeSourceId = String(source).replace(/\s+/g, '-');
             const activeId = `active-msg-${safeSourceId}`;
 
@@ -1156,9 +1139,8 @@
                 const styleAttr = isFinal ? '' : 'opacity: 0.8; font-style: italic; transition: opacity 0.3s;';
                 
                 const html = `
-                    <div class="log-entry ${alignClass}" ${idAttr}>
+                    <div class="log-entry" ${idAttr}>
                         <div class="log-meta">
-                            <span style="font-weight:600;">${label}</span>
                             <span>${getTimeStr()}</span>
                         </div>
                         <div class="log-bubble" style="${styleAttr}">
@@ -1302,16 +1284,10 @@
         function renderTranscriptItem(item) {
             if (!item) return '';
             let text = item.text || "";
-            // Use 'speaker' for history files, 'source' for real-time events
-            let source = item.speaker || item.source || 'system';
-            const isUser = source === 'user' || source === 'Me';
-            const alignClass = isUser ? 'user' : 'system';
-            const label = isUser ? 'Me' : (typeof source === 'string' ? source : 'Speaker');
 
             return `
-                <div class="log-entry ${alignClass}">
+                <div class="log-entry">
                     <div class="log-meta">
-                        <span style="font-weight:600;">${label}</span>
                     </div>
                     <div class="log-bubble">
                         ${text}

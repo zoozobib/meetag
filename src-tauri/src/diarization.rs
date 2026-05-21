@@ -756,6 +756,17 @@ pub fn process_dual_channel(
     println!("✅ [DUAL-CHANNEL] Gap processing: {} new user entries", gap_entries.len());
 
     // ═══════════════════════════════════════════════════════════════════════
+    // PHASE 3.5: Text-level echo dedup on real-time user entries
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═══ PHASE 3.5: Text-level echo dedup ═══");
+    let pre_dedup_count = realtime_user_entries.len();
+    let realtime_user_entries = filter_echo_by_text(realtime_user_entries, &system_entries);
+    println!(
+        "🔇 [DEDUP] {} → {} real-time user entries ({} echo removed)",
+        pre_dedup_count, realtime_user_entries.len(), pre_dedup_count - realtime_user_entries.len()
+    );
+
+    // ═══════════════════════════════════════════════════════════════════════
     // PHASE 4: Merge all + write
     // ═══════════════════════════════════════════════════════════════════════
     println!("═══ PHASE 4: Merging and writing ═══");
@@ -805,6 +816,114 @@ pub fn process_dual_channel(
     );
 
     Ok(final_entries.len())
+}
+
+/// Filter real-time user entries by comparing their text with overlapping system entries.
+/// Entries whose text is mostly contained in system text (echo) are removed.
+fn filter_echo_by_text(
+    user_entries: Vec<serde_json::Value>,
+    system_entries: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    user_entries
+        .into_iter()
+        .filter(|user_entry| {
+            let user_text = user_entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let user_start = user_entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let user_end = user_entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+            // Extract Chinese characters from user text (ignore punctuation/whitespace)
+            let user_chars: Vec<char> = user_text
+                .chars()
+                .filter(|c| {
+                    ('\u{4e00}'..='\u{9fff}').contains(c)
+                        || ('\u{3400}'..='\u{4dbf}').contains(c)
+                        || c.is_ascii_alphanumeric()
+                })
+                .collect();
+
+            if user_chars.is_empty() || user_chars.len() < 3 {
+                // Too short to judge, keep it
+                return true;
+            }
+
+            // Collect system text from overlapping entries
+            let mut combined_system_text = String::new();
+            for sys_entry in system_entries {
+                let sys_start = sys_entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let sys_end = sys_entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let sys_text = sys_entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+                // Check temporal overlap (any overlap counts)
+                let overlap_start = user_start.max(sys_start);
+                let overlap_end = user_end.min(sys_end);
+                if overlap_end > overlap_start {
+                    // There is overlap — include this system text
+                    combined_system_text.push_str(sys_text);
+                }
+            }
+
+            if combined_system_text.is_empty() {
+                // No overlapping system entries — not echo, keep it
+                return true;
+            }
+
+            // Extract Chinese/alphanumeric chars from system text
+            let system_chars: Vec<char> = combined_system_text
+                .chars()
+                .filter(|c| {
+                    ('\u{4e00}'..='\u{9fff}').contains(c)
+                        || ('\u{3400}'..='\u{4dbf}').contains(c)
+                        || c.is_ascii_alphanumeric()
+                })
+                .collect();
+
+            // Find longest common substring
+            let lcs_len = longest_common_substring(&user_chars, &system_chars);
+            let echo_ratio = lcs_len as f32 / user_chars.len() as f32;
+
+            if echo_ratio > 0.5 {
+                let display: String = user_text.chars().take(30).collect();
+                println!(
+                    "  🔇 ECHO REMOVED [{:.1}s-{:.1}s]: \"{}\" (LCS={}/{}, ratio={:.0}%)",
+                    user_start, user_end, display,
+                    lcs_len, user_chars.len(), echo_ratio * 100.0
+                );
+                false // Remove this entry
+            } else {
+                true // Keep
+            }
+        })
+        .collect()
+}
+
+/// Compute the length of the longest common substring between two char slices.
+fn longest_common_substring(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let m = a.len();
+    let n = b.len();
+    let mut max_len = 0;
+    // Use single-row DP for memory efficiency
+    let mut prev = vec![0usize; n + 1];
+    let mut curr = vec![0usize; n + 1];
+
+    for i in 1..=m {
+        for j in 1..=n {
+            if a[i - 1] == b[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] > max_len {
+                    max_len = curr[j];
+                }
+            } else {
+                curr[j] = 0;
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.iter_mut().for_each(|x| *x = 0);
+    }
+
+    max_len
 }
 
 /// Find silence gaps in the system timeline.
