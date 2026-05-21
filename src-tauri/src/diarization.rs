@@ -648,7 +648,7 @@ fn run_vad_offline(
             min_silence_duration: 0.8,
             min_speech_duration: 0.3,
             window_size: 512,
-            max_speech_duration: 15.0, // shorter max to avoid overly long segments
+            max_speech_duration: 30.0,
         },
         sample_rate: 16000,
         num_threads: 1,
