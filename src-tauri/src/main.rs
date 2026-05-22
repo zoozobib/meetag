@@ -105,6 +105,12 @@ fn main() {
                     eprintln!("   Segmentation model: {}", segmentation_model.display());
                     eprintln!("   Embedding model: {}", embedding_model.display());
                 }
+
+                // Enhance any sessions that weren't processed before last app quit.
+                // Runs in the current async task (already off the main thread).
+                if crate::diarization::is_initialized() {
+                    crate::diarization::enhance_pending_sessions(&handle);
+                }
             });
             Ok(())
         })

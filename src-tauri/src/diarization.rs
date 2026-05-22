@@ -455,11 +455,12 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 ///   3. Map speaker labels to system entries (timestamp overlap)
 ///   4. Echo cleanup: LCS compare user entries against real-time system text
 ///   5. Deduplicate sliding window overlaps
-///   6. Write enhanced transcript + emit to frontend
+///   6. Write enhanced transcript + optionally emit to frontend
 pub fn enhance_transcript(
     system_wav: &Path,
     transcript_path: &Path,
     app: &tauri::AppHandle,
+    emit_to_frontend: bool,
 ) -> Result<usize> {
     use std::io::{BufRead, Write};
     use tauri::Emitter;
@@ -574,8 +575,10 @@ pub fn enhance_transcript(
         a_start.partial_cmp(&b_start).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Write to transcript.jsonl
-    let mut file = std::fs::File::create(transcript_path)?;
+    // Write to temp file first, then atomic rename to protect against crash/quit.
+    // If interrupted, the original real-time transcript.jsonl remains intact.
+    let tmp_path = transcript_path.with_extension("jsonl.tmp");
+    let mut file = std::fs::File::create(&tmp_path)?;
     let mut user_count = 0;
     let mut system_count = 0;
     for entry in &final_entries {
@@ -589,17 +592,28 @@ pub fn enhance_transcript(
             writeln!(file, "{}", line)?;
         }
     }
+    file.flush()?;
+    drop(file); // Close before rename
+    std::fs::rename(&tmp_path, transcript_path)?;
 
-    // Emit all entries to frontend
-    for entry in &final_entries {
-        let text = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
-        let speaker = entry.get("speaker").and_then(|s| s.as_str()).unwrap_or("system");
-        let payload = serde_json::json!({
-            "text": text,
-            "source": speaker,
-            "is_final": true
-        });
-        let _ = app.emit("asr_final", &payload);
+    // Emit to frontend only during active recording session (not during startup catchup)
+    if emit_to_frontend {
+        for entry in &final_entries {
+            let text = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let speaker = entry.get("speaker").and_then(|s| s.as_str()).unwrap_or("system");
+            let payload = serde_json::json!({
+                "text": text,
+                "source": speaker,
+                "is_final": true
+            });
+            let _ = app.emit("asr_final", &payload);
+        }
+    }
+
+    // Write .enhanced marker so we don't re-process on next startup
+    if let Some(session_dir) = transcript_path.parent() {
+        let marker = session_dir.join(".enhanced");
+        let _ = std::fs::File::create(&marker);
     }
 
     println!(
@@ -758,3 +772,70 @@ fn dedup_overlapping(mut entries: Vec<serde_json::Value>) -> Vec<serde_json::Val
     result
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Startup Enhancement — process sessions that weren't enhanced before app quit
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Scan sessions directory for unenhanced sessions and process them.
+/// Called once at startup, after diarization models are loaded.
+/// Runs in the calling thread (caller should spawn a background thread).
+/// Does NOT emit to frontend (startup catchup is silent).
+pub fn enhance_pending_sessions(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let sessions_dir = match app.path().app_data_dir() {
+        Ok(base) => base.join("sessions"),
+        Err(e) => {
+            eprintln!("⚠️ [ENHANCE] Cannot resolve app data dir: {}", e);
+            return;
+        }
+    };
+
+    if !sessions_dir.exists() {
+        return;
+    }
+
+    // Collect session dirs, sort newest first
+    let mut session_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => return,
+    };
+    session_dirs.sort_by(|a, b| b.cmp(a)); // newest first
+
+    let mut enhanced_count = 0;
+    for session_dir in &session_dirs {
+        let marker = session_dir.join(".enhanced");
+        if marker.exists() {
+            continue; // Already enhanced
+        }
+
+        let transcript = session_dir.join("transcript.jsonl");
+        let system_wav = session_dir.join("system.wav");
+
+        if !transcript.exists() {
+            continue; // No transcript to enhance
+        }
+
+        let session_name = session_dir.file_name().unwrap_or_default().to_string_lossy();
+        println!("🔄 [STARTUP] Enhancing pending session: {}", session_name);
+
+        match enhance_transcript(&system_wav, &transcript, app, false) {
+            Ok(n) => {
+                println!("✅ [STARTUP] Session {} enhanced: {} entries", session_name, n);
+                enhanced_count += 1;
+            }
+            Err(e) => {
+                eprintln!("⚠️ [STARTUP] Failed to enhance {}: {}", session_name, e);
+                // Don't write marker — will retry next startup
+            }
+        }
+    }
+
+    if enhanced_count > 0 {
+        println!("✅ [STARTUP] Enhanced {} pending session(s)", enhanced_count);
+    }
+}
