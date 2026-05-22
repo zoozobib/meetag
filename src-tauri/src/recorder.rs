@@ -493,46 +493,24 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                         }
                     }
 
-                    // ── v9.0: Dual-channel processing (system.wav + mic.wav) ──
+                    // ── v10.0: Lightweight offline enhancement ──
+                    // Uses real-time transcript data (no re-ASR).
+                    // Adds speaker labels + removes echo + deduplicates overlaps.
                     if crate::diarization::is_initialized() {
-                        if mic_path_t.exists() {
-                            // Dual-channel: gap-based mic supplement + system diarization
-                            println!("🔄 [DIARIZATION] Starting gap-based dual-channel post-processing...");
-                            match crate::diarization::process_dual_channel(
-                                &system_path_t,
-                                &mic_path_t,
-                                &transcript_path_bg,
-                                &mix_app,
-                            ) {
-                                Ok(n) => {
-                                    println!("✅ [DIARIZATION] Dual-channel complete: {} total entries", n);
-                                    let _ = mix_app.emit("tray-log", format!("✅ Dual-channel diarization complete: {} entries", n));
-                                }
-                                Err(e) => eprintln!("⚠️ [DIARIZATION] Dual-channel processing failed: {}", e),
+                        println!("🔄 [ENHANCE] Starting lightweight offline enhancement...");
+                        match crate::diarization::enhance_transcript(
+                            &system_path_t,
+                            &transcript_path_bg,
+                            &mix_app,
+                        ) {
+                            Ok(n) => {
+                                println!("✅ [ENHANCE] Complete: {} total entries", n);
+                                let _ = mix_app.emit("tray-log", format!("✅ Transcript enhanced: {} entries", n));
                             }
-                        } else {
-                            // Fallback: single-channel (legacy, system.wav only)
-                            println!("🔄 [DIARIZATION] mic.wav not found, falling back to single-channel...");
-                            match crate::diarization::process_wav(&system_path_t) {
-                                Ok(segments) => {
-                                    println!("✅ [DIARIZATION] Got {} segments, transcribing each...", segments.len());
-                                    match crate::diarization::transcribe_segments(
-                                        &system_path_t,
-                                        &segments,
-                                        &transcript_path_bg,
-                                        &mix_app,
-                                    ) {
-                                        Ok(n) => {
-                                            println!("✅ [DIARIZATION] Transcribed {} segments", n);
-                                            let _ = mix_app.emit("tray-log", format!("✅ Speaker diarization complete: {} segments transcribed", n));
-                                        }
-                                        Err(e) => eprintln!("⚠️ [DIARIZATION] Transcription failed: {}", e),
-                                    }
-                                }
-                                Err(e) => eprintln!("⚠️ [DIARIZATION] Offline processing failed: {}", e),
-                            }
+                            Err(e) => eprintln!("⚠️ [ENHANCE] Enhancement failed: {}", e),
                         }
                     }
+
                 }
             });
             println!("🔄 [LIFECYCLE: rec_join thread EXIT] Recording thread ending");
