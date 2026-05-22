@@ -1,12 +1,12 @@
-//! Speaker Diarization v9.0 — Offline post-processing via sherpa-onnx OfflineSpeakerDiarization.
+//! Speaker Diarization v10.0 — Lightweight offline enhancement.
 //!
 //! Architecture:
-//!   - During recording: no speaker identification at all. Just transcribe with timestamps.
-//!   - After recording: run dual-channel processing:
-//!     1. system.wav → OfflineSpeakerDiarization (Pyannote + embedding + clustering)
-//!     2. mic.wav → Silero VAD (lightweight) + echo filtering + ASR
-//!     3. Merge both by timestamp into transcript.jsonl
-//!   - Re-label transcript.jsonl entries by aligning timestamps with diarization segments.
+//!   - During recording: real-time ASR writes transcript.jsonl (the primary product).
+//!   - After recording: lightweight enhancement (no re-ASR):
+//!     1. system.wav → OfflineSpeakerDiarization (speaker labels)
+//!     2. Text-level LCS echo cleanup (using real-time system entries)
+//!     3. Sliding window deduplication
+//!   - On next startup: catch up any sessions that weren't enhanced before app quit.
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
@@ -483,6 +483,21 @@ pub fn enhance_transcript(
         Vec::new()
     };
 
+    // ═══ Guard: skip sessions already processed by old pipeline ═══
+    // Old pipeline wrote "Speaker 1", "Speaker 2" etc. If these exist,
+    // the transcript is already enhanced — don't re-process or we'll lose labels.
+    let has_old_labels = all_entries.iter().any(|e| {
+        let s = e.get("speaker").and_then(|v| v.as_str()).unwrap_or("");
+        s.starts_with("Speaker ")
+    });
+    if has_old_labels {
+        println!("📋 [ENHANCE] Session already has speaker labels from old pipeline, skipping");
+        if let Some(session_dir) = transcript_path.parent() {
+            let _ = std::fs::File::create(session_dir.join(".enhanced"));
+        }
+        return Ok(all_entries.len());
+    }
+
     // Separate into system and user entries
     let mut system_entries: Vec<serde_json::Value> = Vec::new();
     let mut user_entries: Vec<serde_json::Value> = Vec::new();
@@ -760,9 +775,13 @@ fn dedup_overlapping(mut entries: Vec<serde_json::Value>) -> Vec<serde_json::Val
             let overlap_ratio = if shorter_dur > 0.0 { overlap / shorter_dur } else { 0.0 };
 
             if overlap_ratio > 0.5 {
-                // Significant overlap: replace with the current (later) entry
-                // which has more complete context from the sliding window
-                *result.last_mut().unwrap() = entry;
+                // Significant overlap: keep the later entry (more complete context)
+                // but extend its start to cover the earlier entry's time range
+                let mut merged = entry;
+                if let Some(obj) = merged.as_object_mut() {
+                    obj.insert("start".to_string(), serde_json::json!(last_start));
+                }
+                *result.last_mut().unwrap() = merged;
                 continue;
             }
         }
@@ -806,7 +825,12 @@ pub fn enhance_pending_sessions(app: &tauri::AppHandle) {
     };
     session_dirs.sort_by(|a, b| b.cmp(a)); // newest first
 
+    // Only process the most recent N unenhanced sessions.
+    // Older sessions get a marker so we don't scan them every startup.
+    let max_to_process = 3;
     let mut enhanced_count = 0;
+    let mut skipped_old = 0;
+
     for session_dir in &session_dirs {
         let marker = session_dir.join(".enhanced");
         if marker.exists() {
@@ -814,12 +838,21 @@ pub fn enhance_pending_sessions(app: &tauri::AppHandle) {
         }
 
         let transcript = session_dir.join("transcript.jsonl");
-        let system_wav = session_dir.join("system.wav");
 
         if !transcript.exists() {
-            continue; // No transcript to enhance
+            // No transcript — mark and skip
+            let _ = std::fs::File::create(&marker);
+            continue;
         }
 
+        if enhanced_count >= max_to_process {
+            // Older sessions: mark as skipped to avoid re-scanning
+            let _ = std::fs::File::create(&marker);
+            skipped_old += 1;
+            continue;
+        }
+
+        let system_wav = session_dir.join("system.wav");
         let session_name = session_dir.file_name().unwrap_or_default().to_string_lossy();
         println!("🔄 [STARTUP] Enhancing pending session: {}", session_name);
 
@@ -833,6 +866,10 @@ pub fn enhance_pending_sessions(app: &tauri::AppHandle) {
                 // Don't write marker — will retry next startup
             }
         }
+    }
+
+    if skipped_old > 0 {
+        println!("⏭️ [STARTUP] Skipped {} older session(s)", skipped_old);
     }
 
     if enhanced_count > 0 {
