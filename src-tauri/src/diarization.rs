@@ -70,7 +70,7 @@ pub fn init(segmentation_model: &Path, embedding_model: &Path) -> Result<()> {
         },
         clustering: FastClusteringConfig {
             num_clusters: -1, // auto-detect number of speakers
-            threshold: 0.80, // higher = fewer speakers (0.5 was too aggressive, splitting 2 people into dozens)
+            threshold: 0.65, // 0.65 is the sweet spot for distinguishing multiple speakers (0.80 was too aggressive, merging 3 people into 1-2; 0.5 was too low)
         },
         min_duration_on: 0.3,  // minimum speech duration (seconds)
         min_duration_off: 0.5, // minimum silence duration (seconds)
@@ -732,7 +732,7 @@ fn filter_echo_by_text(
                 })
                 .collect();
 
-            let lcs_len = longest_common_substring(&user_chars, &system_chars);
+            let lcs_len = longest_common_subsequence(&user_chars, &system_chars);
             let echo_ratio = lcs_len as f32 / user_chars.len() as f32;
 
             if echo_ratio > 0.5 {
@@ -754,14 +754,13 @@ fn filter_echo_by_text(
         .collect()
 }
 
-/// Compute the length of the longest common substring between two char slices.
-fn longest_common_substring(a: &[char], b: &[char]) -> usize {
+/// Compute the length of the longest common subsequence between two char slices.
+fn longest_common_subsequence(a: &[char], b: &[char]) -> usize {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
     let m = a.len();
     let n = b.len();
-    let mut max_len = 0;
     let mut prev = vec![0usize; n + 1];
     let mut curr = vec![0usize; n + 1];
 
@@ -769,18 +768,14 @@ fn longest_common_substring(a: &[char], b: &[char]) -> usize {
         for j in 1..=n {
             if a[i - 1] == b[j - 1] {
                 curr[j] = prev[j - 1] + 1;
-                if curr[j] > max_len {
-                    max_len = curr[j];
-                }
             } else {
-                curr[j] = 0;
+                curr[j] = prev[j].max(curr[j - 1]);
             }
         }
         std::mem::swap(&mut prev, &mut curr);
-        curr.iter_mut().for_each(|x| *x = 0);
     }
 
-    max_len
+    prev[n]
 }
 
 /// Deduplicate overlapping entries from the same channel.

@@ -502,7 +502,7 @@ pub fn start_recording(app: tauri::AppHandle) -> Result<(String, String), String
                             &system_path_t,
                             &transcript_path_bg,
                             &mix_app,
-                            true, // emit to frontend — user is watching
+                            false, // do not emit to frontend to prevent duplicate display of real-time entries
                         ) {
                             Ok(n) => {
                                 println!("✅ [ENHANCE] Complete: {} total entries", n);
