@@ -70,7 +70,7 @@ pub fn init(segmentation_model: &Path, embedding_model: &Path) -> Result<()> {
         },
         clustering: FastClusteringConfig {
             num_clusters: -1, // auto-detect number of speakers
-            threshold: 0.80,  // higher = fewer speakers (0.5 was too aggressive, splitting 2 people into dozens)
+            threshold: 0.80, // higher = fewer speakers (0.5 was too aggressive, splitting 2 people into dozens)
         },
         min_duration_on: 0.3,  // minimum speech duration (seconds)
         min_duration_off: 0.5, // minimum silence duration (seconds)
@@ -153,7 +153,8 @@ pub fn process_wav(wav_path: &Path) -> Result<Vec<DiarizationSegment>> {
 
     // ── Post-processing: merge noise speakers & renumber ──────────────
     // Step 1: Calculate total speaking time per raw speaker ID
-    let mut speaker_durations: std::collections::HashMap<i32, f32> = std::collections::HashMap::new();
+    let mut speaker_durations: std::collections::HashMap<i32, f32> =
+        std::collections::HashMap::new();
     for s in &segments_raw {
         *speaker_durations.entry(s.speaker).or_insert(0.0) += s.end - s.start;
     }
@@ -166,7 +167,9 @@ pub fn process_wav(wav_path: &Path) -> Result<Vec<DiarizationSegment>> {
         if pct < 3.0 {
             println!(
                 "🧹 [DIARIZATION] Merging Speaker {} ({:.1}s, {:.1}% — noise)",
-                spk + 1, dur, pct
+                spk + 1,
+                dur,
+                pct
             );
             noise_speakers.insert(spk);
         }
@@ -250,7 +253,8 @@ pub fn process_wav(wav_path: &Path) -> Result<Vec<DiarizationSegment>> {
     let mut segments = segments;
     loop {
         // Collect unique speakers and their total durations
-        let mut speaker_dur: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut speaker_dur: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
         for s in &segments {
             *speaker_dur.entry(s.speaker.clone()).or_insert(0.0) += s.end - s.start;
         }
@@ -270,17 +274,21 @@ pub fn process_wav(wav_path: &Path) -> Result<Vec<DiarizationSegment>> {
             let (ref small_spk, _) = speakers_sorted[i];
 
             // Get all time intervals for small speaker
-            let small_intervals: Vec<(f32, f32)> = segments.iter()
+            let small_intervals: Vec<(f32, f32)> = segments
+                .iter()
                 .filter(|s| &s.speaker == small_spk)
                 .map(|s| (s.start, s.end))
                 .collect();
 
             // Check against each other speaker (prefer merging into the largest)
             for j in (0..speakers_sorted.len()).rev() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let (ref candidate_spk, _) = speakers_sorted[j];
 
-                let candidate_intervals: Vec<(f32, f32)> = segments.iter()
+                let candidate_intervals: Vec<(f32, f32)> = segments
+                    .iter()
                     .filter(|s| &s.speaker == candidate_spk)
                     .map(|s| (s.start, s.end))
                     .collect();
@@ -353,16 +361,16 @@ pub fn process_wav(wav_path: &Path) -> Result<Vec<DiarizationSegment>> {
     }
 
     // Print summary
-    let final_speakers: std::collections::HashSet<&str> = segments.iter().map(|s| s.speaker.as_str()).collect();
+    let final_speakers: std::collections::HashSet<&str> =
+        segments.iter().map(|s| s.speaker.as_str()).collect();
     println!(
         "✅ [DIARIZATION] Final: {} speakers, {} segments (merged {} noise speakers)",
-        final_speakers.len(), segments.len(), noise_speakers.len()
+        final_speakers.len(),
+        segments.len(),
+        noise_speakers.len()
     );
     for seg in &segments {
-        println!(
-            "  📌 {:.1}s - {:.1}s: {}",
-            seg.start, seg.end, seg.speaker
-        );
+        println!("  📌 {:.1}s - {:.1}s: {}", seg.start, seg.end, seg.speaker);
     }
 
     Ok(segments)
@@ -392,10 +400,7 @@ fn read_wav_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
                 .map(|s| s as f32 / max_val)
                 .collect()
         }
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .filter_map(|s| s.ok())
-            .collect(),
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
     };
 
     // If stereo, take only left channel (or average)
@@ -511,7 +516,9 @@ pub fn enhance_transcript(
     }
     println!(
         "📋 [ENHANCE] Loaded {} entries: {} system, {} user",
-        all_entries.len(), system_entries.len(), user_entries.len()
+        all_entries.len(),
+        system_entries.len(),
+        user_entries.len()
     );
 
     // ═══ Step 2: Run diarization on system.wav ═══
@@ -522,7 +529,10 @@ pub fn enhance_transcript(
                 segs
             }
             Err(e) => {
-                eprintln!("⚠️ [ENHANCE] Diarization failed: {}, skipping speaker labels", e);
+                eprintln!(
+                    "⚠️ [ENHANCE] Diarization failed: {}, skipping speaker labels",
+                    e
+                );
                 Vec::new()
             }
         }
@@ -557,7 +567,10 @@ pub fn enhance_transcript(
                 );
             }
         }
-        println!("✅ [ENHANCE] Speaker labels mapped to {} system entries", system_entries.len());
+        println!(
+            "✅ [ENHANCE] Speaker labels mapped to {} system entries",
+            system_entries.len()
+        );
     }
 
     // ═══ Step 4: Echo cleanup using text-level LCS ═══
@@ -565,7 +578,9 @@ pub fn enhance_transcript(
     let user_entries = filter_echo_by_text(user_entries, &system_entries);
     println!(
         "🔇 [ENHANCE] Echo cleanup: {} → {} user entries ({} removed)",
-        pre_echo_count, user_entries.len(), pre_echo_count - user_entries.len()
+        pre_echo_count,
+        user_entries.len(),
+        pre_echo_count - user_entries.len()
     );
 
     // ═══ Step 5: Deduplicate sliding window overlaps ═══
@@ -575,7 +590,10 @@ pub fn enhance_transcript(
     let user_entries = dedup_overlapping(user_entries);
     println!(
         "🔗 [ENHANCE] Dedup: system {} → {}, user {} → {}",
-        pre_dedup_sys, system_entries.len(), pre_dedup_usr, user_entries.len()
+        pre_dedup_sys,
+        system_entries.len(),
+        pre_dedup_usr,
+        user_entries.len()
     );
 
     // ═══ Step 6: Merge, sort, write, emit ═══
@@ -587,7 +605,9 @@ pub fn enhance_transcript(
     final_entries.sort_by(|a, b| {
         let a_start = a.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let b_start = b.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        a_start.partial_cmp(&b_start).unwrap_or(std::cmp::Ordering::Equal)
+        a_start
+            .partial_cmp(&b_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Write to temp file first, then atomic rename to protect against crash/quit.
@@ -615,7 +635,10 @@ pub fn enhance_transcript(
     if emit_to_frontend {
         for entry in &final_entries {
             let text = entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            let speaker = entry.get("speaker").and_then(|s| s.as_str()).unwrap_or("system");
+            let speaker = entry
+                .get("speaker")
+                .and_then(|s| s.as_str())
+                .unwrap_or("system");
             let payload = serde_json::json!({
                 "text": text,
                 "source": speaker,
@@ -633,7 +656,9 @@ pub fn enhance_transcript(
 
     println!(
         "✅ [ENHANCE v10.0] Complete: {} user + {} system = {} total",
-        user_count, system_count, final_entries.len()
+        user_count,
+        system_count,
+        final_entries.len()
     );
 
     Ok(final_entries.len())
@@ -649,9 +674,18 @@ fn filter_echo_by_text(
     user_entries
         .into_iter()
         .filter(|user_entry| {
-            let user_text = user_entry.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            let user_start = user_entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-            let user_end = user_entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let user_text = user_entry
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let user_start = user_entry
+                .get("start")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            let user_end = user_entry
+                .get("end")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
 
             // Extract meaningful characters (Chinese + alphanumeric)
             let user_chars: Vec<char> = user_text
@@ -670,7 +704,10 @@ fn filter_echo_by_text(
             // Collect system text from temporally overlapping entries
             let mut combined_system_text = String::new();
             for sys_entry in system_entries {
-                let sys_start = sys_entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let sys_start = sys_entry
+                    .get("start")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
                 let sys_end = sys_entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
                 let overlap_start = user_start.max(sys_start);
@@ -702,8 +739,12 @@ fn filter_echo_by_text(
                 let display: String = user_text.chars().take(30).collect();
                 println!(
                     "  🔇 ECHO [{:.1}s-{:.1}s]: \"{}\" (LCS={}/{}, ratio={:.0}%)",
-                    user_start, user_end, display,
-                    lcs_len, user_chars.len(), echo_ratio * 100.0
+                    user_start,
+                    user_end,
+                    display,
+                    lcs_len,
+                    user_chars.len(),
+                    echo_ratio * 100.0
                 );
                 false // Remove
             } else {
@@ -753,7 +794,9 @@ fn dedup_overlapping(mut entries: Vec<serde_json::Value>) -> Vec<serde_json::Val
     entries.sort_by(|a, b| {
         let a_start = a.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let b_start = b.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        a_start.partial_cmp(&b_start).unwrap_or(std::cmp::Ordering::Equal)
+        a_start
+            .partial_cmp(&b_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut result: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
@@ -772,7 +815,11 @@ fn dedup_overlapping(mut entries: Vec<serde_json::Value>) -> Vec<serde_json::Val
             let overlap = (overlap_end - overlap_start).max(0.0);
 
             let shorter_dur = entry_dur.min(last_end - last_start);
-            let overlap_ratio = if shorter_dur > 0.0 { overlap / shorter_dur } else { 0.0 };
+            let overlap_ratio = if shorter_dur > 0.0 {
+                overlap / shorter_dur
+            } else {
+                0.0
+            };
 
             if overlap_ratio > 0.5 {
                 // Significant overlap: keep the later entry (more complete context)
@@ -853,12 +900,18 @@ pub fn enhance_pending_sessions(app: &tauri::AppHandle) {
         }
 
         let system_wav = session_dir.join("system.wav");
-        let session_name = session_dir.file_name().unwrap_or_default().to_string_lossy();
+        let session_name = session_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         println!("🔄 [STARTUP] Enhancing pending session: {}", session_name);
 
         match enhance_transcript(&system_wav, &transcript, app, false) {
             Ok(n) => {
-                println!("✅ [STARTUP] Session {} enhanced: {} entries", session_name, n);
+                println!(
+                    "✅ [STARTUP] Session {} enhanced: {} entries",
+                    session_name, n
+                );
                 enhanced_count += 1;
             }
             Err(e) => {
@@ -873,6 +926,9 @@ pub fn enhance_pending_sessions(app: &tauri::AppHandle) {
     }
 
     if enhanced_count > 0 {
-        println!("✅ [STARTUP] Enhanced {} pending session(s)", enhanced_count);
+        println!(
+            "✅ [STARTUP] Enhanced {} pending session(s)",
+            enhanced_count
+        );
     }
 }
