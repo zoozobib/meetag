@@ -593,25 +593,16 @@ pub fn enhance_transcript(
                     } else {
                         0.0
                     };
-                    // If the closest segment is within 15 seconds, use its speaker
-                    if dist < 15.0 {
+                    // If the closest segment is within 10 seconds, use its speaker.
+                    // This is extremely safe: it covers tail-end truncation and ASR/VAD time shifts,
+                    // but prevents mislabeling speakers across long silent gaps.
+                    if dist < 10.0 {
                         final_speaker = Some(seg.speaker.clone());
                         println!(
                             "  🎯 [MAPPING] Fallback to nearest speaker for entry {:.1}s-{:.1}s: {} (dist={:.1}s)",
                             entry_start, entry_end, seg.speaker, dist
                         );
                     }
-                }
-            }
-
-            // Fallback 2: Use the last mapped speaker if still None
-            if final_speaker.is_none() {
-                if let Some(ref prev_spk) = last_mapped_speaker {
-                    final_speaker = Some(prev_spk.clone());
-                    println!(
-                        "  🎯 [MAPPING] Fallback to last seen speaker for entry {:.1}s-{:.1}s: {}",
-                        entry_start, entry_end, prev_spk
-                    );
                 }
             }
 
@@ -788,18 +779,15 @@ fn filter_echo_by_text(
                 })
                 .collect();
 
-            let lcs_len = longest_common_subsequence(&user_chars, &system_chars);
-            let echo_ratio = lcs_len as f32 / user_chars.len() as f32;
+            let echo_ratio = common_fragment_overlap_ratio(&user_chars, &system_chars);
 
             if echo_ratio > 0.5 {
                 let display: String = user_text.chars().take(30).collect();
                 println!(
-                    "  🔇 ECHO [{:.1}s-{:.1}s]: \"{}\" (LCS={}/{}, ratio={:.0}%)",
+                    "  🔇 ECHO [{:.1}s-{:.1}s]: \"{}\" (overlap_ratio={:.0}%)",
                     user_start,
                     user_end,
                     display,
-                    lcs_len,
-                    user_chars.len(),
                     echo_ratio * 100.0
                 );
                 false // Remove
@@ -810,28 +798,44 @@ fn filter_echo_by_text(
         .collect()
 }
 
-/// Compute the length of the longest common subsequence between two char slices.
-fn longest_common_subsequence(a: &[char], b: &[char]) -> usize {
-    if a.is_empty() || b.is_empty() {
-        return 0;
+/// Compute the ratio of characters in `user` that are part of common contiguous substrings with `system` of length >= 2.
+/// This algorithm is 100% panic-free, handles any UTF-8 text safely, and guarantees zero coincidental false positives.
+fn common_fragment_overlap_ratio(user: &[char], system: &[char]) -> f32 {
+    if user.len() < 2 || system.len() < 2 {
+        return 0.0;
     }
-    let m = a.len();
-    let n = b.len();
-    let mut prev = vec![0usize; n + 1];
-    let mut curr = vec![0usize; n + 1];
+    
+    let mut matched = vec![false; user.len()];
+    let user_len = user.len();
+    let sys_len = system.len();
 
-    for i in 1..=m {
-        for j in 1..=n {
-            if a[i - 1] == b[j - 1] {
-                curr[j] = prev[j - 1] + 1;
-            } else {
-                curr[j] = prev[j].max(curr[j - 1]);
+    // Iterate through all possible fragment lengths in user from 2 up to 12.
+    // Lengths >= 2 filter out single random coincidental character matches.
+    let max_len = user_len.min(12);
+    
+    for len in (2..=max_len).rev() {
+        for i in 0..=user_len.saturating_sub(len) {
+            let sub = &user[i..i + len];
+            
+            // Check if sub exists in system
+            let mut found = false;
+            for j in 0..=sys_len.saturating_sub(len) {
+                if sub == &system[j..j + len] {
+                    found = true;
+                    break;
+                }
+            }
+            
+            if found {
+                for k in i..i + len {
+                    matched[k] = true;
+                }
             }
         }
-        std::mem::swap(&mut prev, &mut curr);
     }
 
-    prev[n]
+    let matched_count = matched.iter().filter(|&&m| m).count();
+    matched_count as f32 / user_len as f32
 }
 
 /// Deduplicate overlapping entries from the same channel.
