@@ -543,6 +543,7 @@ pub fn enhance_transcript(
 
     // ═══ Step 3: Map speaker labels to system entries ═══
     if !diar_segments.is_empty() {
+        let mut last_mapped_speaker: Option<String> = None;
         for entry in &mut system_entries {
             let entry_start = entry.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             let entry_end = entry.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -560,10 +561,65 @@ pub fn enhance_transcript(
                 })
                 .map(|seg| seg.speaker.as_str());
 
-            if let Some(speaker) = best_speaker {
+            let mut final_speaker = best_speaker.map(|s| s.to_string());
+
+            if final_speaker.is_none() {
+                // Fallback 1: Find the nearest segment in time
+                let nearest = diar_segments
+                    .iter()
+                    .min_by(|a, b| {
+                        let dist_a = if entry_mid < a.start {
+                            a.start - entry_mid
+                        } else if entry_mid > a.end {
+                            entry_mid - a.end
+                        } else {
+                            0.0
+                        };
+                        let dist_b = if entry_mid < b.start {
+                            b.start - entry_mid
+                        } else if entry_mid > b.end {
+                            entry_mid - b.end
+                        } else {
+                            0.0
+                        };
+                        dist_a.partial_cmp(&dist_b).unwrap()
+                    });
+
+                if let Some(seg) = nearest {
+                    let dist = if entry_mid < seg.start {
+                        seg.start - entry_mid
+                    } else if entry_mid > seg.end {
+                        entry_mid - seg.end
+                    } else {
+                        0.0
+                    };
+                    // If the closest segment is within 15 seconds, use its speaker
+                    if dist < 15.0 {
+                        final_speaker = Some(seg.speaker.clone());
+                        println!(
+                            "  🎯 [MAPPING] Fallback to nearest speaker for entry {:.1}s-{:.1}s: {} (dist={:.1}s)",
+                            entry_start, entry_end, seg.speaker, dist
+                        );
+                    }
+                }
+            }
+
+            // Fallback 2: Use the last mapped speaker if still None
+            if final_speaker.is_none() {
+                if let Some(ref prev_spk) = last_mapped_speaker {
+                    final_speaker = Some(prev_spk.clone());
+                    println!(
+                        "  🎯 [MAPPING] Fallback to last seen speaker for entry {:.1}s-{:.1}s: {}",
+                        entry_start, entry_end, prev_spk
+                    );
+                }
+            }
+
+            if let Some(speaker) = final_speaker {
+                last_mapped_speaker = Some(speaker.clone());
                 entry.as_object_mut().unwrap().insert(
                     "speaker".to_string(),
-                    serde_json::Value::String(speaker.to_string()),
+                    serde_json::Value::String(speaker),
                 );
             }
         }
