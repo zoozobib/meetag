@@ -1125,7 +1125,7 @@
             // Extract fields from parsed object
             if (obj && typeof obj === 'object') {
                 text = obj.text || '';
-                if (obj.source) source = obj.source;
+                source = obj.speaker || obj.source || 'system';
                 if (obj.is_final !== undefined) isFinal = obj.is_final;
             } else {
                 text = String(payload);
@@ -1270,6 +1270,24 @@
                     // Re-enable start button if start failed
                     document.getElementById("btnStart").disabled = false;
                     document.getElementById("btnStop").disabled = true;
+                } else if (msg.includes("Transcript enhanced:")) {
+                    appendSystemMessage(msg, "success");
+                    if (currentSessionId) {
+                        invoke('get_session_detail', { id: currentSessionId })
+                            .then(detail => {
+                                if (detail && detail.transcript) {
+                                    logEl.innerHTML = ''; // Clear raw/dirty real-time log!
+                                    appendSystemMessage("✨ Final transcript loaded (echo filtered & speaker diarized)!", "success");
+                                    detail.transcript.forEach(item => {
+                                        appendTranscript(item);
+                                    });
+                                    logEl.scrollTop = logEl.scrollHeight;
+                                }
+                            })
+                            .catch(err => {
+                                console.error("Failed to load enhanced transcript:", err);
+                            });
+                    }
                 } else {
                     appendSystemMessage(msg, "info");
                 }
