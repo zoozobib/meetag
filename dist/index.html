@@ -372,6 +372,26 @@
             gap: 6px;
         }
 
+        .speaker-label {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 1px 6px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .speaker-label.spk-user {
+            color: #065F46;
+            background: #D1FAE5;
+        }
+        .speaker-label.spk-system {
+            color: #1E40AF;
+            background: #DBEAFE;
+        }
+        .speaker-label.spk-other {
+            color: #7C3AED;
+            background: #EDE9FE;
+        }
+
         /* Log System Messages (preserved) */
         .log-system-entry {
             margin-bottom: 4px;
@@ -1114,6 +1134,9 @@
             const safeSourceId = String(source).replace(/\s+/g, '-');
             const activeId = `active-msg-${safeSourceId}`;
 
+            // Speaker label
+            const speakerHtml = getSpeakerLabelHtml(source);
+
             let existingNode = document.getElementById(activeId);
             
             // If the message is empty and it's an interim, just ignore it
@@ -1141,6 +1164,7 @@
                 const html = `
                     <div class="log-entry" ${idAttr}>
                         <div class="log-meta">
+                            ${speakerHtml}
                             <span>${getTimeStr()}</span>
                         </div>
                         <div class="log-bubble" style="${styleAttr}">
@@ -1150,6 +1174,19 @@
                 `;
                 appendHtml(html);
             }
+        }
+
+        function getSpeakerLabelHtml(speaker) {
+            if (!speaker) return '';
+            const s = String(speaker);
+            if (s === 'user') {
+                return '<span class="speaker-label spk-user">Me</span>';
+            } else if (s === 'system') {
+                return '<span class="speaker-label spk-system">System</span>';
+            } else if (s.startsWith('Speaker')) {
+                return `<span class="speaker-label spk-other">${s}</span>`;
+            }
+            return '';
         }
 
         async function setupListeners() {
@@ -1284,10 +1321,13 @@
         function renderTranscriptItem(item) {
             if (!item) return '';
             let text = item.text || "";
+            let speaker = item.speaker || '';
+            const speakerHtml = getSpeakerLabelHtml(speaker);
 
             return `
                 <div class="log-entry">
                     <div class="log-meta">
+                        ${speakerHtml}
                     </div>
                     <div class="log-bubble">
                         ${text}
